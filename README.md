@@ -17,7 +17,7 @@ Errorcore captures the state around a failure so you can inspect what happened a
 
 ## Getting started
 
-1. Install the SDK
+1. Install the package
 
    ```bash
    npm install errorcore
