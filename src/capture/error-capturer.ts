@@ -9,6 +9,7 @@ import { finalizePackageAssemblyResult } from './package-builder';
 import type { PackageBuilder } from './package-builder';
 import type { ProcessMetadata } from './process-metadata';
 import type { DeadLetterStore } from '../transport/dead-letter-store';
+import type { SourceMapResolver } from './source-map-resolver';
 import type {
   AmbientEventContext,
   ErrorInfo,
@@ -97,7 +98,11 @@ function extractCustomProperties(error: Error): Record<string, unknown> {
   return properties;
 }
 
-function serializeError(error: Error, depth = 0): ErrorInfo {
+function serializeError(
+  error: Error,
+  resolver: SourceMapResolver | null,
+  depth = 0
+): ErrorInfo {
   if (depth > 5) {
     return {
       type: 'Error',
@@ -108,12 +113,28 @@ function serializeError(error: Error, depth = 0): ErrorInfo {
   }
 
   const cause = (error as Error & { cause?: unknown }).cause;
+  const rawStack = error.stack || '';
+  let resolvedStack = rawStack;
+  let rawStackField: string | undefined;
+
+  if (resolver !== null && rawStack.length > 0) {
+    try {
+      resolvedStack = resolver.resolveStack(rawStack);
+
+      if (resolvedStack !== rawStack) {
+        rawStackField = rawStack;
+      }
+    } catch {
+      resolvedStack = rawStack;
+    }
+  }
 
   return {
     type: error.constructor?.name || 'Error',
     message: error.message || '',
-    stack: error.stack || '',
-    cause: cause instanceof Error ? serializeError(cause, depth + 1) : undefined,
+    stack: resolvedStack,
+    rawStack: rawStackField,
+    cause: cause instanceof Error ? serializeError(cause, resolver, depth + 1) : undefined,
     properties: cloneAndLimit(extractCustomProperties(error), STANDARD_LIMITS) as Record<
       string,
       unknown
@@ -150,6 +171,8 @@ export class ErrorCapturer {
 
   private readonly deadLetterStore: DeadLetterStore | null;
 
+  private readonly sourceMapResolver: SourceMapResolver | null;
+
   private readonly pendingTransportDispatches = new Set<Promise<void>>();
 
   public constructor(deps: {
@@ -167,6 +190,7 @@ export class ErrorCapturer {
     packageAssemblyDispatcher?: PackageAssemblyDispatcherLike | null;
     stateTrackerStatus?: StateTrackerStatusLike | null;
     deadLetterStore?: DeadLetterStore | null;
+    sourceMapResolver?: SourceMapResolver | null;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
@@ -182,6 +206,7 @@ export class ErrorCapturer {
     this.packageAssemblyDispatcher = deps.packageAssemblyDispatcher ?? null;
     this.stateTrackerStatus = deps.stateTrackerStatus ?? null;
     this.deadLetterStore = deps.deadLetterStore ?? null;
+    this.sourceMapResolver = deps.sourceMapResolver ?? null;
   }
 
   public capture(error: Error, _options?: { isUncaught?: boolean }): ErrorPackage | null {
@@ -194,7 +219,7 @@ export class ErrorCapturer {
 
       const rateLimiterDrops = this.rateLimiter.getAndResetDropSummary() ?? undefined;
 
-      const serializedError = serializeError(error);
+      const serializedError = serializeError(error, this.sourceMapResolver);
       const locals = this.safeGetLocals(error, captureFailures);
       const context = this.safeGetContext(captureFailures);
       const usedAmbientEvents = context === undefined;

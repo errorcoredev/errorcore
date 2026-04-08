@@ -172,7 +172,8 @@ function instrumentMethod(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const mongodb = require('mongodb') as {
+    const modName = 'mongodb';
+    const mongodb = require(modName) as {
       Collection?: { prototype?: object };
     };
 

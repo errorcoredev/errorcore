@@ -22,6 +22,7 @@ import { TransportDispatcher } from './transport/transport';
 import { DeadLetterStore } from './transport/dead-letter-store';
 import { ErrorCapturer } from './capture/error-capturer';
 import { PackageAssemblyDispatcher } from './capture/package-assembly-dispatcher';
+import { SourceMapResolver } from './capture/source-map-resolver';
 import type { RequestContext, ResolvedConfig, SDKConfig, TransportConfig } from './types';
 
 type SDKState = 'created' | 'active' | 'shutting_down' | 'shutdown';
@@ -141,7 +142,11 @@ export class SDKInstance {
 
     if (!this.config.encryptionKey && !this.config.allowUnencrypted) {
       throw new Error(
-        'ErrorCore requires an encryptionKey unless allowUnencrypted is explicitly set to true'
+        'ErrorCore requires an encryptionKey for encrypted error packages.\n\n' +
+        'For local development, add to your config:\n' +
+        '  allowUnencrypted: true\n\n' +
+        'For production, generate a key:\n' +
+        '  node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
       );
     }
 
@@ -152,6 +157,14 @@ export class SDKInstance {
     this.registerProcessHandlers();
     this.processMetadata.startEventLoopLagMeasurement();
     this.drainDeadLetters();
+
+    if (this.config.flushIntervalMs > 0) {
+      const flushTimer = setInterval(() => {
+        void this.transport.flush().catch(() => undefined);
+      }, this.config.flushIntervalMs);
+      flushTimer.unref();
+      this.timers.push(flushTimer);
+    }
 
     this.state = 'active';
   }
@@ -240,6 +253,15 @@ export class SDKInstance {
     });
 
     return this.als.runWithContext(context as RequestContext, fn);
+  }
+
+  public async flush(): Promise<void> {
+    if (this.state !== 'active') {
+      return;
+    }
+
+    await this.errorCapturer.shutdown({ timeoutMs: 5000 });
+    await this.transport.flush();
   }
 
   public isActive(): boolean {
@@ -440,6 +462,9 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
       '[ErrorCore] Dead-letter persistence is disabled because no encryptionKey or HTTP authorization secret is configured.'
     );
   }
+  const sourceMapResolver = config.resolveSourceMaps
+    ? new SourceMapResolver()
+    : null;
   const packageAssemblyDispatcher = config.useWorkerAssembly
     ? new PackageAssemblyDispatcher({ config })
     : null;
@@ -457,7 +482,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     config,
     packageAssemblyDispatcher,
     stateTrackerStatus: stateTracker,
-    deadLetterStore
+    deadLetterStore,
+    sourceMapResolver
   });
 
   return new SDKInstance({

@@ -101,7 +101,9 @@ describe('resolveConfig', () => {
       allowInvalidCollectorCertificates: false,
       allowInsecureTransport: false,
       maxDrainOnStartup: 100,
-      useWorkerAssembly: false
+      useWorkerAssembly: false,
+      flushIntervalMs: 5000,
+      resolveSourceMaps: true
     });
   });
 
@@ -267,7 +269,7 @@ describe('resolveConfig', () => {
       'utf8'
     );
 
-    expect(template).toContain('allowUnencrypted: false');
+    expect(template).toContain('allowUnencrypted: true');
     expect(template).toContain('allowPlainHttpTransport: false');
     expect(template).toContain('allowInvalidCollectorCertificates: false');
     expect(template).not.toContain("'multipart/form-data'");

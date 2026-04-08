@@ -5,6 +5,24 @@ import { FileTransport } from './file-transport';
 import { HttpTransport } from './http-transport';
 import { StdoutTransport } from './stdout-transport';
 
+const debugEnabled = typeof process !== 'undefined' && process.env?.ERRORCORE_DEBUG === '1';
+
+function debug(message: string): void {
+  if (debugEnabled) {
+    console.debug(`[ErrorCore:transport] ${message}`);
+  }
+}
+
+function isWebpackBundled(): boolean {
+  try {
+    return typeof __webpack_require__ !== 'undefined';
+  } catch {
+    return false;
+  }
+}
+
+declare const __webpack_require__: unknown;
+
 interface WorkerLike {
   postMessage(message: unknown): void;
   on(event: 'message', listener: (message: unknown) => void): this;
@@ -248,6 +266,8 @@ export class TransportDispatcher implements Transport {
   }
 
   public async send(payload: string | Buffer): Promise<void> {
+    debug(`send() called, worker=${this.worker !== null ? 'active' : 'null'}`);
+
     if (this.worker !== null) {
       return this.dispatchToWorker('send', payload);
     }
@@ -295,6 +315,19 @@ export class TransportDispatcher implements Transport {
   }
 
   private initializeWorker(): void {
+    if (this.config.transport.type === 'http') {
+      debug('HTTP transport runs on main thread, skipping worker');
+      this.fallbackToMainThread();
+      return;
+    }
+
+    if (isWebpackBundled()) {
+      debug('Webpack environment detected, skipping worker threads (eval:true is unreliable in bundlers)');
+      console.warn('[ErrorCore] Bundled environment detected — using main-thread transport (worker threads disabled).');
+      this.fallbackToMainThread();
+      return;
+    }
+
     try {
       const workerThreads = getWorkerThreads();
       const worker = new workerThreads.Worker(createWorkerSource(), {
@@ -332,8 +365,12 @@ export class TransportDispatcher implements Transport {
         }
       });
 
+      debug('Worker thread initialized successfully');
       this.worker = worker;
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      debug(`Worker init failed, falling back to main thread: ${message}`);
+      console.warn(`[ErrorCore] Worker thread init failed, using main-thread transport: ${message}`);
       this.fallbackToMainThread();
     }
   }

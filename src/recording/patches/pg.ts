@@ -242,7 +242,8 @@ function instrumentQuery(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const pg = require('pg') as {
+    const modName = 'pg';
+    const pg = require(modName) as {
       Client?: { prototype?: object };
       Pool?: { prototype?: object };
     };

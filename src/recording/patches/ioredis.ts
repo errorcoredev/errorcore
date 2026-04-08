@@ -33,7 +33,8 @@ function pushEvent(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const Redis = require('ioredis') as { prototype?: object };
+    const modName = 'ioredis';
+    const Redis = require(modName) as { prototype?: object };
 
     if (Redis.prototype !== undefined) {
       wrapMethod(Redis.prototype, 'sendCommand', (original) => {

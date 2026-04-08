@@ -138,6 +138,7 @@ export interface ErrorInfo {
   type: string;
   message: string;
   stack: string;
+  rawStack?: string;
   cause?: ErrorInfo;
   properties: Record<string, unknown>;
 }
@@ -231,6 +232,7 @@ export interface ErrorPackage {
     type: string;
     message: string;
     stack: string;
+    rawStack?: string;
     cause?: ErrorInfo;
     properties: Record<string, unknown>;
   };
@@ -355,6 +357,8 @@ export interface SDKConfig {
   deadLetterPath?: string;
   maxDrainOnStartup?: number;
   useWorkerAssembly?: boolean;
+  flushIntervalMs?: number;
+  resolveSourceMaps?: boolean;
 }
 
 export interface ResolvedConfig {
@@ -391,6 +395,8 @@ export interface ResolvedConfig {
   deadLetterPath: string | undefined;
   maxDrainOnStartup: number;
   useWorkerAssembly: boolean;
+  flushIntervalMs: number;
+  resolveSourceMaps: boolean;
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {

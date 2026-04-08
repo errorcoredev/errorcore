@@ -50,6 +50,14 @@ export function withContext<T>(fn: () => T): T {
   return instance.withContext(fn);
 }
 
+export async function flush(): Promise<void> {
+  if (instance === null) {
+    return;
+  }
+
+  await instance.flush();
+}
+
 export async function shutdown(): Promise<void> {
   if (instance === null) {
     return;

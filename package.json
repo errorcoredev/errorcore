@@ -26,6 +26,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@hono/node-server": "^1.19.13",
     "assertion-error": "^2.0.1",
     "chai": "^6.2.2",
     "es-module-lexer": "^1.7.0",
@@ -33,6 +34,7 @@
     "estree-walker": "^3.0.3",
     "expect-type": "^1.3.0",
     "fdir": "^6.5.0",
+    "hono": "^4.12.12",
     "magic-string": "^0.30.21",
     "nanoid": "^3.3.11",
     "obug": "^2.1.1",
@@ -57,6 +59,26 @@
     "@types/node": "^20.19.37",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "ioredis": ">=4",
+    "mongodb": ">=5",
+    "mysql2": ">=2",
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    },
+    "mongodb": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    }
   },
   "license": "MIT"
 }

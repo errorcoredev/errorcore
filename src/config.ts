@@ -297,7 +297,9 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     allowInsecureTransport: allowPlainHttpTransport,
     deadLetterPath: resolveDeadLetterPath(userConfig, transport),
     maxDrainOnStartup,
-    useWorkerAssembly: userConfig.useWorkerAssembly ?? false
+    useWorkerAssembly: userConfig.useWorkerAssembly ?? false,
+    flushIntervalMs: userConfig.flushIntervalMs ?? 5000,
+    resolveSourceMaps: userConfig.resolveSourceMaps ?? true
   };
 }
 

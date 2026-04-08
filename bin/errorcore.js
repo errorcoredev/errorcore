@@ -60,6 +60,8 @@ function parseArgs(argv) {
       flags.dryRun = true;
     } else if (arg === '--force') {
       flags.force = true;
+    } else if (arg === '--port' && i + 1 < argv.length) {
+      flags.port = parseInt(argv[++i], 10);
     } else if (!arg.startsWith('--')) {
       positional.push(arg);
     }
@@ -102,6 +104,8 @@ ${bold('Commands:')}
   ${cyan('status')}   [--config <path>]    Show dead-letter store status
   ${cyan('drain')}    [--config <path>]    Re-send dead-letter payloads
              [--dry-run] [--force]
+  ${cyan('ui')}       [--config <path>]    Open the error dashboard
+             [--port <number>]
   ${cyan('help')}                          Show this help message
 
 ${bold('Examples:')}
@@ -138,7 +142,10 @@ function cmdInit() {
   process.stdout.write('  2. Add to your application entry point:\n\n');
   process.stdout.write(`     ${cyan("const errorcore = require('errorcore');")}\n`);
   process.stdout.write(`     ${cyan("errorcore.init(require('./errorcore.config.js'));")}\n\n`);
-  process.stdout.write('  3. Run ' + cyan('errorcore validate') + ' to check your config\n');
+  process.stdout.write('  3. Run ' + cyan('errorcore validate') + ' to check your config\n\n');
+  process.stdout.write(yellow('Note: ') + 'allowUnencrypted is enabled for local development.\n');
+  process.stdout.write('Set encryptionKey before deploying to production:\n');
+  process.stdout.write(`  ${dim('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"')}\n`);
 }
 
 function cmdValidate(flags) {
@@ -156,8 +163,9 @@ function cmdValidate(flags) {
   if (resolved.allowUnencrypted === true && resolved.encryptionKey === undefined) {
     process.stdout.write(
       yellow('WARNING: ') +
-      'allowUnencrypted is true and no encryptionKey is set \u2014 packages are stored in plaintext. ' +
-      'Set encryptionKey before deploying to production.\n'
+      'allowUnencrypted is true and no encryptionKey is set \u2014 packages are stored in plaintext.\n' +
+      'Set encryptionKey before deploying to production. Generate one with:\n' +
+      `  ${cyan('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"')}\n\n`
     );
   }
 
@@ -396,6 +404,42 @@ function createTransportFromConfig(config, authorization) {
   die(`Unsupported transport type: ${t.type}`);
 }
 
+function cmdUI(flags) {
+  const configPath = flags.config || path.join(process.cwd(), 'errorcore.config.js');
+  const userConfig = loadConfigFile(configPath);
+  const { resolveConfig } = requireDist('config.js');
+
+  let resolved;
+  try {
+    resolved = resolveConfig(userConfig);
+  } catch (err) {
+    die(err.message || String(err));
+  }
+
+  let filePath;
+  if (resolved.transport.type === 'file') {
+    filePath = resolved.transport.path;
+  } else if (resolved.deadLetterPath) {
+    filePath = resolved.deadLetterPath;
+  } else {
+    die(
+      'Cannot determine NDJSON file path. The UI requires a file transport or deadLetterPath.\n' +
+      'Set transport.type to "file" or configure deadLetterPath in your config.'
+    );
+  }
+
+  const port = flags.port || 4400;
+
+  let encryption = null;
+  if (resolved.encryptionKey) {
+    const { Encryption } = requireDist(path.join('security', 'encryption.js'));
+    encryption = new Encryption(resolved.encryptionKey);
+  }
+
+  const { startDashboard } = requireDist(path.join('ui', 'server.js'));
+  startDashboard({ filePath, port, encryption });
+}
+
 const { flags, positional } = parseArgs(process.argv.slice(2));
 const command = positional[0] || 'help';
 
@@ -422,6 +466,10 @@ switch (command) {
     cmdDrain(flags).catch((err) => {
       die(err.message || String(err));
     });
+    break;
+
+  case 'ui':
+    cmdUI(flags);
     break;
 
   default:

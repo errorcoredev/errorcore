@@ -195,7 +195,8 @@ function instrumentMethod(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const mysql2 = require('mysql2') as {
+    const modName = 'mysql2';
+    const mysql2 = require(modName) as {
       Connection?: { prototype?: object };
     };
 
