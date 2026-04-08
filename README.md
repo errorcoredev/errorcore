@@ -43,4 +43,4 @@ Report vulnerabilities via issues or privately.
 
 ## License
 
-ISC
+[MIT](LICENSE)
