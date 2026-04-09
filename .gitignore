@@ -8,10 +8,9 @@ coverage/
 benchmark-harness/
 benchmark-results/
 test/benchmark-profiles/
-errorcore.config.js
-errorcore.config.mjs
+/errorcore.config.js
+/errorcore.config.mjs
 .errorcore-dead-letters.ndjson
 tmp-review-*/
 tmp-pre-ship-*/
 tmp-errorcore-cli-*/
-.npmignore

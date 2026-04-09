@@ -1,0 +1,44 @@
+# Source and build config (only dist/ ships)
+src/
+tsconfig.json
+vitest.config.ts
+
+# Tests and specs
+test/
+spec/
+
+# Benchmarks
+perf/
+benchmark-harness/
+benchmark-results/
+
+# Banner image (README-only)
+banner.png
+
+# Environment and secrets
+*.env
+.env*
+
+# Logs
+*.log
+
+# Pack artifacts
+*.tgz
+
+# Coverage
+coverage/
+
+# Config files
+errorcore.config.js
+errorcore.config.mjs
+
+# Dead-letter store
+.errorcore-dead-letters.ndjson
+
+# Temp directories
+tmp-review-*/
+tmp-pre-ship-*/
+tmp-errorcore-cli-*/
+
+# Node
+node_modules/
