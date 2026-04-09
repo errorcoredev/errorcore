@@ -18,6 +18,10 @@
     "bin",
     "config-template"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/errorcoredev/errorcore.git"
+  },
   "engines": {
     "node": ">=20"
   },
