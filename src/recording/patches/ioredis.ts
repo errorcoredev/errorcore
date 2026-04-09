@@ -1,7 +1,11 @@
 
+import { createRequire } from 'node:module';
+
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+
+const nodeRequire = createRequire(__filename);
 
 function toDurationMs(startTime: bigint, endTime: bigint): number {
   return Number(endTime - startTime) / 1_000_000;
@@ -33,8 +37,7 @@ function pushEvent(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const modName = 'ioredis';
-    const Redis = require(modName) as { prototype?: object };
+    const Redis = nodeRequire('ioredis') as { prototype?: object };
 
     if (Redis.prototype !== undefined) {
       wrapMethod(Redis.prototype, 'sendCommand', (original) => {

@@ -1,7 +1,11 @@
 
+import { createRequire } from 'node:module';
+
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+
+const nodeRequire = createRequire(__filename);
 
 const COLLECTION_METHODS = [
   'find',
@@ -172,8 +176,7 @@ function instrumentMethod(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const modName = 'mongodb';
-    const mongodb = require(modName) as {
+    const mongodb = nodeRequire('mongodb') as {
       Collection?: { prototype?: object };
     };
 

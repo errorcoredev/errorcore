@@ -204,11 +204,7 @@ export class InspectorManager {
       return { frames: null, missReason: 'not_initialized' };
     }
 
-    const requestId = this.getRequestId();
-
-    if (requestId === undefined) {
-      return { frames: null, missReason: 'no_request_context' };
-    }
+    const requestId = this.getRequestId() ?? '__no_context__';
 
     const appFrame = this._extractFirstAppFrameFromStack(error.stack);
 
@@ -295,15 +291,18 @@ export class InspectorManager {
             () => undefined
           );
         }
-      } catch {
+      } catch (error) {
+        console.warn('[ErrorCore] Failed to reset pause-on-exceptions during shutdown:', error instanceof Error ? error.message : String(error));
       }
       try {
         this.session.post('Debugger.disable', () => undefined);
-      } catch {
+      } catch (error) {
+        console.warn('[ErrorCore] Failed to disable debugger during shutdown:', error instanceof Error ? error.message : String(error));
       }
       try {
         this.session.disconnect();
-      } catch {
+      } catch (error) {
+        console.warn('[ErrorCore] Failed to disconnect inspector session during shutdown:', error instanceof Error ? error.message : String(error));
       }
     }
 
@@ -370,12 +369,7 @@ export class InspectorManager {
           return;
         }
 
-        const requestId = this.getRequestId();
-
-        if (requestId === undefined) {
-          this.recordMiss('no_request_context');
-          return;
-        }
+        const requestId = this.getRequestId() ?? '__no_context__';
 
         const firstAppFrame = this._toAppFrameLocation(appFrames[0]);
 

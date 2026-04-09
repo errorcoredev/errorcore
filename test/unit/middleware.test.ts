@@ -9,6 +9,7 @@ import { fastifyPlugin } from '../../src/middleware/fastify';
 import { koaMiddleware } from '../../src/middleware/koa';
 import { hapiPlugin } from '../../src/middleware/hapi';
 import { wrapHandler } from '../../src/middleware/raw-http';
+import { withErrorcore } from '../../src/middleware/nextjs';
 import { resolveTestConfig } from '../helpers/test-config';
 
 function createSdk(options?: { active?: boolean; throwOnCreate?: boolean }) {
@@ -422,5 +423,100 @@ describe('middleware adapters', () => {
 
     expect(sdk.als.createRequestContext).not.toHaveBeenCalled();
     expect(sdk.requestTracker.add).not.toHaveBeenCalled();
+  });
+
+  function createNextRequest(overrides?: {
+    method?: string;
+    url?: string;
+    headers?: Map<string, string>;
+  }) {
+    const hdrs = overrides?.headers ?? new Map([
+      ['host', 'service.local'],
+      ['authorization', 'secret'],
+      ['cookie', 'session=secret'],
+      ['x-request-id', 'req-next-1']
+    ]);
+
+    return {
+      method: overrides?.method ?? 'GET',
+      url: overrides?.url ?? 'http://localhost:3000/api/test',
+      headers: {
+        forEach: (cb: (value: string, key: string) => void) =>
+          hdrs.forEach((v, k) => cb(v, k))
+      }
+    };
+  }
+
+  it('withErrorcore propagates ALS context through async Next.js handler and cleans up', async () => {
+    const { sdk, als, getAddedContext } = createSdk();
+    let observedRequestId: string | undefined;
+
+    const handler = withErrorcore(async () => {
+      await Promise.resolve();
+      observedRequestId = als.getRequestId();
+      return { status: 'ok' };
+    }, sdk);
+
+    await handler(createNextRequest());
+
+    const captured = getAddedContext();
+
+    expect(observedRequestId).toBe(captured?.requestId);
+    expect(captured).toMatchObject({
+      method: 'GET',
+      url: 'http://localhost:3000/api/test',
+      headers: {
+        host: 'service.local',
+        'x-request-id': 'req-next-1'
+      }
+    });
+    expect(captured?.headers).not.toHaveProperty('authorization');
+    expect(captured?.headers).not.toHaveProperty('cookie');
+    expect(sdk.requestTracker.add).toHaveBeenCalledTimes(1);
+    expect(sdk.requestTracker.remove).toHaveBeenCalledWith(captured?.requestId);
+  });
+
+  it('withErrorcore passes through when SDK is not active', async () => {
+    const { sdk } = createSdk({ active: false });
+    const result = await withErrorcore(async () => 'ok', sdk)(createNextRequest());
+
+    expect(result).toBe('ok');
+    expect(sdk.requestTracker.add).not.toHaveBeenCalled();
+  });
+
+  it('withErrorcore passes through when context already exists', async () => {
+    const { sdk, als } = createSdk();
+    const existing = als.createRequestContext({
+      method: 'GET',
+      url: '/existing',
+      headers: { host: 'service.local' }
+    });
+
+    await als.runWithContext(existing, async () => {
+      await withErrorcore(async () => 'ok', sdk)(createNextRequest());
+    });
+
+    expect(sdk.als.createRequestContext).not.toHaveBeenCalled();
+    expect(sdk.requestTracker.add).not.toHaveBeenCalled();
+  });
+
+  it('withErrorcore still calls handler when SDK throws during setup', async () => {
+    const { sdk } = createSdk({ throwOnCreate: true });
+    const result = await withErrorcore(async () => 'recovered', sdk)(createNextRequest());
+
+    expect(result).toBe('recovered');
+  });
+
+  it('withErrorcore cleans up tracker even when handler throws', async () => {
+    const { sdk, getAddedContext } = createSdk();
+
+    await expect(
+      withErrorcore(async () => {
+        throw new Error('handler boom');
+      }, sdk)(createNextRequest())
+    ).rejects.toThrow('handler boom');
+
+    const captured = getAddedContext();
+    expect(sdk.requestTracker.remove).toHaveBeenCalledWith(captured?.requestId);
   });
 });

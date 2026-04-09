@@ -23,7 +23,7 @@ export const STRIPE_KEY_REGEX = /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g;
 export const GENERIC_SK_KEY_REGEX = /\bsk-[A-Za-z0-9]{10,}\b/g;
 
 export const PHONE_REGEX =
-  /(?:\+\d{1,3}[\s().-]*\d[\d(). -]{7,}\d|\(\d{2,4}\)[\s().-]*\d[\d(). -]{5,}\d|\b\d{3}[\s().-]\d{3}[\s().-]\d{4,}\b)/g;
+  /(?:\+\d{1,3}[\s().-]*\d(?:[\s().-]*\d){7,9}|\(\d{2,4}\)[\s().-]*\d(?:[\s().-]*\d){5,7}|\b\d{3}[\s().-]\d{3}[\s().-]\d{4,}\b)/g;
 
 export const IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
 

@@ -16,29 +16,25 @@ export interface EncryptedPayload {
 export class Encryption {
   private readonly encryptionKey: string;
 
-  private readonly salt: Buffer;
-
-  private readonly derivedKey: Buffer;
-
   public constructor(encryptionKey: string) {
     if (encryptionKey.length === 0) {
       throw new Error('encryptionKey must not be empty');
     }
 
     this.encryptionKey = encryptionKey;
-    this.salt = randomBytes(16);
-    this.derivedKey = pbkdf2Sync(
+  }
+
+  public encrypt(plaintext: string): EncryptedPayload {
+    const salt = randomBytes(16);
+    const derivedKey = pbkdf2Sync(
       this.encryptionKey,
-      this.salt,
+      salt,
       100000,
       32,
       'sha256'
     );
-  }
-
-  public encrypt(plaintext: string): EncryptedPayload {
     const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', this.derivedKey, iv);
+    const cipher = createCipheriv('aes-256-gcm', derivedKey, iv);
     const ciphertext = Buffer.concat([
       cipher.update(plaintext, 'utf8'),
       cipher.final()
@@ -46,7 +42,7 @@ export class Encryption {
     const authTag = cipher.getAuthTag();
 
     return {
-      salt: this.salt.toString('base64'),
+      salt: salt.toString('base64'),
       iv: iv.toString('base64'),
       ciphertext: ciphertext.toString('base64'),
       authTag: authTag.toString('base64')

@@ -41,7 +41,7 @@ function startPackageAssemblyWorker(data: PackageAssemblyWorkerData): void {
     } catch (error) {
       port.postMessage({
         id: message.id,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? (error.stack ?? error.message) : String(error)
       } satisfies PackageAssemblyWorkerResponse);
     }
   });

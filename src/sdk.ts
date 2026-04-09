@@ -456,7 +456,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
       : null;
 
   if (config.deadLetterPath !== undefined && deadLetterIntegrityKey === null) {
-    // FIX ASSUMPTION: Disable automatic dead-letter replay when no stable secret
+    // Design note: Disable automatic dead-letter replay when no stable secret
     // is configured because unsigned disk content cannot be trusted safely.
     console.warn(
       '[ErrorCore] Dead-letter persistence is disabled because no encryptionKey or HTTP authorization secret is configured.'

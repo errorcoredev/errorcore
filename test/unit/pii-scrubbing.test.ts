@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { HeaderFilter } from '../../src/pii/header-filter';
-import { looksLikeHighEntropySecret, Scrubber } from '../../src/pii/scrubber';
+import { looksLikeHighEntropySecret, redactSensitiveQueryText, Scrubber } from '../../src/pii/scrubber';
 import { isValidLuhn } from '../../src/pii/patterns';
 import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 
@@ -394,5 +394,57 @@ describe('HeaderFilter', () => {
       'content-type': 'application/json',
       'x-request-id': 'req-1'
     });
+  });
+});
+
+describe('redactSensitiveQueryText', () => {
+
+  it.each([
+    ['SELECT * FROM users', 'SELECT * FROM users'],
+    ['INSERT INTO logs VALUES ($1, $2)', 'INSERT INTO logs VALUES ($1, $2)'],
+    ['UPDATE users SET name = $1', 'UPDATE users SET name = $1'],
+    ['DELETE FROM sessions WHERE expired = true', 'DELETE FROM sessions WHERE expired = true'],
+    ['CREATE TABLE users (id SERIAL)', 'CREATE TABLE users (id SERIAL)'],
+    ['ALTER TABLE users ADD COLUMN email TEXT', 'ALTER TABLE users ADD COLUMN email TEXT'],
+    ['DROP TABLE temp_data', 'DROP TABLE temp_data'],
+    ['CREATE INDEX idx_name ON users (name)', 'CREATE INDEX idx_name ON users (name)'],
+    ['', ''],
+  ])('passes through safe query: %s', (input, expected) => {
+    expect(redactSensitiveQueryText(input)).toBe(expected);
+  });
+
+  it.each([
+    ["ALTER USER admin WITH PASSWORD 'secret123'", '[REDACTED: ALTER USER/ROLE statement]'],
+    ["CREATE USER 'newuser' IDENTIFIED BY 'pass'", '[REDACTED: CREATE USER/ROLE statement]'],
+    ["ALTER ROLE myuser WITH PASSWORD 'secret'", '[REDACTED: ALTER USER/ROLE statement]'],
+    ["CREATE ROLE dba WITH LOGIN PASSWORD 'x'", '[REDACTED: CREATE USER/ROLE statement]'],
+    ['DROP USER olduser', '[REDACTED: DROP USER/ROLE statement]'],
+    ['DROP ROLE testrole', '[REDACTED: DROP USER/ROLE statement]'],
+    ["SET PASSWORD = 'newsecret'", '[REDACTED: SET PASSWORD statement]'],
+    ['SET SESSION AUTHORIZATION admin', '[REDACTED: SET SESSION AUTHORIZATION statement]'],
+    ['GRANT SELECT ON users TO readonly', '[REDACTED: GRANT statement]'],
+    ['REVOKE ALL ON users FROM public', '[REDACTED: REVOKE statement]'],
+  ])('redacts sensitive query: %s', (input, expected) => {
+    expect(redactSensitiveQueryText(input)).toBe(expected);
+  });
+
+  it('redacts with leading whitespace', () => {
+    expect(redactSensitiveQueryText("  ALTER USER admin PASSWORD 'x'"))
+      .toBe('[REDACTED: ALTER USER/ROLE statement]');
+  });
+
+  it('redacts with leading SQL block comment', () => {
+    expect(redactSensitiveQueryText("/* prisma */ CREATE USER test IDENTIFIED BY 'y'"))
+      .toBe('[REDACTED: CREATE USER/ROLE statement]');
+  });
+
+  it('redacts with leading SQL line comment', () => {
+    expect(redactSensitiveQueryText("-- comment\nGRANT ALL ON schema TO admin"))
+      .toBe('[REDACTED: GRANT statement]');
+  });
+
+  it('does not redact GRANT-like strings that appear mid-query', () => {
+    expect(redactSensitiveQueryText("SELECT * FROM users WHERE role = 'GRANT_ADMIN'"))
+      .toBe("SELECT * FROM users WHERE role = 'GRANT_ADMIN'");
   });
 });

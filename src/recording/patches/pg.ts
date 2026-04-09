@@ -1,7 +1,12 @@
 
+import { createRequire } from 'node:module';
+
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+import { redactSensitiveQueryText } from '../../pii/scrubber';
+
+const nodeRequire = createRequire(__filename);
 
 interface PgQueryDetails {
   text: string;
@@ -179,7 +184,7 @@ function instrumentQuery(
       startTime,
       target: getPgTarget(this as Record<string, unknown>),
       method: methodName,
-      query: query.text,
+      query: redactSensitiveQueryText(query.text),
       params: query.values
     });
     let finished = false;
@@ -242,8 +247,7 @@ function instrumentQuery(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const modName = 'pg';
-    const pg = require(modName) as {
+    const pg = nodeRequire('pg') as {
       Client?: { prototype?: object };
       Pool?: { prototype?: object };
     };

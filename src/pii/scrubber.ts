@@ -145,6 +145,33 @@ function detectBodyEncoding(contentType: string | undefined): BufferEncoding {
   return 'utf8';
 }
 
+const SENSITIVE_SQL_QUICK_TEST =
+  /^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*(ALTER\s+(?:USER|ROLE|LOGIN)|CREATE\s+(?:USER|ROLE|LOGIN)|DROP\s+(?:USER|ROLE|LOGIN)|SET\s+PASSWORD|SET\s+SESSION\s+AUTHORIZATION|GRANT\b|REVOKE\b)/i;
+
+const SENSITIVE_SQL_LABELS: ReadonlyArray<[RegExp, string]> = [
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*ALTER\s+(?:USER|ROLE|LOGIN)/i, 'ALTER USER/ROLE'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*CREATE\s+(?:USER|ROLE|LOGIN)/i, 'CREATE USER/ROLE'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*DROP\s+(?:USER|ROLE|LOGIN)/i, 'DROP USER/ROLE'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*SET\s+PASSWORD/i, 'SET PASSWORD'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*SET\s+SESSION\s+AUTHORIZATION/i, 'SET SESSION AUTHORIZATION'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*GRANT\b/i, 'GRANT'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*REVOKE\b/i, 'REVOKE'],
+];
+
+export function redactSensitiveQueryText(query: string): string {
+  if (!SENSITIVE_SQL_QUICK_TEST.test(query)) {
+    return query;
+  }
+
+  for (const [pattern, label] of SENSITIVE_SQL_LABELS) {
+    if (pattern.test(query)) {
+      return `[REDACTED: ${label} statement]`;
+    }
+  }
+
+  return query;
+}
+
 export class Scrubber {
   private readonly config: ResolvedConfig;
 

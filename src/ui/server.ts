@@ -10,17 +10,47 @@ export interface DashboardOptions {
   filePath: string;
   port: number;
   encryption: Encryption | null;
+  token?: string;
+  hostname?: string;
 }
 
 export function startDashboard(options: DashboardOptions): ReturnType<typeof serve> {
   const { filePath, port, encryption } = options;
+  const token = options.token ?? process.env.EC_DASHBOARD_TOKEN;
+
+  if (token !== undefined && token !== '' && !/^[a-zA-Z0-9_\-]+$/.test(token)) {
+    throw new Error(
+      'Dashboard token must contain only alphanumeric characters, hyphens, and underscores'
+    );
+  }
+
+  const effectiveToken = token !== undefined && token !== '' ? token : undefined;
+
   const reader = new NdjsonReader(filePath, encryption);
   reader.watch();
 
   const app = new Hono();
 
+  if (effectiveToken !== undefined) {
+    app.use('/api/*', async (c, next) => {
+      if (c.req.header('authorization') !== `Bearer ${effectiveToken}`) {
+        return c.json({ error: 'Unauthorized' }, 401);
+      }
+
+      await next();
+    });
+  }
+
+  app.post('*', async (c, next) => {
+    if (c.req.header('x-errorcore-action') !== 'true') {
+      return c.json({ error: 'Missing X-ErrorCore-Action header' }, 403);
+    }
+
+    await next();
+  });
+
   app.get('/', (c: Context) => {
-    return c.html(renderHTML());
+    return c.html(renderHTML(effectiveToken));
   });
 
   app.get('/api/errors', (c: Context) => {
@@ -58,8 +88,17 @@ export function startDashboard(options: DashboardOptions): ReturnType<typeof ser
     return c.json({ status: 'ok' });
   });
 
-  const server = serve({ fetch: app.fetch, port }, (info: { port: number }) => {
-    console.log(`\n  ErrorCore Dashboard running at http://localhost:${info.port}\n`);
+  const hostname = options.hostname ?? (effectiveToken !== undefined ? '0.0.0.0' : '127.0.0.1');
+
+  if (effectiveToken === undefined) {
+    console.warn(
+      '[ErrorCore] No dashboard token configured. Binding to localhost only.\n' +
+      '  Set EC_DASHBOARD_TOKEN or pass token in options to enable remote access.'
+    );
+  }
+
+  const server = serve({ fetch: app.fetch, port, hostname }, (info: { port: number }) => {
+    console.log(`\n  ErrorCore Dashboard running at http://${hostname}:${info.port}\n`);
   });
 
   const shutdown = () => {

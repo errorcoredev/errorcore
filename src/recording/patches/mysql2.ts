@@ -1,7 +1,12 @@
 
+import { createRequire } from 'node:module';
+
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+import { redactSensitiveQueryText } from '../../pii/scrubber';
+
+const nodeRequire = createRequire(__filename);
 
 function formatParams(values: unknown[], captureActualValues: boolean): string | undefined {
   if (values.length === 0) {
@@ -124,7 +129,7 @@ function instrumentMethod(
       error: null,
       aborted: false,
       dbMeta: {
-        query: parsed.sql,
+        query: redactSensitiveQueryText(parsed.sql),
         params: formatParams(parsed.values, deps.config.captureDbBindParams),
         rowCount: null
       }
@@ -195,8 +200,7 @@ function instrumentMethod(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const modName = 'mysql2';
-    const mysql2 = require(modName) as {
+    const mysql2 = nodeRequire('mysql2') as {
       Connection?: { prototype?: object };
     };
 

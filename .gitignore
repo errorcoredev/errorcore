@@ -14,3 +14,4 @@ errorcore.config.mjs
 tmp-review-*/
 tmp-pre-ship-*/
 tmp-errorcore-cli-*/
+.npmignore

@@ -15,9 +15,13 @@ const MAX_CACHE_SIZE = 50;
 export class SourceMapResolver {
   private readonly cache = new Map<string, CachedConsumer | null>();
 
+  private warnedNoMaps = false;
+
   public resolveStack(stack: string): string {
     const lines = stack.split('\n');
     const resolved: string[] = [];
+    let frameCount = 0;
+    let resolvedCount = 0;
 
     for (const line of lines) {
       const match = V8_FRAME_RE.exec(line);
@@ -30,6 +34,8 @@ export class SourceMapResolver {
       const [, indent, funcName, filePath, lineStr, colStr] = match;
       const lineNum = parseInt(lineStr, 10);
       const colNum = parseInt(colStr, 10);
+
+      frameCount++;
 
       const consumer = this.getConsumer(filePath);
 
@@ -48,6 +54,7 @@ export class SourceMapResolver {
         continue;
       }
 
+      resolvedCount++;
       const resolvedFunc = original.name ?? funcName;
       const resolvedCol = (original.column ?? 0) + 1;
       const resolvedSource = original.source;
@@ -57,6 +64,20 @@ export class SourceMapResolver {
       } else {
         resolved.push(`${indent}${resolvedSource}:${original.line}:${resolvedCol}`);
       }
+    }
+
+    if (!this.warnedNoMaps && resolvedCount === 0 && frameCount > 0) {
+      this.warnedNoMaps = true;
+      console.warn(
+        '[ErrorCore] No source maps found for captured stack traces. ' +
+        'Stack frames will reference minified/bundled locations.\n' +
+        'If you use a bundler (webpack, esbuild, Next.js, etc.), configure it to emit ' +
+        'server-side source maps. For Next.js, add to next.config.mjs:\n' +
+        '  webpack: (config, { isServer }) => {\n' +
+        '    if (isServer) config.devtool = "source-map";\n' +
+        '    return config;\n' +
+        '  },'
+      );
     }
 
     return resolved.join('\n');
@@ -122,7 +143,12 @@ export class SourceMapResolver {
         return new SourceMapConsumer(JSON.parse(decoded));
       }
 
-      const mapPath = path.resolve(path.dirname(filePath), url);
+      const baseDir = path.resolve(path.dirname(filePath));
+      const mapPath = path.resolve(baseDir, url);
+
+      if (!mapPath.startsWith(baseDir + path.sep) && mapPath !== baseDir) {
+        return null;
+      }
 
       if (!fs.existsSync(mapPath)) {
         return null;

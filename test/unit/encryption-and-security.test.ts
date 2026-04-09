@@ -58,6 +58,19 @@ describe('Encryption', () => {
   it('rejects an empty encryption key', () => {
     expect(() => new Encryption('')).toThrow('encryptionKey must not be empty');
   });
+
+  it('produces different salts and ciphertexts for the same plaintext on the same instance', () => {
+    const encryption = new Encryption('top-secret-key');
+    const first = encryption.encrypt('identical plaintext');
+    const second = encryption.encrypt('identical plaintext');
+
+    expect(first.salt).not.toBe(second.salt);
+    expect(first.ciphertext).not.toBe(second.ciphertext);
+    expect(first.iv).not.toBe(second.iv);
+
+    expect(encryption.decrypt(first)).toBe('identical plaintext');
+    expect(encryption.decrypt(second)).toBe('identical plaintext');
+  });
 });
 
 describe('RateLimiter', () => {

@@ -1,5 +1,5 @@
 
-export function renderHTML(): string {
+export function renderHTML(apiToken?: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -117,6 +117,13 @@ export function renderHTML(): string {
     import htm from 'https://esm.sh/htm@3.1.1';
     const html = htm.bind(h);
 
+    function escapeHtml(s) {
+      if (typeof s !== 'string') return s == null ? '' : String(s);
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;');
+    }
+    const API_TOKEN = ${apiToken ? `'${apiToken.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'` : 'null'};
+    const authHeaders = API_TOKEN ? { 'Authorization': 'Bearer ' + API_TOKEN } : {};
+
     function typeClass(t) {
       return ['Error','TypeError','RangeError'].includes(t) ? 'type-'+t : 'type-default';
     }
@@ -163,15 +170,15 @@ export function renderHTML(): string {
       function fetchErrors() {
         const params = new URLSearchParams({ page, limit, sort });
         if (search) params.set('search', search);
-        fetch('/api/errors?' + params).then(r => r.json()).then(data => {
+        fetch('/api/errors?' + params, { headers: authHeaders }).then(r => r.json()).then(data => {
           setErrors(data.entries); setTotal(data.total);
         });
       }
       function fetchStats() {
-        fetch('/api/stats').then(r => r.json()).then(setStats);
+        fetch('/api/stats', { headers: authHeaders }).then(r => r.json()).then(setStats);
       }
       function openDetail(id) {
-        fetch('/api/errors/' + id).then(r => r.json()).then(data => {
+        fetch('/api/errors/' + id, { headers: authHeaders }).then(r => r.json()).then(data => {
           setDetail(data); setView('detail');
         });
       }
@@ -201,7 +208,7 @@ export function renderHTML(): string {
               <option value="newest">Newest first</option>
               <option value="oldest">Oldest first</option>
             </select>
-            <button class="btn-refresh" type="button" onClick=\${() => { fetch('/api/refresh', {method:'POST'}).then(fetchErrors); }}>\u21bb Refresh</button>
+            <button class="btn-refresh" type="button" onClick=\${() => { fetch('/api/refresh', {method:'POST', headers: {...authHeaders, 'X-ErrorCore-Action': 'true'}}).then(fetchErrors); }}>\u21bb Refresh</button>
           </form>
           \${errors.length === 0 ? html\`
             <div class="empty-state">
@@ -259,8 +266,8 @@ export function renderHTML(): string {
       return html\`
         <div class="detail">
           <div class="detail-header">
-            <h2><span class="type-badge \${typeClass(pkg.error?.type)}">\${pkg.error?.type}</span> \${pkg.error?.message}</h2>
-            <div class="meta">\${fmtTime(pkg.capturedAt)}\${req ? ' \u2014 ' + req.method + ' ' + req.url : ''}</div>
+            <h2><span class="type-badge \${typeClass(pkg.error?.type)}">\${escapeHtml(pkg.error?.type)}</span> \${escapeHtml(pkg.error?.message)}</h2>
+            <div class="meta">\${fmtTime(pkg.capturedAt)}\${req ? ' \u2014 ' + escapeHtml(req.method + ' ' + req.url) : ''}</div>
           </div>
 
           <div class="section">
@@ -276,7 +283,7 @@ export function renderHTML(): string {
             \${!collapsed.io && io.map(ev => html\`
               <div class="io-item">
                 <span class="method-badge \${ev.type === 'db-query' ? 'method-query' : methodClass(ev.method || '')}">\${ev.type === 'db-query' ? (ev.method || 'query') : (ev.method || ev.type)}</span>
-                <span class="io-target">\${ev.url || ev.target}\${ev.dbMeta?.query ? ' \u2014 ' + ev.dbMeta.query : ''}</span>
+                <span class="io-target">\${escapeHtml(ev.url || ev.target)}\${ev.dbMeta?.query ? ' \u2014 ' + escapeHtml(ev.dbMeta.query) : ''}</span>
                 \${ev.statusCode ? html\`<span class="status-chip \${statusClass(ev.statusCode)}">\${ev.statusCode}</span>\` : ''}
                 <span class="io-duration">\${fmtDuration(ev.durationMs)}</span>
                 <div style="width:80px"><div class="duration-bar" style="width:\${Math.max(2, (ev.durationMs||0)/maxDur*80)}px"></div></div>
@@ -290,7 +297,7 @@ export function renderHTML(): string {
               <dt>Method</dt><dd>\${req.method}</dd>
               <dt>URL</dt><dd>\${req.url}</dd>
               <dt>Request ID</dt><dd>\${req.id}</dd>
-              \${req.headers && Object.entries(req.headers).map(([k,v]) => html\`<dt>\${k}</dt><dd>\${v}</dd>\`)}
+              \${req.headers && Object.entries(req.headers).map(([k,v]) => html\`<dt>\${escapeHtml(k)}</dt><dd>\${escapeHtml(v)}</dd>\`)}
             </dl>\`}
           </div>\`}
 
@@ -311,7 +318,7 @@ export function renderHTML(): string {
           \${Object.keys(env).length > 0 && html\`<div class="section">
             <h3 onClick=\${() => toggle('env')}>\${collapsed.env ? '\u25b6' : '\u25bc'} Environment</h3>
             \${!collapsed.env && html\`<dl class="kv-grid">
-              \${Object.entries(env).map(([k,v]) => html\`<dt>\${k}</dt><dd>\${v}</dd>\`)}
+              \${Object.entries(env).map(([k,v]) => html\`<dt>\${escapeHtml(k)}</dt><dd>\${escapeHtml(v)}</dd>\`)}
             </dl>\`}
           </div>\`}
 
@@ -324,7 +331,7 @@ export function renderHTML(): string {
 
           <div class="section">
             <h3 onClick=\${() => setShowRaw(!showRaw)}>\${showRaw ? '\u25bc' : '\u25b6'} Raw JSON</h3>
-            \${showRaw && html\`<div class="raw-json">\${JSON.stringify(pkg, null, 2)}</div>\`}
+            \${showRaw && html\`<div class="raw-json">\${escapeHtml(JSON.stringify(pkg, null, 2))}</div>\`}
           </div>
         </div>\`;
     }
@@ -344,7 +351,7 @@ export function renderHTML(): string {
             <h3>By Type</h3>
             <ul class="stat-list">
               \${Object.entries(stats.byType).sort(([,a],[,b]) => b-a).map(([type, count]) => html\`
-                <li><span class="type-badge \${typeClass(type)}">\${type}</span> <span class="stat-count">\${count}</span></li>
+                <li><span class="type-badge \${typeClass(type)}">\${escapeHtml(type)}</span> <span class="stat-count">\${count}</span></li>
               \`)}
             </ul>
           </div>
@@ -352,7 +359,7 @@ export function renderHTML(): string {
             <h3>Top Errors</h3>
             <ul class="stat-list">
               \${stats.topErrors.map(e => html\`
-                <li><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">\${e.message}</span> <span class="stat-count">\${e.count}</span></li>
+                <li><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">\${escapeHtml(e.message)}</span> <span class="stat-count">\${e.count}</span></li>
               \`)}
             </ul>
           </div>

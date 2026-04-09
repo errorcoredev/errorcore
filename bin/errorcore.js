@@ -145,7 +145,12 @@ function cmdInit() {
   process.stdout.write('  3. Run ' + cyan('errorcore validate') + ' to check your config\n\n');
   process.stdout.write(yellow('Note: ') + 'allowUnencrypted is enabled for local development.\n');
   process.stdout.write('Set encryptionKey before deploying to production:\n');
-  process.stdout.write(`  ${dim('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"')}\n`);
+  process.stdout.write(`  ${dim('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"')}\n\n`);
+  process.stdout.write(bold('Source maps:') + ' For readable stack traces in Next.js, add to next.config.mjs:\n');
+  process.stdout.write(`  ${dim('webpack: (config, { isServer }) => {')}\n`);
+  process.stdout.write(`  ${dim('  if (isServer) config.devtool = "source-map";')}\n`);
+  process.stdout.write(`  ${dim('  return config;')}\n`);
+  process.stdout.write(`  ${dim('},')}\n`);
 }
 
 function cmdValidate(flags) {
@@ -166,6 +171,14 @@ function cmdValidate(flags) {
       'allowUnencrypted is true and no encryptionKey is set \u2014 packages are stored in plaintext.\n' +
       'Set encryptionKey before deploying to production. Generate one with:\n' +
       `  ${cyan('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"')}\n\n`
+    );
+  }
+
+  if (resolved.resolveSourceMaps === true) {
+    process.stdout.write(
+      cyan('NOTE: ') +
+      'resolveSourceMaps is enabled. Ensure your bundler emits .map files for server-side code.\n' +
+      'Without source maps, captured stack traces will reference minified locations.\n\n'
     );
   }
 
@@ -405,7 +418,8 @@ function createTransportFromConfig(config, authorization) {
 }
 
 function cmdUI(flags) {
-  const configPath = flags.config || path.join(process.cwd(), 'errorcore.config.js');
+  const configPath = path.resolve(flags.config || path.join(process.cwd(), 'errorcore.config.js'));
+  const configDir = path.dirname(configPath);
   const userConfig = loadConfigFile(configPath);
   const { resolveConfig } = requireDist('config.js');
 
@@ -418,9 +432,10 @@ function cmdUI(flags) {
 
   let filePath;
   if (resolved.transport.type === 'file') {
-    filePath = resolved.transport.path;
+    // Resolve relative paths against the config file's directory, not CWD
+    filePath = path.resolve(configDir, resolved.transport.path);
   } else if (resolved.deadLetterPath) {
-    filePath = resolved.deadLetterPath;
+    filePath = path.resolve(configDir, resolved.deadLetterPath);
   } else {
     die(
       'Cannot determine NDJSON file path. The UI requires a file transport or deadLetterPath.\n' +
@@ -436,8 +451,10 @@ function cmdUI(flags) {
     encryption = new Encryption(resolved.encryptionKey);
   }
 
+  const token = process.env.EC_DASHBOARD_TOKEN || undefined;
+
   const { startDashboard } = requireDist(path.join('ui', 'server.js'));
-  startDashboard({ filePath, port, encryption });
+  startDashboard({ filePath, port, encryption, token });
 }
 
 const { flags, positional } = parseArgs(process.argv.slice(2));

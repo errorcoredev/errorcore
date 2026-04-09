@@ -488,7 +488,6 @@ describe('InspectorManager', () => {
 
       expect(result.frames).toBeNull();
       expect(result.missReason).toContain('cache_miss');
-      expect(result.missReason).toContain('no_request_context');
       manager.shutdown();
     });
   });
@@ -506,10 +505,9 @@ describe('InspectorManager', () => {
 
       manager.ensureDebuggerActive();
 
-      expect(manager.getLocalsWithDiagnostics(buildErrorAt())).toEqual({
-        frames: null,
-        missReason: 'no_request_context'
-      });
+      const noContextResult = manager.getLocalsWithDiagnostics(buildErrorAt());
+      expect(noContextResult.frames).toBeNull();
+      expect(noContextResult.missReason).toContain('cache_miss');
 
       activeRequestId = 'req-1';
       expect(
