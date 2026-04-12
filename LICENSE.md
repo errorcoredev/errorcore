@@ -18,9 +18,7 @@ The licensor grants you an additional copyright license to distribute copies of 
 
 ## Notices
 
-You must ensure that anyone who gets a copy of any part of the software from you also gets a copy of these terms or the URL for them above, as well as copies of any plain-text lines beginning with `Required Notice:` that the licensor provided with the software. For example:
-
-Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
+You must ensure that anyone who gets a copy of any part of the software from you also gets a copy of these terms or the URL for them above, as well as copies of any plain-text lines beginning with `Required Notice:` that the licensor provided with the software.
 
 ## Changes and New Works License
 
@@ -70,4 +68,4 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 
 ## Commercial License
 
-Companies exceeding the Small Business thresholds above require a commercial license. Contact errorcore@pm.me for pricing.
+Companies exceeding the Small Business thresholds above require a commercial license. Contact hv@errorcore.dev for pricing.
