@@ -38,15 +38,10 @@ export class SourceMapResolver {
 
       frameCount++;
 
-      // Normalize webpack-internal:// virtual URLs to real module paths.
-      // eval-source-map preserves original line numbers, so the positions
-      // are already correct relative to the original source.
       const effectivePath = this.normalizeWebpackPath(filePath);
       const consumer = this.getConsumer(effectivePath);
 
       if (consumer === null) {
-        // If the path was normalized from a webpack URL, rewrite the frame
-        // to use the clean path even without a source map.
         if (effectivePath !== filePath) {
           if (funcName) {
             resolved.push(`${indent}${funcName} (${effectivePath}:${lineStr}:${colStr})`);

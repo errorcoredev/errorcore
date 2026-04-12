@@ -62,7 +62,6 @@ function formatValue(value: unknown, baseIndent: number, depth: number, maxDepth
     return formatArray(value, baseIndent, depth, maxDepth);
   }
 
-  // Handle serialization markers from clone-and-limit
   const obj = value as Record<string, unknown>;
   if (obj._type === 'Map' || obj._type === 'Set') {
     return theme.dim(`[${obj._type as string}(${obj.size as number})]`);

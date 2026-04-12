@@ -16,7 +16,6 @@ export interface ParsedStack {
 
 export type CollapsedEntry = ParsedFrame | { collapsed: number };
 
-// Handles both Unix and Windows paths (C:\...) in V8 stack traces
 const FRAME_RE = /^\s*at\s+(?:(.+?)\s+\()?((?:[A-Za-z]:)?[^:]+):(\d+):(\d+)\)?$/;
 
 function isVendorPath(filePath: string): boolean {

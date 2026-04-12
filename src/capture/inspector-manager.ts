@@ -365,10 +365,6 @@ export class InspectorManager {
           .slice(0, this.maxLocalsFrames);
 
         if (appFrames.length === 0) {
-          // In webpack/bundler eval contexts, V8 may report empty URLs for
-          // eval frames while other frames carry webpack-internal:// URLs.
-          // Do a second pass: if any frame has a webpack-internal URL, accept
-          // frames with empty URLs that have a local scope chain.
           const hasWebpackContext = params.callFrames.some(
             (frame) => frame.url !== undefined && frame.url.startsWith('webpack-internal://')
           );
@@ -390,8 +386,6 @@ export class InspectorManager {
 
         const requestId = this.getRequestId() ?? '__no_context__';
 
-        // When a frame was accepted via the webpack fallback pass (empty URL),
-        // use the first webpack-internal URL from other frames as the file path.
         const webpackFallbackUrl = appFrames[0]?.url === ''
           ? params.callFrames.find((f) => f.url?.startsWith('webpack-internal://'))?.url
           : undefined;
@@ -626,11 +620,6 @@ export class InspectorManager {
     let location = trimmed.startsWith('at ') ? trimmed.slice(3).trim() : trimmed;
 
     if (location.endsWith(')')) {
-      // Find the opening parenthesis that separates the function name from
-      // the file location. We cannot use lastIndexOf('(') because URLs like
-      // webpack-internal:///(rsc)/... contain literal parentheses.
-      // The V8 format is: "funcName (path:line:col)" where the opening paren
-      // is always preceded by a space.
       let openParenIndex = -1;
 
       for (let i = location.length - 1; i >= 0; i--) {
@@ -667,8 +656,6 @@ export class InspectorManager {
   private _normalizeFramePath(filePath: string): string {
     let normalized = filePath.replace(/^file:\/\//, '').replace(/\\/g, '/');
 
-    // Normalize webpack-internal:// URLs to the original module path.
-    // e.g. webpack-internal:///(rsc)/./app/api/route.ts → ./app/api/route.ts
     const webpackMatch = normalized.match(/^webpack-internal:\/\/\/[^/]*\/(\.\/.+)$/);
     if (webpackMatch !== null) {
       normalized = webpackMatch[1];

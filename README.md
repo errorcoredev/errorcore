@@ -43,4 +43,4 @@ Report vulnerabilities via issues or privately.
 
 ## License
 
-[MIT](LICENSE)
+[PolyForm Small Business 1.0.0](LICENSE) — free for individuals and companies under $1M revenue. Commercial license required above that threshold.

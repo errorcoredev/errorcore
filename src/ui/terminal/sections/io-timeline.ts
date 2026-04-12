@@ -26,13 +26,10 @@ export function renderIOTimeline(pkg: ErrorPackage): string | null {
 function formatEventLine(ev: IOEventSerialized): string {
   const parts: string[] = [];
 
-  // Timestamp
   parts.push(theme.timestamp(formatTimestamp(ev.startTime)));
 
-  // Type label
   parts.push(theme.ioType(ev.type));
 
-  // Method + target
   if (ev.method !== null) {
     parts.push(colorForMethod(ev.method)(ev.method.toUpperCase()));
   }
@@ -40,17 +37,14 @@ function formatEventLine(ev: IOEventSerialized): string {
   const target = ev.url ?? ev.target;
   parts.push(theme.dim(truncate(target, 50)));
 
-  // Status code
   if (ev.statusCode !== null) {
     parts.push(colorForStatus(ev.statusCode)(String(ev.statusCode)));
   }
 
-  // Duration
   if (ev.durationMs !== null) {
     parts.push(colorForDuration(ev.durationMs)(formatDuration(ev.durationMs)));
   }
 
-  // Error indicator
   if (ev.error !== null) {
     parts.push(theme.errorMessage('ERR'));
   }

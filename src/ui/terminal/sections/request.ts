@@ -9,7 +9,6 @@ export function renderRequest(pkg: ErrorPackage): string | null {
   const { method, url } = pkg.request;
   const lines: string[] = [sectionHeader('Request Context')];
 
-  // Find a matching IO event to get the status code
   let statusCode: number | null = null;
   for (const ev of pkg.ioTimeline) {
     if (ev.type === 'http-server' && ev.statusCode !== null) {

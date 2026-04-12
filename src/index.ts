@@ -1,3 +1,4 @@
+// Copyright 2026 ErrorCore Dev — PolyForm Small Business 1.0.0 — see LICENSE.md
 
 import type { SDKConfig } from './types';
 import { SDKInstance, createSDK } from './sdk';

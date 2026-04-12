@@ -32,7 +32,6 @@ export function withErrorcore<
       return handler(req, routeContext);
     }
 
-    // SDK setup — if this fails, fall back to bare handler.
     let context: { requestId: string };
 
     try {
@@ -56,9 +55,6 @@ export function withErrorcore<
       return await instance.als.runWithContext(context, async () => {
         const result = await handler(req, routeContext);
 
-        // Auto-capture when the handler returns a 5xx response.
-        // The ALS context is still active here, so the captured error
-        // will be associated with the current request.
         if (
           instance.captureError !== undefined &&
           result != null &&
@@ -73,24 +69,17 @@ export function withErrorcore<
                 if (body != null && typeof body.error === 'string') {
                   message = body.error;
                 }
-              } catch {
-                // Body not JSON-parseable; use status code message
-              }
+              } catch {}
             }
             const err = new Error(message);
             err.name = 'ServerError';
             instance.captureError(err);
-          } catch {
-            // Never break the response for capture failures
-          }
+          } catch {}
         }
 
         return result;
       });
     } catch (handlerError) {
-      // Handler threw — V8 already paused at the throw site, so locals
-      // are in the inspector cache. Capture with full request context
-      // (ALS is still active inside runWithContext) before re-throwing.
       if (instance.captureError !== undefined && handlerError instanceof Error) {
         try { instance.captureError(handlerError); } catch {}
       }
