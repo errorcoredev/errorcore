@@ -10,6 +10,7 @@ interface CachedConsumer {
 
 const V8_FRAME_RE = /^(\s+at\s+)(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?$/;
 const SOURCEMAP_URL_RE = /\/\/[#@]\s*sourceMappingURL\s*=\s*(\S+)\s*$/;
+const WEBPACK_INTERNAL_RE = /^webpack-internal:\/\/\/[^/]*\/(\.\/.+)$/;
 const MAX_CACHE_SIZE = 50;
 
 export class SourceMapResolver {
@@ -37,10 +38,24 @@ export class SourceMapResolver {
 
       frameCount++;
 
-      const consumer = this.getConsumer(filePath);
+      // Normalize webpack-internal:// virtual URLs to real module paths.
+      // eval-source-map preserves original line numbers, so the positions
+      // are already correct relative to the original source.
+      const effectivePath = this.normalizeWebpackPath(filePath);
+      const consumer = this.getConsumer(effectivePath);
 
       if (consumer === null) {
-        resolved.push(line);
+        // If the path was normalized from a webpack URL, rewrite the frame
+        // to use the clean path even without a source map.
+        if (effectivePath !== filePath) {
+          if (funcName) {
+            resolved.push(`${indent}${funcName} (${effectivePath}:${lineStr}:${colStr})`);
+          } else {
+            resolved.push(`${indent}${effectivePath}:${lineStr}:${colStr}`);
+          }
+        } else {
+          resolved.push(line);
+        }
         continue;
       }
 
@@ -180,5 +195,13 @@ export class SourceMapResolver {
     if (oldestKey !== null) {
       this.cache.delete(oldestKey);
     }
+  }
+
+  private normalizeWebpackPath(filePath: string): string {
+    const match = WEBPACK_INTERNAL_RE.exec(filePath);
+    if (match !== null) {
+      return path.resolve(match[1]);
+    }
+    return filePath;
   }
 }

@@ -27,6 +27,7 @@ function createSdk(options?: { active?: boolean; throwOnCreate?: boolean }) {
   return {
     sdk: {
       isActive: () => options?.active ?? true,
+      captureError: vi.fn(),
       als: {
         createRequestContext: vi.fn((input: {
           method: string;

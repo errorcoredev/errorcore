@@ -360,18 +360,43 @@ export class InspectorManager {
           return;
         }
 
-        const appFrames = params.callFrames
+        let appFrames = params.callFrames
           .filter((frame) => this._isAppFrame(frame.url))
           .slice(0, this.maxLocalsFrames);
 
         if (appFrames.length === 0) {
-          this.recordMiss('no_app_frames');
-          return;
+          // In webpack/bundler eval contexts, V8 may report empty URLs for
+          // eval frames while other frames carry webpack-internal:// URLs.
+          // Do a second pass: if any frame has a webpack-internal URL, accept
+          // frames with empty URLs that have a local scope chain.
+          const hasWebpackContext = params.callFrames.some(
+            (frame) => frame.url !== undefined && frame.url.startsWith('webpack-internal://')
+          );
+
+          if (hasWebpackContext) {
+            appFrames = params.callFrames
+              .filter((frame) =>
+                this._isAppFrame(frame.url) ||
+                (frame.url === '' && frame.scopeChain.some((s) => s.type === 'local'))
+              )
+              .slice(0, this.maxLocalsFrames);
+          }
+
+          if (appFrames.length === 0) {
+            this.recordMiss('no_app_frames');
+            return;
+          }
         }
 
         const requestId = this.getRequestId() ?? '__no_context__';
 
-        const firstAppFrame = this._toAppFrameLocation(appFrames[0]);
+        // When a frame was accepted via the webpack fallback pass (empty URL),
+        // use the first webpack-internal URL from other frames as the file path.
+        const webpackFallbackUrl = appFrames[0]?.url === ''
+          ? params.callFrames.find((f) => f.url?.startsWith('webpack-internal://'))?.url
+          : undefined;
+
+        const firstAppFrame = this._toAppFrameLocation(appFrames[0], webpackFallbackUrl);
 
         if (firstAppFrame === null) {
           this.recordMiss('no_app_frame_key');
@@ -563,15 +588,16 @@ export class InspectorManager {
     return `${requestId}:${frame.filePath}:${frame.lineNumber}:${frame.columnNumber}`;
   }
 
-  private _toAppFrameLocation(frame: CallFrame | undefined): AppFrameLocation | null {
-    if (frame?.url === undefined || frame.url === '') {
+  private _toAppFrameLocation(frame: CallFrame | undefined, fallbackUrl?: string): AppFrameLocation | null {
+    const url = frame?.url || fallbackUrl;
+    if (url === undefined || url === '') {
       return null;
     }
 
     return {
-      filePath: this._normalizeFramePath(frame.url),
-      lineNumber: frame.location.lineNumber + 1,
-      columnNumber: frame.location.columnNumber + 1
+      filePath: this._normalizeFramePath(url),
+      lineNumber: frame!.location.lineNumber + 1,
+      columnNumber: frame!.location.columnNumber + 1
     };
   }
 
@@ -600,7 +626,19 @@ export class InspectorManager {
     let location = trimmed.startsWith('at ') ? trimmed.slice(3).trim() : trimmed;
 
     if (location.endsWith(')')) {
-      const openParenIndex = location.lastIndexOf('(');
+      // Find the opening parenthesis that separates the function name from
+      // the file location. We cannot use lastIndexOf('(') because URLs like
+      // webpack-internal:///(rsc)/... contain literal parentheses.
+      // The V8 format is: "funcName (path:line:col)" where the opening paren
+      // is always preceded by a space.
+      let openParenIndex = -1;
+
+      for (let i = location.length - 1; i >= 0; i--) {
+        if (location[i] === '(' && (i === 0 || location[i - 1] === ' ')) {
+          openParenIndex = i;
+          break;
+        }
+      }
 
       if (openParenIndex !== -1) {
         location = location.slice(openParenIndex + 1, -1);
@@ -627,7 +665,16 @@ export class InspectorManager {
   }
 
   private _normalizeFramePath(filePath: string): string {
-    return filePath.replace(/^file:\/\//, '').replace(/\\/g, '/');
+    let normalized = filePath.replace(/^file:\/\//, '').replace(/\\/g, '/');
+
+    // Normalize webpack-internal:// URLs to the original module path.
+    // e.g. webpack-internal:///(rsc)/./app/api/route.ts → ./app/api/route.ts
+    const webpackMatch = normalized.match(/^webpack-internal:\/\/\/[^/]*\/(\.\/.+)$/);
+    if (webpackMatch !== null) {
+      normalized = webpackMatch[1];
+    }
+
+    return normalized;
   }
 
   private _isAppFrame(url: string | undefined): boolean {

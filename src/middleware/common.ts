@@ -1,6 +1,7 @@
 
 export interface SDKInstanceLike {
   isActive(): boolean;
+  captureError?(error: Error): void;
   als: {
     createRequestContext(input: {
       method: string;
