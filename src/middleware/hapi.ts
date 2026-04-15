@@ -40,7 +40,8 @@ export const hapiPlugin = {
         const ctx = instance.als.createRequestContext({
           method: request.method.toUpperCase(),
           url: request.url.pathname,
-          headers: filterHeaders(instance, request.headers)
+          headers: filterHeaders(instance, request.headers),
+          traceparent: request.headers['traceparent'] as string | undefined
         });
 
         instance.requestTracker.add(ctx);

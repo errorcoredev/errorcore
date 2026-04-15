@@ -199,7 +199,8 @@ describe('SDK composition', () => {
       sdk.activate();
 
       expect(sdk.isActive()).toBe(true);
-      expect(collectSpy).toHaveBeenCalledTimes(1);
+      // collectStartupMetadata is called in the constructor, not activate()
+      expect(collectSpy).toHaveBeenCalledTimes(0);
       expect(installSpy).toHaveBeenCalledTimes(1);
       expect(subscribeSpy).toHaveBeenCalledTimes(1);
       expect(patchSpy).toHaveBeenCalledTimes(1);

@@ -32,18 +32,23 @@ export function withErrorcore<
       return handler(req, routeContext);
     }
 
-    let context: { requestId: string };
+    let context: import('../types').RequestContext;
 
     try {
       const headers: Record<string, string> = {};
+      let traceparent: string | undefined;
       req.headers.forEach((value, key) => {
         headers[key] = value;
+        if (key === 'traceparent') {
+          traceparent = value;
+        }
       });
 
       context = instance.als.createRequestContext({
         method: req.method,
         url: req.url,
-        headers: filterHeaders(instance, headers)
+        headers: filterHeaders(instance, headers),
+        traceparent
       });
     } catch {
       return handler(req, routeContext);

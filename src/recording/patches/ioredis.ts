@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+import { pushIOEvent } from '../utils';
 
 const nodeRequire = createRequire(__filename);
 
@@ -32,7 +33,7 @@ function pushEvent(
   event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>
 ): void {
   const { slot } = deps.buffer.push(event);
-  context?.ioEvents.push(slot);
+  pushIOEvent(context, slot, deps.config.bufferSize);
 }
 
 export function install(deps: PatchInstallDeps): () => void {

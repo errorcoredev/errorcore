@@ -59,12 +59,14 @@ describe('Encryption', () => {
     expect(() => new Encryption('')).toThrow('encryptionKey must not be empty');
   });
 
-  it('produces different salts and ciphertexts for the same plaintext on the same instance', () => {
+  it('produces different IVs and ciphertexts for the same plaintext on the same instance', () => {
     const encryption = new Encryption('top-secret-key');
     const first = encryption.encrypt('identical plaintext');
     const second = encryption.encrypt('identical plaintext');
 
-    expect(first.salt).not.toBe(second.salt);
+    // Salt is static per instance (key derived once at construction).
+    // Per-message uniqueness is ensured via random IVs.
+    expect(first.salt).toBe(second.salt);
     expect(first.ciphertext).not.toBe(second.ciphertext);
     expect(first.iv).not.toBe(second.iv);
 

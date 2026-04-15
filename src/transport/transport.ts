@@ -315,6 +315,12 @@ export class TransportDispatcher implements Transport {
   }
 
   private initializeWorker(): void {
+    if (this.config.serverless) {
+      debug('Serverless mode, skipping worker thread');
+      this.fallbackToMainThread();
+      return;
+    }
+
     if (this.config.transport.type === 'http') {
       debug('HTTP transport runs on main thread, skipping worker');
       this.fallbackToMainThread();

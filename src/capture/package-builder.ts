@@ -254,6 +254,11 @@ export class PackageBuilder {
       processMetadata: { ...parts.processMetadata },
       codeVersion: { ...parts.codeVersion },
       environment: { ...parts.environment },
+      trace: parts.traceContext ? {
+        traceId: parts.traceContext.traceId,
+        spanId: parts.traceContext.spanId,
+        parentSpanId: parts.traceContext.parentSpanId
+      } : undefined,
       completeness: this.computeCompleteness(parts, false, {
         ioTimeline: serializedTimeline,
         stateReads: serializedStateReads,
@@ -290,13 +295,17 @@ export class PackageBuilder {
       return;
     }
 
+    // Strip bodies from the largest IO events until the estimate is under the limit.
+    // Use estimated subtraction inside the loop to avoid re-serializing the entire
+    // package on every iteration. Re-measure once after the loop for accuracy.
+    let strippedAnyBody = false;
     while (currentPackageSize > maxPackageSize) {
       const largestBody = findLargestBodyEvent(pkg.ioTimeline);
       if (largestBody === null) {
         break;
       }
 
-      const { event } = largestBody;
+      const { event, estimatedBytes } = largestBody;
 
       if (event.requestBody !== null) {
         event.requestBody = null;
@@ -308,10 +317,13 @@ export class PackageBuilder {
         event.responseBodyTruncated = true;
       }
 
-      currentPackageSize = this.getPackageSize(pkg);
+      currentPackageSize -= estimatedBytes;
+      strippedAnyBody = true;
     }
 
-    currentPackageSize = this.getPackageSize(pkg);
+    if (strippedAnyBody) {
+      currentPackageSize = this.getPackageSize(pkg);
+    }
 
     if (currentPackageSize > maxPackageSize && parts.usedAmbientEvents) {
       pkg.ioTimeline = [];

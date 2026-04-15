@@ -1,7 +1,7 @@
 
 import type { IOEventSlot, RequestContext } from '../types';
 import { isSdkInternalRequest } from './internal';
-import { toDurationMs } from './utils';
+import { pushIOEvent, toDurationMs } from './utils';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -80,6 +80,18 @@ export class UndiciRecorder {
       }
 
       const context = this.als.getContext();
+
+      if (context !== undefined) {
+        const traceparent = `00-${context.traceId}-${context.spanId}-01`;
+        try {
+          if (typeof (request as any).addHeader === 'function') {
+            (request as any).addHeader('traceparent', traceparent);
+          }
+        } catch {
+          // Undici request object might not support addHeader
+        }
+      }
+
       const extracted = extractTarget(request);
       const { slot } = this.buffer.push({
         phase: 'active',
@@ -107,7 +119,7 @@ export class UndiciRecorder {
         aborted: false
       });
 
-      context?.ioEvents.push(slot);
+      pushIOEvent(context, slot);
       this.slots.set(message.request as object, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);

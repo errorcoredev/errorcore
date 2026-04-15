@@ -117,6 +117,15 @@ export class DeadLetterStore {
         return { entries: [], lineCount: 0 };
       }
 
+      const stats = fs.statSync(this.filePath);
+      if (stats.size > 10 * 1024 * 1024) {
+        console.warn(
+          `[ErrorCore] Dead-letter store is ${Math.round(stats.size / 1024 / 1024)}MB; ` +
+          'skipping automatic drain at startup. Run `errorcore drain` to process manually.'
+        );
+        return { entries: [], lineCount: 0 };
+      }
+
       const content = fs.readFileSync(this.filePath, 'utf8');
       const lines = content.split('\n').filter((line) => line.length > 0);
       const entries: DeadLetterDrainEntry[] = [];

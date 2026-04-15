@@ -104,9 +104,11 @@ export { koaMiddleware } from './middleware/koa';
 export { hapiPlugin } from './middleware/hapi';
 export { wrapHandler } from './middleware/raw-http';
 export { withErrorcore } from './middleware/nextjs';
+export { wrapLambda, wrapServerless } from './middleware/lambda';
 
 export type { SDKConfig, ErrorPackage, Completeness, ResolvedConfig } from './types';
 export type { SDKInstance } from './sdk';
+export type { LambdaContext } from './middleware/lambda';
 
 /**
  * @internal
@@ -116,4 +118,8 @@ export type { SDKInstance } from './sdk';
  */
 export function getModuleInstance(): SDKInstance | null {
   return getGlobalInstance();
+}
+
+export function getTraceparent(): string | null {
+  return getGlobalInstance()?.als.formatTraceparent() ?? null;
 }

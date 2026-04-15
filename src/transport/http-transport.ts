@@ -68,6 +68,8 @@ export class HttpTransport {
 
   private readonly allowInvalidCollectorCertificates: boolean;
 
+  private readonly agent: http.Agent | https.Agent;
+
   public constructor(config: HttpTransportConfig) {
     this.url = new URL(config.url);
     this.authorization = config.authorization;
@@ -81,6 +83,10 @@ export class HttpTransport {
         'HTTP transport requires an https:// URL. Set allowPlainHttpTransport: true to allow plain HTTP (not recommended).'
       );
     }
+
+    this.agent = this.url.protocol === 'https:'
+      ? new https.Agent({ keepAlive: true, maxSockets: 1 })
+      : new http.Agent({ keepAlive: true, maxSockets: 1 });
 
     warnOnInvalidCertificatesOnce(
       this.url,
@@ -115,7 +121,7 @@ export class HttpTransport {
   }
 
   public async shutdown(): Promise<void> {
-    return Promise.resolve();
+    this.agent.destroy();
   }
 
   private sendOnce(payload: string | Buffer): Promise<void> {
@@ -148,6 +154,7 @@ export class HttpTransport {
               port: this.url.port === '' ? undefined : Number(this.url.port),
               path: `${this.url.pathname}${this.url.search}`,
               method: 'POST',
+              agent: this.agent,
               headers: {
                 'content-type': 'application/x-ndjson',
                 'content-length': String(body.length),

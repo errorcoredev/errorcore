@@ -7,7 +7,7 @@ import type { Socket } from 'node:net';
 
 import type { IOEventSlot, RequestContext, ResolvedConfig } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
-import { extractFd, toDurationMs } from './utils';
+import { extractFd, pushIOEvent, toDurationMs } from './utils';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -293,7 +293,7 @@ export class HttpServerRecorder {
 
       const { slot, seq } = this.buffer.push(event);
 
-      context.ioEvents.push(slot);
+      pushIOEvent(context, slot, this.config.bufferSize);
 
       const finalizer = (this.finalizerPool.pop() ?? new RequestFinalizer()).initialize({
         buffer: this.buffer,

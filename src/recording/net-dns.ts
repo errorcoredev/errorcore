@@ -6,7 +6,7 @@ import type { Socket } from 'node:net';
 import type { IOEventSlot, RequestContext } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
 import { isInternalCallActive, runAsInternal } from './internal';
-import { extractFd, toDurationMs } from './utils';
+import { extractFd, pushIOEvent, toDurationMs } from './utils';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -116,7 +116,7 @@ export class NetDnsRecorder {
         aborted: false
       });
 
-      context?.ioEvents.push(slot);
+      pushIOEvent(context, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       console.warn(`[ErrorCore] Failed to record TCP connect: ${messageText}`);
@@ -164,7 +164,7 @@ export class NetDnsRecorder {
         aborted: false
       });
 
-      context?.ioEvents.push(slot);
+      pushIOEvent(context, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       console.warn(`[ErrorCore] Failed to record DNS lookup: ${messageText}`);

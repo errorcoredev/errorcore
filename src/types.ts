@@ -58,6 +58,9 @@ export interface RequestContext {
   bodyTruncated: boolean;
   ioEvents: IOEventSlot[];
   stateReads: StateRead[];
+  traceId: string;
+  spanId: string;
+  parentSpanId: string | null;
 }
 
 export interface StateRead {
@@ -252,8 +255,13 @@ export interface ErrorPackage {
   stateReads: StateReadSerialized[];
   concurrentRequests: RequestSummary[];
   processMetadata: ProcessMetadata;
-  codeVersion: { gitSha?: string; packageVersion?: string };
+  codeVersion: { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string };
   environment: Record<string, string>;
+  trace?: {
+    traceId: string;
+    spanId: string;
+    parentSpanId: string | null;
+  };
   integrity?: {
     algorithm: 'HMAC-SHA256';
     signature: string;
@@ -266,6 +274,7 @@ export interface ErrorPackageParts {
     type: string;
     message: string;
     stack: string;
+    rawStack?: string;
     cause?: ErrorInfo;
     properties: Record<string, unknown>;
   };
@@ -278,7 +287,7 @@ export interface ErrorPackageParts {
   concurrentRequests: RequestSummary[];
   processMetadata: ProcessMetadata;
   timeAnchor: TimeAnchor;
-  codeVersion: { gitSha?: string; packageVersion?: string };
+  codeVersion: { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string };
   environment: Record<string, string>;
   ioEventsDropped: number;
   captureFailures: string[];
@@ -286,6 +295,11 @@ export interface ErrorPackageParts {
   stateTrackingEnabled: boolean;
   usedAmbientEvents: boolean;
   rateLimiterDrops?: RateLimiterDropSummary;
+  traceContext?: {
+    traceId: string;
+    spanId: string;
+    parentSpanId: string | null;
+  };
 }
 
 export interface PackageAssemblyResult {
@@ -336,7 +350,7 @@ export interface SDKConfig {
   envBlocklist?: RegExp[];
   encryptionKey?: string;
   allowUnencrypted?: boolean;
-  transport?: TransportConfig;
+  transport: TransportConfig;
   captureLocalVariables?: boolean;
   captureDbBindParams?: boolean;
   captureRequestBodies?: boolean;
@@ -359,6 +373,7 @@ export interface SDKConfig {
   useWorkerAssembly?: boolean;
   flushIntervalMs?: number;
   resolveSourceMaps?: boolean;
+  serverless?: boolean | 'auto';
 }
 
 export interface ResolvedConfig {
@@ -397,6 +412,7 @@ export interface ResolvedConfig {
   useWorkerAssembly: boolean;
   flushIntervalMs: number;
   resolveSourceMaps: boolean;
+  serverless: boolean;
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {

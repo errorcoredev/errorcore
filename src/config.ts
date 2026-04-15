@@ -24,7 +24,8 @@ const DEFAULT_HEADER_ALLOWLIST = [
   'user-agent',
   'x-request-id',
   'x-correlation-id',
-  'host'
+  'host',
+  'traceparent'
 ];
 
 const DEFAULT_HEADER_BLOCKLIST = [
@@ -69,6 +70,24 @@ const DEFAULT_BODY_CAPTURE_CONTENT_TYPES = [
   'application/xml'
 ];
 
+function assertNonNegativeInteger(
+  value: number,
+  fieldName: string
+): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${fieldName} must be a non-negative integer`);
+  }
+}
+
+export function detectServerlessEnvironment(): boolean {
+  if (process.env.AWS_LAMBDA_FUNCTION_NAME) return true;
+  if (process.env.FUNCTIONS_WORKER_RUNTIME) return true;
+  if (process.env.K_SERVICE && process.env.K_REVISION) return true;
+  if (process.env.VERCEL) return true;
+  if (process.env.AWS_EXECUTION_ENV) return true;
+  return false;
+}
+
 function assertPositiveInteger(
   value: number,
   fieldName: string,
@@ -110,8 +129,14 @@ function resolveSerializationLimits(
 
 export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConfig {
   const transport = userConfig.transport;
-  const bufferSize = userConfig.bufferSize ?? 200;
-  const bufferMaxBytes = userConfig.bufferMaxBytes ?? 52428800;
+
+  const serverless =
+    userConfig.serverless === true ? true :
+    userConfig.serverless === false ? false :
+    detectServerlessEnvironment();
+
+  let bufferSize = userConfig.bufferSize ?? (serverless ? 50 : 200);
+  let bufferMaxBytes = userConfig.bufferMaxBytes ?? (serverless ? 5242880 : 52428800);
   const maxPayloadSize = userConfig.maxPayloadSize ?? 32768;
   const maxConcurrentRequests = userConfig.maxConcurrentRequests ?? 50;
   const rateLimitPerMinute = userConfig.rateLimitPerMinute ?? 60;
@@ -122,7 +147,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   const maxLocalsFrames = userConfig.maxLocalsFrames ?? 5;
   const uncaughtExceptionExitDelayMs =
     userConfig.uncaughtExceptionExitDelayMs ?? 1500;
-  const maxDrainOnStartup = userConfig.maxDrainOnStartup ?? 100;
+  const maxDrainOnStartup = userConfig.maxDrainOnStartup ?? (serverless ? 0 : 100);
   const explicitBodyControlsProvided =
     userConfig.captureRequestBodies !== undefined ||
     userConfig.captureResponseBodies !== undefined;
@@ -184,7 +209,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     uncaughtExceptionExitDelayMs,
     'uncaughtExceptionExitDelayMs'
   );
-  assertPositiveInteger(maxDrainOnStartup, 'maxDrainOnStartup');
+  assertNonNegativeInteger(maxDrainOnStartup, 'maxDrainOnStartup');
 
   if (transport === undefined) {
     throw new Error('transport must be configured explicitly');
@@ -262,6 +287,28 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
         }
       : transport;
 
+  const useWorkerAssembly = userConfig.useWorkerAssembly ??
+    (serverless ? false : true);
+  const flushIntervalMs = userConfig.flushIntervalMs ??
+    (serverless ? 0 : 5000);
+  if (flushIntervalMs !== 0) {
+    assertPositiveInteger(flushIntervalMs, 'flushIntervalMs', (candidate) => {
+      if (candidate < 1000) {
+        return 'flushIntervalMs must be at least 1000 (1 second) or 0 to disable';
+      }
+      return null;
+    });
+  }
+  const deadLetterPath = serverless && userConfig.deadLetterPath === undefined
+    ? undefined
+    : resolveDeadLetterPath(userConfig, transport);
+
+  if (serverless && transport.type === 'file') {
+    console.warn(
+      '[ErrorCore] File transport in a serverless environment writes to ephemeral disk. Consider using HTTP transport instead.'
+    );
+  }
+
   return {
     bufferSize,
     bufferMaxBytes,
@@ -286,7 +333,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
       ...(userConfig.bodyCaptureContentTypes ?? DEFAULT_BODY_CAPTURE_CONTENT_TYPES)
     ],
     piiScrubber: userConfig.piiScrubber,
-    replaceDefaultScrubber: false,
+    replaceDefaultScrubber: userConfig.replaceDefaultScrubber ?? false,
     serialization: resolveSerializationLimits(userConfig),
     maxLocalsCollectionsPerSecond,
     maxCachedLocals,
@@ -295,11 +342,12 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     allowPlainHttpTransport,
     allowInvalidCollectorCertificates,
     allowInsecureTransport: allowPlainHttpTransport,
-    deadLetterPath: resolveDeadLetterPath(userConfig, transport),
+    deadLetterPath,
     maxDrainOnStartup,
-    useWorkerAssembly: userConfig.useWorkerAssembly ?? false,
-    flushIntervalMs: userConfig.flushIntervalMs ?? 5000,
-    resolveSourceMaps: userConfig.resolveSourceMaps ?? true
+    useWorkerAssembly,
+    flushIntervalMs,
+    resolveSourceMaps: userConfig.resolveSourceMaps ?? true,
+    serverless
   };
 }
 

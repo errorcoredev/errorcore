@@ -263,19 +263,13 @@ export class Scrubber {
         return this.scrubRelativeUrl(rawUrl);
       }
 
-      const parsed = hasScheme
-        ? new URL(rawUrl)
-        : new URL(rawUrl, 'http://errorcore.local');
+      const parsed = new URL(rawUrl);
 
       for (const [key, value] of parsed.searchParams.entries()) {
         parsed.searchParams.set(key, String(this.scrubValue(key, value)));
       }
 
-      if (hasScheme) {
-        return parsed.toString();
-      }
-
-      return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      return parsed.toString();
     } catch {
       return this.scrubString(rawUrl);
     }

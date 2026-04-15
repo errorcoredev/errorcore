@@ -16,25 +16,34 @@ export interface EncryptedPayload {
 export class Encryption {
   private readonly encryptionKey: string;
 
+  private readonly derivedKey: Buffer;
+
+  private readonly keySalt: Buffer;
+
   public constructor(encryptionKey: string) {
     if (encryptionKey.length === 0) {
       throw new Error('encryptionKey must not be empty');
     }
 
     this.encryptionKey = encryptionKey;
-  }
 
-  public encrypt(plaintext: string): EncryptedPayload {
-    const salt = randomBytes(16);
-    const derivedKey = pbkdf2Sync(
+    // Derive the AES key once at construction using a deterministic salt.
+    // The encryption key is already a 32-byte hex secret, so a single PBKDF2
+    // derivation at init is sufficient. Per-message uniqueness comes from the
+    // random IV, not from per-message key derivation.
+    this.keySalt = Buffer.from('errorcore-v1-key-derivation', 'utf8');
+    this.derivedKey = pbkdf2Sync(
       this.encryptionKey,
-      salt,
+      this.keySalt,
       100000,
       32,
       'sha256'
     );
+  }
+
+  public encrypt(plaintext: string): EncryptedPayload {
     const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', derivedKey, iv);
+    const cipher = createCipheriv('aes-256-gcm', this.derivedKey, iv);
     const ciphertext = Buffer.concat([
       cipher.update(plaintext, 'utf8'),
       cipher.final()
@@ -42,7 +51,7 @@ export class Encryption {
     const authTag = cipher.getAuthTag();
 
     return {
-      salt: salt.toString('base64'),
+      salt: this.keySalt.toString('base64'),
       iv: iv.toString('base64'),
       ciphertext: ciphertext.toString('base64'),
       authTag: authTag.toString('base64')
@@ -54,9 +63,15 @@ export class Encryption {
     const iv = Buffer.from(payload.iv, 'base64');
     const ciphertext = Buffer.from(payload.ciphertext, 'base64');
     const authTag = Buffer.from(payload.authTag, 'base64');
-    const derivedKey = pbkdf2Sync(this.encryptionKey, salt, 100000, 32, 'sha256');
-    const decipher = createDecipheriv('aes-256-gcm', derivedKey, iv);
 
+    // Support decrypting payloads from both the old per-message salt scheme
+    // and the new static salt scheme.
+    const needsPerMessageDerivation = !salt.equals(this.keySalt);
+    const derivedKey = needsPerMessageDerivation
+      ? pbkdf2Sync(this.encryptionKey, salt, 100000, 32, 'sha256')
+      : this.derivedKey;
+
+    const decipher = createDecipheriv('aes-256-gcm', derivedKey, iv);
     decipher.setAuthTag(authTag);
 
     return Buffer.concat([

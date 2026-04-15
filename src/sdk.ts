@@ -23,6 +23,7 @@ import { DeadLetterStore } from './transport/dead-letter-store';
 import { ErrorCapturer } from './capture/error-capturer';
 import { PackageAssemblyDispatcher } from './capture/package-assembly-dispatcher';
 import { SourceMapResolver } from './capture/source-map-resolver';
+import { WatchdogManager } from './middleware/watchdog';
 import type { RequestContext, ResolvedConfig, SDKConfig, TransportConfig } from './types';
 
 type SDKState = 'created' | 'active' | 'shutting_down' | 'shutdown';
@@ -58,6 +59,8 @@ export class SDKInstance {
   private state: SDKState = 'created';
 
   private fatalExitInProgress = false;
+
+  private shutdownPromise: Promise<void> | null = null;
 
   private readonly timers: Array<NodeJS.Timeout | NodeJS.Timer> = [];
 
@@ -97,6 +100,8 @@ export class SDKInstance {
 
   private readonly deadLetterStore: DeadLetterStore | null;
 
+  private readonly watchdog: WatchdogManager | null;
+
   public constructor(input: {
     config: ResolvedConfig;
     buffer: IOEventBuffer;
@@ -115,6 +120,7 @@ export class SDKInstance {
     undiciRecorder: UndiciRecorder;
     netDnsRecorder: NetDnsRecorder;
     deadLetterStore: DeadLetterStore | null;
+    watchdog: WatchdogManager | null;
   }) {
     this.config = input.config;
     this.buffer = input.buffer;
@@ -133,6 +139,7 @@ export class SDKInstance {
     this.undiciRecorder = input.undiciRecorder;
     this.netDnsRecorder = input.netDnsRecorder;
     this.deadLetterStore = input.deadLetterStore;
+    this.watchdog = input.watchdog;
   }
 
   public activate(): void {
@@ -150,12 +157,17 @@ export class SDKInstance {
       );
     }
 
-    this.processMetadata.collectStartupMetadata();
     this.httpServerRecorder.install();
     this.channelSubscriber.subscribeAll();
     this.patchManager.installAll();
     this.registerProcessHandlers();
-    this.processMetadata.startEventLoopLagMeasurement();
+
+    if (!this.config.serverless) {
+      this.processMetadata.startEventLoopLagMeasurement();
+    }
+
+    // In serverless mode, deadLetterStore is null (deadLetterPath is undefined),
+    // so drainDeadLetters() is already a no-op.
     this.drainDeadLetters();
 
     if (this.config.flushIntervalMs > 0) {
@@ -252,7 +264,7 @@ export class SDKInstance {
       headers: {}
     });
 
-    return this.als.runWithContext(context as RequestContext, fn);
+    return this.als.runWithContext(context, fn);
   }
 
   public async flush(): Promise<void> {
@@ -260,7 +272,7 @@ export class SDKInstance {
       return;
     }
 
-    await this.errorCapturer.shutdown({ timeoutMs: 5000 });
+    await this.errorCapturer.flush();
     await this.transport.flush();
   }
 
@@ -268,49 +280,66 @@ export class SDKInstance {
     return this.state === 'active';
   }
 
+  public getWatchdog(): WatchdogManager | null {
+    return this.watchdog;
+  }
+
   public async shutdown(): Promise<void> {
-    if (this.state === 'shutdown' || this.state === 'shutting_down') {
+    if (this.state === 'shutdown') {
       return;
     }
 
+    if (this.shutdownPromise !== null) {
+      return this.shutdownPromise;
+    }
+
     this.state = 'shutting_down';
+    this.shutdownPromise = this.performShutdown();
+    return this.shutdownPromise;
+  }
 
-    this.channelSubscriber.unsubscribeAll();
-    this.patchManager.unwrapAll();
-    this.httpServerRecorder.shutdown();
-    this.httpClientRecorder.shutdown();
-    this.undiciRecorder.shutdown();
-    this.netDnsRecorder.shutdown();
-    this.inspector.shutdown();
-    this.processMetadata.shutdown();
-    this.requestTracker.shutdown();
+  private async performShutdown(): Promise<void> {
+    try {
+      this.channelSubscriber.unsubscribeAll();
+      this.patchManager.unwrapAll();
+      this.httpServerRecorder.shutdown();
+      this.httpClientRecorder.shutdown();
+      this.undiciRecorder.shutdown();
+      this.netDnsRecorder.shutdown();
+      this.inspector.shutdown();
+      this.processMetadata.shutdown();
+      this.requestTracker.shutdown();
+      await this.watchdog?.shutdown();
 
-    for (const timer of this.timers) {
-      clearTimeout(timer as NodeJS.Timeout);
+      for (const timer of this.timers) {
+        clearTimeout(timer as NodeJS.Timeout);
+      }
+
+      await this.errorCapturer.shutdown({ timeoutMs: 5000 });
+      await this.transport.flush();
+      await this.transport.shutdown({ timeoutMs: 5000 });
+      this.buffer.clear();
+    } finally {
+      for (const listener of this.processListeners) {
+        process.removeListener(listener.event, listener.handler);
+      }
+
+      this.processListeners.length = 0;
+      this.state = 'shutdown';
+      this.fatalExitInProgress = false;
     }
-
-    await this.errorCapturer.shutdown({ timeoutMs: 5000 });
-    await this.transport.flush();
-    await this.transport.shutdown({ timeoutMs: 5000 });
-    this.buffer.clear();
-
-    for (const listener of this.processListeners) {
-      process.removeListener(listener.event, listener.handler);
-    }
-
-    this.processListeners.length = 0;
-    this.state = 'shutdown';
-    this.fatalExitInProgress = false;
   }
 
   public enableAutoShutdown(): void {
+    if (this.config.serverless) {
+      return;
+    }
+
     const sigtermHandler = async () => {
-      await this.shutdown();
-      process.kill(process.pid, 'SIGTERM');
+      try { await this.shutdown(); } finally { process.kill(process.pid, 'SIGTERM'); }
     };
     const sigintHandler = async () => {
-      await this.shutdown();
-      process.kill(process.pid, 'SIGINT');
+      try { await this.shutdown(); } finally { process.kill(process.pid, 'SIGINT'); }
     };
 
     process.once('SIGTERM', sigtermHandler);
@@ -326,48 +355,52 @@ export class SDKInstance {
 
     this.processListeners.length = 0;
 
-    const uncaughtExceptionHandler = (error: Error) => {
-      if (this.fatalExitInProgress) {
-        return;
-      }
-
-      this.fatalExitInProgress = true;
-      this.errorCapturer.capture(error, { isUncaught: true });
-      // Transport delivery is not guaranteed within uncaughtExceptionExitDelayMs;
-      // increase it for slow collectors.
-      const exitNow = () => {
-        // process.exit() is intentional here. This handler is only
-        // registered for uncaughtException and unhandledRejection where
-        // continued execution is unsafe. ESLint: no-process-exit disable
-        // is acceptable in this specific callsite.
-        process.exit(1);
-      };
-      const exitTimer = setTimeout(exitNow, this.config.uncaughtExceptionExitDelayMs);
-      exitTimer.unref();
-
-      void this.shutdown()
-        .catch(() => undefined)
-        .finally(() => {
-          clearTimeout(exitTimer);
-          exitNow();
-        });
-    };
     const unhandledRejectionHandler = (reason: unknown) => {
       const error = reason instanceof Error ? reason : new Error(String(reason));
 
       this.errorCapturer.capture(error);
     };
-    const beforeExitHandler = () => {
-      void this.shutdown();
-    };
 
-    process.on('uncaughtException', uncaughtExceptionHandler);
     process.on('unhandledRejection', unhandledRejectionHandler);
-    process.on('beforeExit', beforeExitHandler);
-
-    this.processListeners.push({ event: 'uncaughtException', handler: uncaughtExceptionHandler });
     this.processListeners.push({ event: 'unhandledRejection', handler: unhandledRejectionHandler });
-    this.processListeners.push({ event: 'beforeExit', handler: beforeExitHandler });
+
+    if (!this.config.serverless) {
+      const uncaughtExceptionHandler = (error: Error) => {
+        if (this.fatalExitInProgress) {
+          return;
+        }
+
+        this.fatalExitInProgress = true;
+        this.errorCapturer.capture(error, { isUncaught: true });
+        // Transport delivery is not guaranteed within uncaughtExceptionExitDelayMs;
+        // increase it for slow collectors.
+        const exitNow = () => {
+          // process.exit() is intentional here. This handler is only
+          // registered for uncaughtException and unhandledRejection where
+          // continued execution is unsafe. ESLint: no-process-exit disable
+          // is acceptable in this specific callsite.
+          process.exit(1);
+        };
+        const exitTimer = setTimeout(exitNow, this.config.uncaughtExceptionExitDelayMs);
+        exitTimer.unref();
+
+        void this.shutdown()
+          .catch(() => undefined)
+          .finally(() => {
+            clearTimeout(exitTimer);
+            exitNow();
+          });
+      };
+      const beforeExitHandler = () => {
+        void this.shutdown();
+      };
+
+      process.on('uncaughtException', uncaughtExceptionHandler);
+      process.on('beforeExit', beforeExitHandler);
+
+      this.processListeners.push({ event: 'uncaughtException', handler: uncaughtExceptionHandler });
+      this.processListeners.push({ event: 'beforeExit', handler: beforeExitHandler });
+    }
   }
 }
 
@@ -468,6 +501,12 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
   const packageAssemblyDispatcher = config.useWorkerAssembly
     ? new PackageAssemblyDispatcher({ config })
     : null;
+  let watchdog: WatchdogManager | null = null;
+  if (config.serverless && config.transport.type === 'http') {
+    watchdog = new WatchdogManager(config, transportAuthorization);
+    watchdog.start();
+  }
+
   const errorCapturer = new ErrorCapturer({
     buffer,
     als,
@@ -483,7 +522,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     packageAssemblyDispatcher,
     stateTrackerStatus: stateTracker,
     deadLetterStore,
-    sourceMapResolver
+    sourceMapResolver,
+    watchdog
   });
 
   return new SDKInstance({
@@ -503,6 +543,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     httpClientRecorder,
     undiciRecorder,
     netDnsRecorder,
-    deadLetterStore
+    deadLetterStore,
+    watchdog
   });
 }

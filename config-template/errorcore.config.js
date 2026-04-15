@@ -24,6 +24,9 @@ module.exports = {
   // Local-development only. Stdout writes captured payloads into application logs.
   // transport: { type: 'stdout' },
 
+  // Serverless mode (auto-detected from environment by default)
+  // serverless: 'auto',
+
   captureLocalVariables: false,
 
   // Deprecated compatibility alias. When true, this enables both request and response body capture.

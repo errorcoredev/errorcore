@@ -39,7 +39,9 @@ export class ProcessMetadata {
 
   private timeAnchor: TimeAnchor = { wallClockMs: 0, hrtimeNs: '0' };
 
-  private codeVersion: { gitSha?: string; packageVersion?: string } = {};
+  private codeVersion: { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string } = {};
+
+  private serverlessMeta: { functionName: string; functionVersion: string; invokedFunctionArn: string; lambdaRequestId: string } | null = null;
 
   private environment: Record<string, string> = {};
 
@@ -72,7 +74,7 @@ export class ProcessMetadata {
         process.env.COMMIT_SHA ??
         process.env.SOURCE_VERSION ??
         this.readGitHead(),
-      packageVersion: process.env.npm_package_version
+      packageVersion: process.env.npm_package_version || this.readPackageVersion() || undefined
     };
     this.environment = this.filterEnvironment(process.env as Record<string, string | undefined>);
   }
@@ -132,8 +134,22 @@ export class ProcessMetadata {
     return { ...this.timeAnchor };
   }
 
-  public getCodeVersion(): { gitSha?: string; packageVersion?: string } {
+  public getCodeVersion(): { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string } {
     return { ...this.codeVersion };
+  }
+
+  public setServerlessMetadata(meta: {
+    functionName: string;
+    functionVersion: string;
+    invokedFunctionArn: string;
+    lambdaRequestId: string;
+  }): void {
+    this.serverlessMeta = meta;
+    this.codeVersion = {
+      ...this.codeVersion,
+      functionVersion: meta.functionVersion,
+      functionArn: meta.invokedFunctionArn
+    };
   }
 
   public getEnvironment(): Record<string, string> {
@@ -189,6 +205,10 @@ export class ProcessMetadata {
       return envHostname;
     }
 
+    if (this.config.serverless) {
+      return undefined;
+    }
+
     if (process.platform !== 'linux') {
       return undefined;
     }
@@ -221,6 +241,10 @@ export class ProcessMetadata {
   }
 
   private readGitHead(): string | undefined {
+    if (this.config.serverless) {
+      return undefined;
+    }
+
     try {
       const gitDir = path.join(process.cwd(), '.git');
       const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
@@ -236,6 +260,40 @@ export class ProcessMetadata {
     } catch {
       return undefined;
     }
+  }
+
+  private readPackageVersion(): string | undefined {
+    try {
+      const pkgPath = path.join(process.cwd(), 'package.json');
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: string };
+      if (typeof pkg.version === 'string') {
+        return pkg.version;
+      }
+    } catch {
+      // package.json not found or not parseable at cwd
+    }
+
+    try {
+      let dir = __dirname;
+      for (let i = 0; i < 10; i++) {
+        const pkgPath = path.join(dir, 'package.json');
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: string };
+          if (typeof pkg.version === 'string') {
+            return pkg.version;
+          }
+        } catch {
+          // Not found at this level, try parent
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    } catch {
+      // Walk failed
+    }
+
+    return undefined;
   }
 
   private getActiveResourceCounts(): Pick<RuntimeMetadata, 'activeHandles' | 'activeRequests' | 'activeResourceTypes'> {

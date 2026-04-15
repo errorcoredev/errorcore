@@ -37,7 +37,8 @@ export function fastifyPlugin(sdk?: SDKInstanceLike) {
         const ctx = instance.als.createRequestContext({
           method: request.raw.method,
           url: request.raw.url,
-          headers: filterHeaders(instance, request.raw.headers)
+          headers: filterHeaders(instance, request.raw.headers),
+          traceparent: request.raw.headers['traceparent'] as string | undefined
         });
 
         instance.requestTracker.add(ctx);

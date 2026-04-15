@@ -60,19 +60,20 @@ type ErrorCapturerWarningCode =
   | 'transport_dispatch_failed'
   | 'dead_letter_write_failed';
 
-function emitSafeWarning(code: ErrorCapturerWarningCode): void {
+function emitSafeWarning(code: ErrorCapturerWarningCode, detail?: string): void {
+  const suffix = detail ? `: ${detail}` : '';
   switch (code) {
     case 'capture_failed':
-      console.warn('[ErrorCore] Error capture failed [code=errorcore_capture_failed]');
+      console.warn(`[ErrorCore] Error capture failed${suffix} [code=errorcore_capture_failed]`);
       return;
     case 'capture_fallback_failed':
-      console.warn('[ErrorCore] Error capture fallback failed [code=errorcore_capture_fallback_failed]');
+      console.warn(`[ErrorCore] Error capture fallback failed${suffix} [code=errorcore_capture_fallback_failed]`);
       return;
     case 'transport_dispatch_failed':
-      console.warn('[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]');
+      console.warn(`[ErrorCore] Transport dispatch failed${suffix} [code=errorcore_transport_dispatch_failed]`);
       return;
     case 'dead_letter_write_failed':
-      console.warn('[ErrorCore] Dead-letter store write failed [code=errorcore_dead_letter_write_failed]');
+      console.warn(`[ErrorCore] Dead-letter store write failed${suffix} [code=errorcore_dead_letter_write_failed]`);
       return;
   }
 }
@@ -173,6 +174,8 @@ export class ErrorCapturer {
 
   private readonly sourceMapResolver: SourceMapResolver | null;
 
+  private readonly watchdog: { notifyErrorCaptured(error: Error): void } | null;
+
   private readonly pendingTransportDispatches = new Set<Promise<void>>();
 
   public constructor(deps: {
@@ -191,6 +194,7 @@ export class ErrorCapturer {
     stateTrackerStatus?: StateTrackerStatusLike | null;
     deadLetterStore?: DeadLetterStore | null;
     sourceMapResolver?: SourceMapResolver | null;
+    watchdog?: { notifyErrorCaptured(error: Error): void } | null;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
@@ -207,6 +211,7 @@ export class ErrorCapturer {
     this.stateTrackerStatus = deps.stateTrackerStatus ?? null;
     this.deadLetterStore = deps.deadLetterStore ?? null;
     this.sourceMapResolver = deps.sourceMapResolver ?? null;
+    this.watchdog = deps.watchdog ?? null;
   }
 
   public capture(error: Error, _options?: { isUncaught?: boolean }): ErrorPackage | null {
@@ -250,6 +255,7 @@ export class ErrorCapturer {
           type: serializedError.type,
           message: serializedError.message,
           stack: serializedError.stack,
+          rawStack: serializedError.rawStack,
           cause: serializedError.cause,
           properties: serializedError.properties
         },
@@ -269,8 +275,15 @@ export class ErrorCapturer {
         alsContextAvailable: context !== undefined,
         stateTrackingEnabled,
         usedAmbientEvents,
-        rateLimiterDrops
+        rateLimiterDrops,
+        traceContext: context ? {
+          traceId: context.traceId,
+          spanId: context.spanId,
+          parentSpanId: context.parentSpanId
+        } : undefined
       };
+
+      this.watchdog?.notifyErrorCaptured(error);
 
       if (
         this.packageAssemblyDispatcher !== null &&
@@ -286,7 +299,6 @@ export class ErrorCapturer {
 
       return this.captureInline(parts);
     } catch (captureError) {
-      void captureError;
       emitSafeWarning('capture_failed');
 
       if (this.deadLetterStore !== null) {
@@ -326,6 +338,12 @@ export class ErrorCapturer {
 
       captureFailures.push(`als: ${message}`);
       return undefined;
+    }
+  }
+
+  public async flush(): Promise<void> {
+    if (this.pendingTransportDispatches.size > 0) {
+      await Promise.allSettled([...this.pendingTransportDispatches]);
     }
   }
 

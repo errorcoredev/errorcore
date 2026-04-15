@@ -34,7 +34,8 @@ describe('resolveConfig', () => {
         'user-agent',
         'x-request-id',
         'x-correlation-id',
-        'host'
+        'host',
+        'traceparent'
       ],
       headerBlocklist: [
         /authorization|cookie|set-cookie|x-api-key|x-auth-token/i,
@@ -100,10 +101,12 @@ describe('resolveConfig', () => {
       allowPlainHttpTransport: false,
       allowInvalidCollectorCertificates: false,
       allowInsecureTransport: false,
+      deadLetterPath: undefined,
       maxDrainOnStartup: 100,
-      useWorkerAssembly: false,
+      useWorkerAssembly: true,
       flushIntervalMs: 5000,
-      resolveSourceMaps: true
+      resolveSourceMaps: true,
+      serverless: false
     });
   });
 

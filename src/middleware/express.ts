@@ -27,7 +27,8 @@ export function expressMiddleware(sdk?: SDKInstanceLike) {
       const ctx = instance.als.createRequestContext({
         method: req.method,
         url: req.url,
-        headers: filterHeaders(instance, req.headers)
+        headers: filterHeaders(instance, req.headers),
+        traceparent: req.headers['traceparent'] as string | undefined
       });
 
       instance.requestTracker.add(ctx);
