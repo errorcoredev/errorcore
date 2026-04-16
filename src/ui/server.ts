@@ -1,7 +1,39 @@
 
+import { timingSafeEqual } from 'node:crypto';
+
 import { NdjsonReader } from './ndjson-reader';
 import { renderHTML } from './frontend';
 import type { Encryption } from '../security/encryption';
+
+function isTimingSafeBearerMatch(header: string | undefined, expectedToken: string): boolean {
+  if (header === undefined) {
+    return false;
+  }
+  const prefix = 'Bearer ';
+  if (!header.startsWith(prefix)) {
+    return false;
+  }
+  const presented = Buffer.from(header.slice(prefix.length), 'utf8');
+  const expected = Buffer.from(expectedToken, 'utf8');
+  if (presented.length !== expected.length) {
+    return false;
+  }
+  return timingSafeEqual(presented, expected);
+}
+
+function sameOriginAsRequest(c: {
+  req: { url: string; header: (name: string) => string | undefined };
+}): boolean {
+  const originHeader = c.req.header('origin');
+  if (originHeader === undefined) {
+    return false;
+  }
+  try {
+    return new URL(c.req.url).origin === originHeader;
+  } catch {
+    return false;
+  }
+}
 
 function loadHono(): { Hono: typeof import('hono').Hono; serve: typeof import('@hono/node-server').serve } {
   try {
@@ -51,7 +83,7 @@ export function startDashboard(options: DashboardOptions): unknown {
 
   if (effectiveToken !== undefined) {
     app.use('/api/*', async (c, next) => {
-      if (c.req.header('authorization') !== `Bearer ${effectiveToken}`) {
+      if (!isTimingSafeBearerMatch(c.req.header('authorization'), effectiveToken)) {
         return c.json({ error: 'Unauthorized' }, 401);
       }
 
@@ -60,6 +92,14 @@ export function startDashboard(options: DashboardOptions): unknown {
   }
 
   app.post('*', async (c, next) => {
+    // Two-layer CSRF guard: a same-origin Origin header plus a custom
+    // header. Browsers forbid cross-origin JS from setting the custom
+    // header without a preflight, and the Origin check protects against
+    // misconfigurations that allow the preflight.
+    if (!sameOriginAsRequest(c)) {
+      return c.json({ error: 'Origin not allowed' }, 403);
+    }
+
     if (c.req.header('x-errorcore-action') !== 'true') {
       return c.json({ error: 'Missing X-ErrorCore-Action header' }, 403);
     }
@@ -106,12 +146,17 @@ export function startDashboard(options: DashboardOptions): unknown {
     return c.json({ status: 'ok' });
   });
 
-  const hostname = options.hostname ?? (effectiveToken !== undefined ? '0.0.0.0' : '127.0.0.1');
+  // Default to loopback. Remote binding requires the operator to pass
+  // options.hostname explicitly. The previous behavior bound to 0.0.0.0
+  // whenever a token was configured, which exposed the dashboard to any
+  // reachable network on that interface. Now the operator declares intent
+  // by passing the bind address.
+  const hostname = options.hostname ?? '127.0.0.1';
 
-  if (effectiveToken === undefined) {
-    console.warn(
-      '[ErrorCore] No dashboard token configured. Binding to localhost only.\n' +
-      '  Set EC_DASHBOARD_TOKEN or pass token in options to enable remote access.'
+  if (hostname !== '127.0.0.1' && hostname !== 'localhost' && effectiveToken === undefined) {
+    throw new Error(
+      'Dashboard refuses to bind to a non-loopback hostname without a token. ' +
+      'Set EC_DASHBOARD_TOKEN or pass token in options.'
     );
   }
 

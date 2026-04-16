@@ -40,6 +40,10 @@ unsafe implicit behaviors removed.
   hex key scores ~3.93 so `crypto.randomBytes(32).toString('hex')` still
   passes. A four-distinct-character repeating pattern that previously
   scraped by is now rejected.
+- `startDashboard()` no longer binds to `0.0.0.0` when a token is configured.
+  The default is always `127.0.0.1`. Remote binding now requires passing
+  `hostname` explicitly. Attempting to bind to a non-loopback hostname
+  without a token throws on startup.
 
 ### Added
 
@@ -65,6 +69,10 @@ unsafe implicit behaviors removed.
   comparison (`crypto.timingSafeEqual`) replaces `Buffer.equals` when
   detecting whether a ciphertext uses the legacy per-message salt scheme; this
   removes a salt-matching timing oracle on decrypt.
+- Dashboard bearer token comparison uses `crypto.timingSafeEqual`.
+- Dashboard POST endpoints now require both an `x-errorcore-action: true`
+  header and a same-origin `Origin` header. The previous single-header gate
+  was insufficient on its own.
 
 ## 0.1.1
 
