@@ -45,6 +45,13 @@ export class ALSManager {
     headers: Record<string, string>;
     traceparent?: string;
   }): RequestContext {
+    // Wrap at Number.MAX_SAFE_INTEGER so the counter never produces a
+    // non-integer id. In practice a process would have to sustain
+    // millions of requests per second for weeks to reach this bound;
+    // the wrap is defensive, not operational.
+    if (this.requestCounter >= Number.MAX_SAFE_INTEGER) {
+      this.requestCounter = 0;
+    }
     const requestId = this.pidPrefix + ++this.requestCounter;
     const parsed = parseTraceparent(req.traceparent);
     const traceId = parsed?.traceId ?? generateTraceId();

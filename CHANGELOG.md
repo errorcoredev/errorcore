@@ -158,6 +158,16 @@ unsafe implicit behaviors removed.
   verbatim as the "collection" and included in the formatted query
   string on every captured error package.
 
+### Defensive bounds
+
+- `RateLimiter.droppedCount` and `droppedSinceLastAcquire` increments
+  are saturating at `Number.MAX_SAFE_INTEGER`. Reaching the bound
+  would take ~9e15 drops, but the counter no longer produces
+  non-integer values if a long-lived rate limiter ever did.
+- `ALSManager.requestCounter` wraps to 0 at `Number.MAX_SAFE_INTEGER`
+  so generated request ids remain integers even on processes that
+  somehow sustained millions of requests per second for weeks.
+
 ### Security
 
 - Closed an arbitrary-code-execution path in `init()` that would `require()`

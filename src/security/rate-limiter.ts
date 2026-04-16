@@ -37,8 +37,15 @@ export class RateLimiter {
       return true;
     }
 
-    this.droppedCount += 1;
-    this.droppedSinceLastAcquire += 1;
+    // Saturating increment. Number.MAX_SAFE_INTEGER would take ~9e15
+    // drops to reach so this is defensive against unexpectedly-long-lived
+    // rate-limiter instances; once saturated the counter stays pinned.
+    if (this.droppedCount < Number.MAX_SAFE_INTEGER) {
+      this.droppedCount += 1;
+    }
+    if (this.droppedSinceLastAcquire < Number.MAX_SAFE_INTEGER) {
+      this.droppedSinceLastAcquire += 1;
+    }
     if (this.firstDropTimestamp === null) {
       this.firstDropTimestamp = now;
     }

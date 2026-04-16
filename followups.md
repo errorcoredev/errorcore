@@ -3,6 +3,26 @@
 Out-of-scope items from the coordinated P0+P1 fix pass. Address in a later
 release. Anything new discovered mid-pass gets appended here.
 
+## Deferred from P0+P1 pass (mid-pass decisions)
+
+- Recording-layer listener finalizer refactor. The plan described a
+  central `finalize(slot)` routine that would walk a slot's list of
+  attached listeners and detach them. On review, the listeners' lifetimes
+  are bounded by the request's natural end (`close`, `finish`, `end`
+  events) so the actual leak surface is much narrower than initially
+  flagged. Keep the AUTH/HELLO credential redaction (landed) and revisit
+  the full listener audit in a dedicated pass.
+- Async `resolveStack` in `source-map-resolver.ts`. The readFileSync
+  blocking concern is already mitigated by `scheduleWarm()` which defers
+  actual disk I/O to `setImmediate`, plus the new 4 MB read cap. A full
+  pipeline async refactor is deferred; the blocking surface is already
+  small and bounded.
+- Dead-letter cross-process lock. Current implementation serializes
+  in-process `clearSent` but does not protect against the CLI `drain`
+  command running concurrently against a live SDK process. Document the
+  limitation in `OPERATIONS.md` on next update and consider a proper
+  lockfile (wx-create, fcntl on posix) in a follow-up.
+
 ## Deferred from P0+P1 pass (P2 and P3)
 
 - Body-capture memoization of content-type allowlist and toLowerCase work on
