@@ -443,6 +443,47 @@ describe('ioredis patch', () => {
     });
   });
 
+  it('redacts credentials on AUTH and HELLO commands', async () => {
+    // Regression: the ioredis patch captured args[0] as "collection" and
+    // included it in the formatted query. For AUTH and HELLO, args[0]
+    // is the plaintext password. Without redaction the SDK recorded a
+    // credential into every captured error package.
+    class FakeRedis {
+      public options = { host: 'redis.local', port: 6379 };
+
+      public sendCommand(command: { name: string; args: unknown[] }): Promise<string> {
+        return Promise.resolve(`${command.name}:ok`);
+      }
+    }
+
+    await withDriverMocks({ ioredis: FakeRedis }, async () => {
+      const deps = createDeps();
+      const uninstall = installIoredisPatch(deps);
+      const redis = new FakeRedis();
+      const context = createContext(deps.als, 'req-redis-auth');
+
+      try {
+        await deps.als.runWithContext(context, () =>
+          redis.sendCommand({ name: 'AUTH', args: ['super-secret-password'] })
+        );
+        await deps.als.runWithContext(context, () =>
+          redis.sendCommand({ name: 'HELLO', args: ['3', 'AUTH', 'user', 'pw'] })
+        );
+        const slots = deps.buffer.drain();
+
+        expect(slots[0]?.dbMeta?.query).toBe('AUTH [REDACTED]');
+        expect(slots[0]?.dbMeta?.collection).toBeUndefined();
+        expect(slots[0]?.method).toBe('AUTH');
+
+        expect(slots[1]?.dbMeta?.query).toBe('HELLO [REDACTED]');
+        expect(slots[1]?.dbMeta?.collection).toBeUndefined();
+        expect(slots[1]?.method).toBe('HELLO');
+      } finally {
+        uninstall();
+      }
+    });
+  });
+
   it('records redis command errors', async () => {
     class FakeRedis {
       public options = { host: 'redis.local', port: 6379 };

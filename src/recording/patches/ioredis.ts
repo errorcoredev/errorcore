@@ -49,10 +49,17 @@ export function install(deps: PatchInstallDeps): () => void {
           const context = deps.als.getContext();
           const startTime = process.hrtime.bigint();
           const name = typeof command?.name === 'string' ? command.name : 'UNKNOWN';
-          const key =
+          // AUTH and HELLO transmit credentials as the first arg to the
+          // Redis server. Recording that arg alongside the command name
+          // turned the SDK into a credential exfiltrator. Replace the
+          // recorded arg with a placeholder.
+          const nameUpper = name.toUpperCase();
+          const isCredentialCommand = nameUpper === 'AUTH' || nameUpper === 'HELLO';
+          const rawKey =
             Array.isArray(command?.args) && typeof command.args[0] === 'string'
               ? command.args[0]
               : undefined;
+          const key = isCredentialCommand ? undefined : rawKey;
           const event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'> = {
             phase: 'active',
             startTime,
@@ -78,7 +85,11 @@ export function install(deps: PatchInstallDeps): () => void {
             error: null,
             aborted: false,
             dbMeta: {
-              query: key === undefined ? name : `${name} ${key}`,
+              query: isCredentialCommand
+                ? `${name} [REDACTED]`
+                : key === undefined
+                  ? name
+                  : `${name} ${key}`,
               collection: key
             }
           };

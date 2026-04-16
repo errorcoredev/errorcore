@@ -150,6 +150,14 @@ unsafe implicit behaviors removed.
   read so unusually large container-stack hierarchies do not block
   SDK init.
 
+### Security (additional)
+
+- ioredis patch redacts the first argument of `AUTH` and `HELLO`
+  commands. These commands transmit credentials to the Redis server
+  as their first argument, which the SDK previously recorded
+  verbatim as the "collection" and included in the formatted query
+  string on every captured error package.
+
 ### Security
 
 - Closed an arbitrary-code-execution path in `init()` that would `require()`
