@@ -166,12 +166,19 @@ export function wrapLambda<TEvent = unknown, TResult = unknown>(
       eventSource: extracted.eventSource
     });
 
+    // Race-free safety-timer lifecycle: a single boolean drives both the
+    // finally-block cleanup and the timer callback's short-circuit. If
+    // the handler returns just as the timer fires, the callback observes
+    // invocationCompleted === true and does nothing; conversely, if the
+    // callback has already started running, setting the flag in finally
+    // is harmless because the callback checks it first.
+    let invocationCompleted = false;
     let safetyTimer: ReturnType<typeof setTimeout> | null = null;
     const remainingMs = lambdaContext.getRemainingTimeInMs();
 
     if (remainingMs > 3000) {
       safetyTimer = setTimeout(() => {
-        safetyTimer = null;
+        if (invocationCompleted) return;
         const err = new Error(
           `Timeout imminent: ${lambdaContext.functionName} (${lambdaContext.getRemainingTimeInMs()}ms left)`
         );
@@ -208,8 +215,10 @@ export function wrapLambda<TEvent = unknown, TResult = unknown>(
       }
       throw error;
     } finally {
+      invocationCompleted = true;
       if (safetyTimer !== null) {
         clearTimeout(safetyTimer);
+        safetyTimer = null;
       }
       instance.requestTracker.remove(context.requestId);
       watchdog?.notifyInvokeEnd();
@@ -254,12 +263,13 @@ export function wrapServerless<TArgs extends unknown[], TResult>(
 
     instance.requestTracker.add(context);
 
+    let invocationCompleted = false;
     let safetyTimer: ReturnType<typeof setTimeout> | null = null;
     const timeoutMs = options?.getTimeoutMs?.(...args);
 
     if (timeoutMs !== undefined && timeoutMs > 3000) {
       safetyTimer = setTimeout(() => {
-        safetyTimer = null;
+        if (invocationCompleted) return;
         const err = new Error(`Timeout imminent (${timeoutMs}ms limit)`);
         err.name = 'ServerlessTimeoutError';
         if (instance.captureError) {
@@ -280,8 +290,10 @@ export function wrapServerless<TArgs extends unknown[], TResult>(
       }
       throw error;
     } finally {
+      invocationCompleted = true;
       if (safetyTimer !== null) {
         clearTimeout(safetyTimer);
+        safetyTimer = null;
       }
       instance.requestTracker.remove(context.requestId);
       try { await instance.flush?.(); } catch {}

@@ -520,4 +520,28 @@ describe('middleware adapters', () => {
     const captured = getAddedContext();
     expect(sdk.requestTracker.remove).toHaveBeenCalledWith(captured?.requestId);
   });
+
+  it('withErrorcore captures 5xx results without reading the response body', async () => {
+    // Regression: the previous implementation called
+    // (result as Response).clone().json() on any 5xx return. If the body
+    // was a streaming response or the framework had already consumed
+    // it, the clone/json path threw. The fix is to skip the body read
+    // entirely and capture only the status-coded error.
+    const { sdk } = createSdk();
+    const captureSpy = sdk.captureError as unknown as ReturnType<typeof vi.fn>;
+
+    // A response-like object whose clone() would throw if invoked.
+    const responseLike = {
+      status: 500,
+      clone() { throw new Error('clone was invoked but must not be'); }
+    };
+
+    const result = await withErrorcore(async () => responseLike, sdk)(createNextRequest());
+
+    expect(result).toBe(responseLike);
+    expect(captureSpy).toHaveBeenCalledTimes(1);
+    const capturedError = captureSpy.mock.calls[0]?.[0] as Error;
+    expect(capturedError.message).toBe('HTTP 500');
+    expect(capturedError.name).toBe('ServerError');
+  });
 });

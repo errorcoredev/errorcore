@@ -114,8 +114,18 @@ function onTimeout() {
       ...(collectorAuth ? { 'Authorization': collectorAuth } : {})
     }
   }, (res) => { res.on('data', () => {}); });
-  req.on('error', () => {});
-  req.setTimeout(3000, () => req.destroy());
+  req.on('error', (err) => {
+    // This worker cannot reach onInternalWarning. Write to stderr so the
+    // failure shows up in CloudWatch (the Lambda use case this watchdog
+    // was built for). Silent swallowing in the original implementation
+    // masked ECONNREFUSED/DNS failures that operators needed to see.
+    try { process.stderr.write('[errorcore][watchdog] post failed: ' + ((err && err.message) || String(err)) + '\\n'); } catch (e) { /* stderr itself failed */ }
+  });
+  req.setTimeout(3000, () => {
+    // Destroy with an explicit error so the 'error' listener logs it and
+    // socket teardown propagates to any in-flight write buffers.
+    try { req.destroy(new Error('watchdog post timeout')); } catch (e) { /* already destroyed */ }
+  });
   req.write(payload);
   req.end();
 }

@@ -76,6 +76,19 @@ unsafe implicit behaviors removed.
 - The `initializing` re-entry guard moved from a module-scoped `let` to a
   `globalThis[Symbol.for('errorcore.sdk.initializing')]` slot so the
   guard spans webpack chunks and bundled entry points.
+- `withErrorcore` (Next.js) no longer calls `.clone().json()` on the
+  handler's return value to pick an error message from a 5xx body. That
+  path interacted badly with streaming responses and with framework
+  internals that had already consumed the clone. The status code alone
+  now drives the auto-capture; a real message comes via exceptions.
+- `wrapLambda` / `wrapServerless` safety timer uses an `invocationCompleted`
+  flag so a timer that fires in the same tick as a handler's return
+  short-circuits instead of reporting a spurious "Timeout imminent".
+- Lambda `WatchdogManager` worker no longer silently swallows HTTP
+  errors from the collector post. Errors go to stderr so CloudWatch
+  sees ECONNREFUSED/DNS failures. The 3-second write timeout now
+  destroys the request with an explicit error, which propagates to any
+  in-flight write buffers.
 
 ### Security
 

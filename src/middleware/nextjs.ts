@@ -65,20 +65,16 @@ export function withErrorcore<
         if (
           instance.captureError !== undefined &&
           result != null &&
-          typeof (result as any).status === 'number' &&
-          (result as any).status >= 500
+          typeof (result as unknown as { status?: unknown }).status === 'number' &&
+          (result as unknown as { status: number }).status >= 500
         ) {
+          // We used to call (result as Response).clone().json() to pick
+          // an error message out of the body. That path interacted badly
+          // with streaming responses and with framework internals that
+          // had already consumed the clone. The status code alone is
+          // enough signal; a real message will come from an exception.
           try {
-            let message = `HTTP ${(result as any).status}`;
-            if (typeof (result as any).clone === 'function') {
-              try {
-                const body = await (result as any).clone().json();
-                if (body != null && typeof body.error === 'string') {
-                  message = body.error;
-                }
-              } catch {}
-            }
-            const err = new Error(message);
+            const err = new Error(`HTTP ${(result as unknown as { status: number }).status}`);
             err.name = 'ServerError';
             instance.captureError(err);
           } catch {}
