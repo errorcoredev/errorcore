@@ -168,6 +168,17 @@ unsafe implicit behaviors removed.
   so generated request ids remain integers even on processes that
   somehow sustained millions of requests per second for weeks.
 
+### Diagnostics
+
+- `ERRORCORE_DEBUG` is re-read on every `createDebug(...)` log call
+  so operators can toggle debug output during incident triage without
+  restarting the host. Previously the flag was captured once at import
+  time.
+- `emitSafeWarning('capture_failed', ...)` now includes the error's
+  name and a 200-char-truncated message instead of only the
+  constructor name. Operators can now tell a RangeError apart from a
+  TypeError without enabling debug output.
+
 ### Security
 
 - Closed an arbitrary-code-execution path in `init()` that would `require()`

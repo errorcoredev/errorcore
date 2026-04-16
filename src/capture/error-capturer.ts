@@ -316,7 +316,15 @@ export class ErrorCapturer {
 
       return this.captureInline(parts);
     } catch (captureError) {
-      emitSafeWarning('capture_failed', captureError instanceof Error ? captureError.constructor.name : 'unknown');
+      // Include name + truncated message rather than just the constructor
+      // name. The previous behavior gave operators no way to distinguish,
+      // for example, a RangeError from out-of-memory vs. a TypeError from
+      // a bad scrubber return type.
+      const detail =
+        captureError instanceof Error
+          ? `${captureError.name}: ${captureError.message.slice(0, 200)}`
+          : 'unknown';
+      emitSafeWarning('capture_failed', detail);
 
       if (this.deadLetterStore !== null) {
         try {
