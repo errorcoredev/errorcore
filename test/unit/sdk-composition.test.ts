@@ -68,6 +68,52 @@ describe('SDK composition', () => {
     }
   });
 
+  it('does not call process.exit when the host has its own uncaughtException handler', () => {
+    // Regression: the previous behavior was that the SDK always forced
+    // process.exit(1) after capturing an uncaught exception, even when
+    // the host application had installed its own handler that expected
+    // to keep the process alive.
+    const existingHostHandler = vi.fn();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((_code?: number) => {
+      // Do not actually exit during the test; we only need to observe
+      // whether the SDK tried to call exit.
+      return undefined as never;
+    }) as (code?: number | string | null | undefined) => never);
+
+    // Install the host handler BEFORE the SDK activates so the SDK's
+    // snapshot count sees a pre-existing listener.
+    process.on('uncaughtException', existingHostHandler);
+
+    let sdk: ReturnType<typeof createSDK> | undefined;
+    try {
+      sdk = createSDK({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        // Disable the worker path so capture is synchronous and we do not
+        // race with async package assembly.
+        useWorkerAssembly: false
+      });
+      sdk.activate();
+
+      // Find the SDK's uncaughtException handler and invoke it with a
+      // synthesized error.
+      const listeners = process.listeners('uncaughtException');
+      const sdkHandler = listeners[listeners.length - 1] as (err: Error) => void;
+      expect(typeof sdkHandler).toBe('function');
+
+      sdkHandler(new Error('injected-uncaught'));
+
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.off('uncaughtException', existingHostHandler);
+      if (sdk !== undefined) {
+        // Avoid shutdown side effects that would call exit in production.
+        void sdk.shutdown().catch(() => undefined);
+      }
+      exitSpy.mockRestore();
+    }
+  });
+
   it('does not auto-load errorcore.config.js from the current working directory', async () => {
     // Regression test: init() used to call tryLoadConfigFile() which did
     // require(process.cwd() + '/errorcore.config.js'). That was an RCE surface

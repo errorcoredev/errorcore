@@ -59,6 +59,23 @@ unsafe implicit behaviors removed.
   recorder (cloneAndLimit of a hostile value, ALS misbehavior). Host reads
   of a tracked container always succeed; telemetry failures are silently
   dropped. Host-side getter exceptions are still propagated normally.
+- The SDK's `uncaughtException` handler no longer calls `process.exit(1)`
+  when the host application has its own `uncaughtException` listener
+  installed. The error is still captured. The previous behavior overrode
+  host-managed crash recovery logic.
+- The `beforeExit` handler is now async and awaits shutdown so pending
+  flushes complete before Node exits. The previous implementation used
+  fire-and-forget and lost the final flush.
+- `captureError` and `flush` now accept calls during the `shutting_down`
+  phase, bounded by the existing buffer. This eliminates silent drops of
+  errors that arrive between shutdown start and transport close.
+- `drainDeadLetters` arithmetic rewritten as a clearer `drainedEverything`
+  branch. Behavior is equivalent; the previous ternary form obscured a
+  subtle correctness requirement around purging interleaved invalid
+  entries.
+- The `initializing` re-entry guard moved from a module-scoped `let` to a
+  `globalThis[Symbol.for('errorcore.sdk.initializing')]` slot so the
+  guard spans webpack chunks and bundled entry points.
 
 ### Security
 

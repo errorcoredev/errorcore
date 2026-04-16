@@ -232,11 +232,17 @@ export class SDKInstance {
       }
 
       if (processedLineCount > 0) {
-        this.deadLetterStore!.clearSent(
+        // If we successfully sent every entry in the batch AND the batch
+        // covered every valid entry drain() returned, clear the whole
+        // file by its line count. That also removes any interleaved lines
+        // that drain() skipped as invalid/unsigned, which would otherwise
+        // accumulate. Otherwise clear only up through the last line we
+        // actually sent.
+        const drainedEverything =
           processedLineCount === batch[batch.length - 1]?.lineNumber &&
-            batch.length === entries.length
-            ? lineCount
-            : processedLineCount
+          batch.length === entries.length;
+        this.deadLetterStore!.clearSent(
+          drainedEverything ? lineCount : processedLineCount
         );
       }
     };
@@ -248,7 +254,11 @@ export class SDKInstance {
   }
 
   public captureError(error: Error): void {
-    if (this.state !== 'active') {
+    // Allow capture during the active phase and during the shutting-down
+    // phase. During shutdown the transport is still up and the capturer
+    // can still enqueue; this prevents a silent drop of the final error
+    // batch that arrives while a SIGTERM-triggered flush is running.
+    if (this.state !== 'active' && this.state !== 'shutting_down') {
       return;
     }
 
@@ -281,7 +291,10 @@ export class SDKInstance {
   }
 
   public async flush(): Promise<void> {
-    if (this.state !== 'active') {
+    // flush() is called from user code (typically in graceful shutdown
+    // paths) and from the shutdown sequence itself. Allow it during the
+    // shutting-down phase so in-flight captures still reach the transport.
+    if (this.state !== 'active' && this.state !== 'shutting_down') {
       return;
     }
 
@@ -426,6 +439,13 @@ export class SDKInstance {
     this.processListeners.push({ event: 'unhandledRejection', handler: unhandledRejectionHandler });
 
     if (!this.config.serverless) {
+      // Snapshot the uncaughtException listener count so we know, at fire
+      // time, whether the SDK is the only listener. If the host app has its
+      // own uncaughtException handler we must NOT force process.exit: Node
+      // only exits by default when nobody is listening, and the host may
+      // intentionally keep the process alive.
+      const preExistingUncaughtListenerCount = process.listenerCount('uncaughtException');
+
       const uncaughtExceptionHandler = (error: Error) => {
         if (this.fatalExitInProgress) {
           return;
@@ -433,13 +453,20 @@ export class SDKInstance {
 
         this.fatalExitInProgress = true;
         this.errorCapturer.capture(error, { isUncaught: true });
-        // Transport delivery is not guaranteed within uncaughtExceptionExitDelayMs;
-        // increase it for slow collectors.
+
+        const currentCount = process.listenerCount('uncaughtException');
+        const sdkIsOnlyListener = currentCount === preExistingUncaughtListenerCount + 1;
+
+        if (!sdkIsOnlyListener) {
+          // Host has its own handler. Let it decide. We have already
+          // captured the error above.
+          return;
+        }
+
+        // No host handler. Node would otherwise terminate the process
+        // after our listener returns; we mirror that with a bounded-time
+        // shutdown so the transport gets a chance to flush.
         const exitNow = () => {
-          // process.exit() is intentional here. This handler is only
-          // registered for uncaughtException and unhandledRejection where
-          // continued execution is unsafe. ESLint: no-process-exit disable
-          // is acceptable in this specific callsite.
           process.exit(1);
         };
         const exitTimer = setTimeout(exitNow, this.config.uncaughtExceptionExitDelayMs);
@@ -452,8 +479,12 @@ export class SDKInstance {
             exitNow();
           });
       };
-      const beforeExitHandler = () => {
-        void this.shutdown();
+      // beforeExit fires synchronously, but Node continues running the
+      // event loop if a listener schedules new async work. Returning the
+      // shutdown promise from an async listener keeps the loop alive long
+      // enough for flush to complete before exit.
+      const beforeExitHandler = async (): Promise<void> => {
+        await this.shutdown().catch(() => undefined);
       };
 
       process.on('uncaughtException', uncaughtExceptionHandler);

@@ -17,8 +17,15 @@ import { resetMiddlewareWarning } from './middleware/common';
  */
 const INSTANCE_KEY = Symbol.for('errorcore.sdk.instance');
 const CAPTURE_WARNING_KEY = Symbol.for('errorcore.capture.warned');
+const INITIALIZING_KEY = Symbol.for('errorcore.sdk.initializing');
 
-let initializing = false;
+function getInitializing(): boolean {
+  return (globalThis as Record<symbol, boolean>)[INITIALIZING_KEY] === true;
+}
+
+function setInitializing(value: boolean): void {
+  (globalThis as Record<symbol, boolean>)[INITIALIZING_KEY] = value;
+}
 
 function getGlobalInstance(): SDKInstance | null {
   return (globalThis as Record<symbol, SDKInstance | null>)[INSTANCE_KEY] ?? null;
@@ -55,7 +62,7 @@ function setCaptureWarningEmitted(value: boolean): void {
  * errorcore.init(require('./errorcore.config.js'));
  */
 export function init(config?: Partial<SDKConfig>): SDKInstance {
-  if (initializing) {
+  if (getInitializing()) {
     throw new Error('SDK initialization already in progress');
   }
 
@@ -72,7 +79,7 @@ export function init(config?: Partial<SDKConfig>): SDKInstance {
     }
   }
 
-  initializing = true;
+  setInitializing(true);
 
   try {
     const resolvedConfig = config ?? {};
@@ -89,7 +96,7 @@ export function init(config?: Partial<SDKConfig>): SDKInstance {
 
     return nextInstance;
   } finally {
-    initializing = false;
+    setInitializing(false);
   }
 }
 
@@ -156,7 +163,7 @@ export async function shutdown(): Promise<void> {
   await instance.shutdown();
   setGlobalInstance(null);
   setCaptureWarningEmitted(false);
-  initializing = false;
+  setInitializing(false);
   resetMiddlewareWarning();
 }
 
