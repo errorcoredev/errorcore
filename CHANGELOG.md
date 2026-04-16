@@ -179,6 +179,14 @@ unsafe implicit behaviors removed.
   constructor name. Operators can now tell a RangeError apart from a
   TypeError without enabling debug output.
 
+### Packaging
+
+- `package.json` `exports.` no longer points at `./dist/index.mjs`.
+  The `tsc`-only build does not emit `.mjs` so the declared ESM
+  entry was a dangling reference. ESM consumers now resolve to the
+  same CJS entry via Node's default CJS-ESM interop. The stale
+  `dist/index.mjs` shim that had been checked in has been removed.
+
 ### Security
 
 - Closed an arbitrary-code-execution path in `init()` that would `require()`
