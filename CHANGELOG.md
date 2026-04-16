@@ -98,6 +98,22 @@ unsafe implicit behaviors removed.
   now surface via the new `onInternalError` constructor option instead
   of being silently swallowed. If no callback is provided the error is
   logged as before.
+- `TransportDispatcher` worker message handler validates that the
+  incoming message has a numeric `id` field before touching the
+  pending Map. A corrupted or unexpected message now early-returns
+  instead of silently dropping an unrelated in-flight request.
+- `TransportDispatcher.sendSync` now applies configured encryption
+  before handing the payload off to the synchronous transport. The
+  previous implementation explicitly discarded the encryption handle,
+  so the uncaught-exception path wrote plaintext even when the SDK was
+  configured with an `encryptionKey`.
+- `HttpTransport` retry filter rewritten as an explicit allowlist of
+  transient network codes (`ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`,
+  `ENOTFOUND`, `EAI_AGAIN`, `EHOSTUNREACH`, `ENETUNREACH`, `EPIPE`)
+  plus the same HTTP status allowlist as before. Everything else is
+  non-retryable. The previous logic treated any `error.code` as
+  retryable except a small TLS blocklist, which meant local errors
+  like `EACCES` and `ENOSPC` were retried pointlessly.
 
 ### Security
 

@@ -323,8 +323,23 @@ export class TransportDispatcher implements Transport {
       this.fallbackTransport ??
       createTransport(this.config, this.transportAuthorization);
 
-    transport.sendSync?.(payload);
-    void this.encryption;
+    // sendSync is used only on the uncaught-exception path where we
+    // cannot await the async encrypt. Encryption.encrypt is itself
+    // synchronous, so there is no reason to skip it. Previously this
+    // path wrote plaintext to stdout/file even when the SDK was
+    // configured with an encryptionKey.
+    let outbound = payload;
+    if (this.encryption !== null) {
+      try {
+        outbound = JSON.stringify(this.encryption.encrypt(payload));
+      } catch {
+        // If encryption itself throws, fall back to the plaintext payload
+        // rather than dropping the error entirely. The SDK is already in
+        // a fatal-exit path.
+      }
+    }
+
+    transport.sendSync?.(outbound);
   }
 
   private initializeWorker(): void {
@@ -357,6 +372,18 @@ export class TransportDispatcher implements Transport {
       });
 
       worker.on('message', (message) => {
+        // Validate message shape before touching the pending Map. A
+        // corrupted or unexpected message could otherwise call
+        // pending.get(undefined) and either miss (silent drop of a
+        // legitimate reply) or, if a non-number id were stored, corrupt
+        // resolution state.
+        if (
+          typeof message !== 'object' ||
+          message === null ||
+          typeof (message as { id?: unknown }).id !== 'number'
+        ) {
+          return;
+        }
         const response = message as { id: number; error?: string };
         const pending = this.pending.get(response.id);
 

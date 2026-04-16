@@ -349,6 +349,38 @@ describe('HttpTransport', () => {
     expect(requestSpy).toHaveBeenCalledTimes(3);
   });
 
+  it('does not retry when the socket errors with a non-transient code like EACCES', async () => {
+    // Regression: the previous filter treated ANY error.code as retryable
+    // except a small TLS blocklist. EACCES and other local errors were
+    // retried up to 3x for no benefit. The fix narrows retry to a
+    // transient-network allowlist.
+    const attempt: Array<EventEmitter & { write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn>; setTimeout: ReturnType<typeof vi.fn> }> = [];
+    const requestSpy = vi.fn(() => {
+      const request = new EventEmitter() as EventEmitter & {
+        write: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+        setTimeout: ReturnType<typeof vi.fn>;
+      };
+      request.write = vi.fn();
+      request.end = vi.fn(() => {
+        const eaccess = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+        setImmediate(() => request.emit('error', eaccess));
+      });
+      request.destroy = vi.fn();
+      request.setTimeout = vi.fn(() => request);
+      attempt.push(request);
+      return request;
+    });
+    httpsModule.request = requestSpy as typeof httpsModule.request;
+
+    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+
+    await expect(transport.send('payload')).rejects.toThrow();
+    // Exactly one attempt: EACCES is not retryable.
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('(f) appends a newline to every payload', async () => {
     const writtenBodies: Buffer[] = [];
     const requestSpy = vi.fn((_opts: unknown, callback: (res: EventEmitter & { statusCode?: number }) => void) => {

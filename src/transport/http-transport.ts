@@ -19,16 +19,6 @@ const INVALID_CERTIFICATE_WARNING =
   '[ErrorCore] HTTPS collector certificate validation is disabled; use allowInvalidCollectorCertificates only for local development.';
 const INVALID_CERTIFICATE_WARNING_FLAG =
   '__errorcoreInvalidCollectorCertificatesWarningEmitted';
-const NON_RETRYABLE_TLS_ERROR_CODES = new Set([
-  'CERT_HAS_EXPIRED',
-  'DEPTH_ZERO_SELF_SIGNED_CERT',
-  'ERR_TLS_CERT_ALTNAME_INVALID',
-  'SELF_SIGNED_CERT_IN_CHAIN',
-  'UNABLE_TO_GET_ISSUER_CERT',
-  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
-  'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
-]);
-
 type GlobalWarningState = typeof globalThis & {
   [INVALID_CERTIFICATE_WARNING_FLAG]?: boolean;
 };
@@ -210,17 +200,28 @@ export class HttpTransport {
       );
     }
 
-    if (
-      error.code !== undefined &&
-      NON_RETRYABLE_TLS_ERROR_CODES.has(error.code)
-    ) {
-      return false;
-    }
-
     if (error.message === 'HTTP transport timeout') {
       return true;
     }
 
-    return error.code !== undefined || !error.message.startsWith('HTTP ');
+    // Explicit allowlist: only retry known-transient network conditions.
+    // Previously anything with an `error.code` property was retried, which
+    // included EACCES, ENOSPC, EISDIR, etc. Those are not going to be
+    // fixed by retrying so they correctly belong in the non-retryable set.
+    if (error.code !== undefined) {
+      const RETRYABLE_NET_CODES = new Set<string>([
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'ETIMEDOUT',
+        'ENOTFOUND',
+        'EAI_AGAIN',
+        'EHOSTUNREACH',
+        'ENETUNREACH',
+        'EPIPE'
+      ]);
+      return RETRYABLE_NET_CODES.has(error.code);
+    }
+
+    return false;
   }
 }
