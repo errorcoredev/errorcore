@@ -300,9 +300,36 @@ describe('FileTransport', () => {
 
       expect(renameSpy).toHaveBeenCalledWith(
         '/tmp/test.log',
-        `/tmp/test.log.${now}.bak`,
+        `/tmp/test.log.${now}-1.bak`,
         expect.any(Function)
       );
+    });
+
+    it('produces distinct filenames when two rotations fire in the same millisecond', async () => {
+      // Regression: previously the rotated filename was ${path}.${Date.now()}.bak
+      // so two rotations inside the same ms tick collided and the second
+      // rename overwrote the first. With a monotonic per-instance counter
+      // the two renames use distinct names.
+      const transport = new FileTransport({ path: '/tmp/test.log', maxSizeBytes: 1024 });
+
+      vi.spyOn(fs, 'stat').mockImplementation((_path, callback) => {
+        (callback as Function)(null, { size: 2048 });
+      });
+      vi.spyOn(Date, 'now').mockReturnValue(1700000000000);
+      const renameSpy = vi.spyOn(fs, 'rename').mockImplementation((_o, _n, cb) => {
+        (cb as Function)();
+      });
+      vi.spyOn(fs, 'readdir').mockImplementation((_dir, callback) => {
+        (callback as Function)(null, []);
+      });
+      vi.spyOn(fs, 'appendFile').mockImplementation((_path, _data, callback) => {
+        (callback as Function)();
+      });
+
+      await Promise.all([transport.send('a'), transport.send('b')]);
+
+      const calls = renameSpy.mock.calls.map((call) => call[1] as string);
+      expect(new Set(calls).size).toBe(calls.length);
     });
   });
 

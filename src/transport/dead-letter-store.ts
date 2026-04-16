@@ -37,6 +37,10 @@ interface DeadLetterStoreOptions {
   maxSizeBytes?: number;
   maxPayloadBytes?: number;
   requireEncryptedPayload?: boolean;
+  // Optional callback invoked with a short diagnostic code when the
+  // store fails at a point that was previously swallowed silently.
+  // Intended to be wired into config.onInternalWarning by the SDK.
+  onInternalError?: (code: string, message: string) => void;
 }
 
 const DEFAULT_MAX_SIZE_BYTES = 50 * 1024 * 1024;
@@ -80,12 +84,32 @@ export class DeadLetterStore {
 
   private readonly requireEncryptedPayload: boolean;
 
+  private readonly onInternalError?: (code: string, message: string) => void;
+
+  // Serialize concurrent clearSent calls inside the same process. Each
+  // call takes the latest promise and chains its work. This removes the
+  // in-process portion of the rename/read/append race. Cross-process
+  // races (the CLI drain running while the SDK runtime appends) remain
+  // best-effort: operators should not run `errorcore drain` concurrently
+  // with a live SDK process against the same file.
+  private clearChain: Promise<void> = Promise.resolve();
+
   public constructor(filePath: string, options: DeadLetterStoreOptions) {
     this.filePath = filePath;
     this.integrityKey = options.integrityKey;
     this.maxSizeBytes = options.maxSizeBytes ?? DEFAULT_MAX_SIZE_BYTES;
     this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.requireEncryptedPayload = options.requireEncryptedPayload ?? false;
+    this.onInternalError = options.onInternalError;
+  }
+
+  private reportError(code: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    if (this.onInternalError !== undefined) {
+      try { this.onInternalError(code, message); } catch { /* never break on telemetry */ }
+    } else {
+      console.warn(`[ErrorCore] Dead-letter store ${code}: ${message}`);
+    }
   }
 
   public appendPayloadSync(payload: string): boolean {
@@ -199,8 +223,11 @@ export class DeadLetterStore {
 
       try {
         fs.unlinkSync(tempPath);
-      } catch {
-        // Best-effort cleanup of temp file
+      } catch (unlinkError) {
+        const code = (unlinkError as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          this.reportError('clearSent_unlink_failed', unlinkError);
+        }
       }
     } catch (error) {
       // If we renamed but failed to process, try to restore the original.
@@ -208,12 +235,11 @@ export class DeadLetterStore {
         if (fs.existsSync(tempPath) && !fs.existsSync(this.filePath)) {
           fs.renameSync(tempPath, this.filePath);
         }
-      } catch {
-        // Best-effort restore
+      } catch (restoreError) {
+        this.reportError('clearSent_restore_failed', restoreError);
       }
 
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Dead-letter store clearSent failed: ${message}`);
+      this.reportError('clearSent_failed', error);
     }
   }
 

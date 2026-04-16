@@ -89,6 +89,15 @@ unsafe implicit behaviors removed.
   sees ECONNREFUSED/DNS failures. The 3-second write timeout now
   destroys the request with an explicit error, which propagates to any
   in-flight write buffers.
+- `FileTransport` rotation is serialized in-process so two concurrent
+  `send()` calls that observe a size over the threshold no longer both
+  attempt to rename the file. Rotated-filename suffix uses a monotonic
+  per-instance counter so two rotations inside the same millisecond
+  produce distinct names.
+- `DeadLetterStore` `clearSent` failures and temp-file-unlink failures
+  now surface via the new `onInternalError` constructor option instead
+  of being silently swallowed. If no callback is provided the error is
+  logged as before.
 
 ### Security
 

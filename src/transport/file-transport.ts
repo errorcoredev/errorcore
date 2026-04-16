@@ -15,6 +15,15 @@ export class FileTransport {
 
   private readonly maxBackups: number;
 
+  // Serialize rotation operations. Without this, two concurrent send()
+  // calls that each observe the file size over the threshold both try
+  // to rename and the second rename races with the first append.
+  private rotatePromise: Promise<void> | null = null;
+
+  // Monotonic suffix within the same millisecond so same-tick rotations
+  // do not collide at Date.now() ms granularity.
+  private rotateCounter = 0;
+
   public constructor(config: FileTransportConfig) {
     this.path = config.path;
     this.maxSizeBytes = config.maxSizeBytes ?? 100 * 1024 * 1024;
@@ -97,6 +106,24 @@ export class FileTransport {
   }
 
   private async rotateIfNeeded(): Promise<void> {
+    // Serialize: if a rotation is already in flight, await it and then
+    // re-check whether another one is still needed. Without this, N
+    // concurrent sends can each observe "over threshold" before anyone
+    // renames, and the winners of that race call rename on a file that
+    // no longer exists at that name.
+    if (this.rotatePromise !== null) {
+      await this.rotatePromise;
+    }
+
+    this.rotatePromise = this.rotateOnce();
+    try {
+      await this.rotatePromise;
+    } finally {
+      this.rotatePromise = null;
+    }
+  }
+
+  private async rotateOnce(): Promise<void> {
     const stats = await new Promise<fs.Stats | null>((resolve) => {
       fs.stat(this.path, (error, value) => {
         if (error) {
@@ -112,7 +139,12 @@ export class FileTransport {
       return;
     }
 
-    const rotatedPath = `${this.path}.${Date.now()}.bak`;
+    // Timestamp is ms granular. Add a per-instance counter so two
+    // rotations inside the same millisecond still produce distinct
+    // filenames.
+    const stamp = Date.now();
+    const seq = ++this.rotateCounter;
+    const rotatedPath = `${this.path}.${stamp}-${seq}.bak`;
 
     await new Promise<void>((resolve, reject) => {
       fs.rename(this.path, rotatedPath, (error) => {
