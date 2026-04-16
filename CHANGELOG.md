@@ -25,6 +25,21 @@ unsafe implicit behaviors removed.
   their own payloads by pulling the HMAC key out of the Encryption instance
   now call `encryption.sign(serializedPayload)` instead. The HMAC key never
   leaves the Encryption instance.
+- `allowUnencrypted` no longer defaults based on `NODE_ENV`. The default is
+  now `false` unconditionally. Callers that previously relied on the dev
+  fallback (`NODE_ENV !== 'production'` implicitly enabling plaintext) must
+  set `allowUnencrypted: true` explicitly in their config. The previous
+  behavior silently disabled encryption when `NODE_ENV` was missing or
+  misspelled (for example `NODE_ENV=prod` or `NODE_ENV=Production`).
+- `allowInsecureTransport` is removed. It was a silent alias for
+  `allowPlainHttpTransport`. `resolveConfig` throws a clear error if the
+  removed name is passed. `ResolvedConfig.allowInsecureTransport` is no
+  longer emitted.
+- `encryptionKey` validation raises the minimum character-diversity (Shannon
+  entropy) from 2.0 to 3.5 bits per character. A uniformly random 32-byte
+  hex key scores ~3.93 so `crypto.randomBytes(32).toString('hex')` still
+  passes. A four-distinct-character repeating pattern that previously
+  scraped by is now rejected.
 
 ### Added
 

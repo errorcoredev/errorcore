@@ -70,7 +70,7 @@ describe('resolveConfig', () => {
       ],
       envBlocklist: [/key|secret|token|password|credential|auth|private/i],
       encryptionKey: undefined,
-      allowUnencrypted: true,
+      allowUnencrypted: true, // set explicitly by resolveTestConfig
       transport: { type: 'stdout' },
       captureLocalVariables: false,
       captureDbBindParams: false,
@@ -100,7 +100,6 @@ describe('resolveConfig', () => {
       uncaughtExceptionExitDelayMs: 1500,
       allowPlainHttpTransport: false,
       allowInvalidCollectorCertificates: false,
-      allowInsecureTransport: false,
       deadLetterPath: undefined,
       maxDrainOnStartup: 100,
       useWorkerAssembly: true,
@@ -171,15 +170,15 @@ describe('resolveConfig', () => {
     ).not.toThrow();
   });
 
-  it('rejects low-entropy encryptionKey', () => {
+  it('rejects low-diversity encryptionKey', () => {
     expect(() => resolveTestConfig({ encryptionKey: '0'.repeat(64) })).toThrow(
-      'insufficient entropy'
+      'insufficient character diversity'
     );
     expect(() => resolveTestConfig({ encryptionKey: 'a'.repeat(64) })).toThrow(
-      'insufficient entropy'
+      'insufficient character diversity'
     );
     expect(() => resolveTestConfig({ encryptionKey: 'ab'.repeat(32) })).toThrow(
-      'insufficient entropy'
+      'insufficient character diversity'
     );
     const randomKey = require('node:crypto').randomBytes(32).toString('hex');
     expect(() => resolveTestConfig({ encryptionKey: randomKey })).not.toThrow();
@@ -293,9 +292,49 @@ describe('resolveConfig', () => {
       })
     ).toMatchObject({
       allowPlainHttpTransport: true,
-      allowInvalidCollectorCertificates: true,
-      allowInsecureTransport: true
+      allowInvalidCollectorCertificates: true
     });
+  });
+
+  it('rejects the removed allowInsecureTransport alias with a clear error', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        allowInsecureTransport: true as unknown as never,
+        allowUnencrypted: true
+        // @ts-expect-error verifying rejected legacy field
+      } as Record<string, unknown>)
+    ).toThrow('allowInsecureTransport was removed');
+  });
+
+  it('defaults allowUnencrypted to false regardless of NODE_ENV', () => {
+    // Regression: previously allowUnencrypted defaulted to !isProduction,
+    // so NODE_ENV=prod (a typo) silently disabled encryption in real
+    // production.
+    for (const value of ['prod', 'PRODUCTION', 'development', undefined]) {
+      const prev = process.env.NODE_ENV;
+      if (value === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = value;
+      }
+      try {
+        const resolved = resolveConfig({ transport: { type: 'stdout' } });
+        expect(resolved.allowUnencrypted).toBe(false);
+      } finally {
+        process.env.NODE_ENV = prev;
+      }
+    }
+  });
+
+  it('rejects low-diversity encryption keys that previously scraped by with entropy >= 2', () => {
+    // Four distinct hex chars equally distributed scores entropy 2.0, which
+    // passed the old threshold but is clearly not a random key.
+    const weakFourChar = '0123'.repeat(16);
+    expect(() => resolveTestConfig({ encryptionKey: weakFourChar })).toThrow(
+      'insufficient character diversity'
+    );
   });
 
   it('ships a production-oriented config template', () => {

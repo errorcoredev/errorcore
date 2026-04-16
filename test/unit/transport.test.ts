@@ -428,17 +428,19 @@ describe('HttpTransport', () => {
     const secureOptions = secureRequestSpy.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(secureOptions.rejectUnauthorized).toBe(true);
 
-    const insecureRequestSpy = createMockRequest({ statuses: [200] });
-    httpsModule.request = insecureRequestSpy as typeof httpsModule.request;
+    const plainHttpRequestSpy = createMockRequest({ statuses: [200] });
+    httpsModule.request = plainHttpRequestSpy as typeof httpsModule.request;
 
-    const insecureTransport = new HttpTransport({
+    // allowPlainHttpTransport permits http:// collectors but must not affect
+    // certificate validation on https:// collectors.
+    const plainHttpTransport = new HttpTransport({
       url: 'https://example.com/collect',
-      allowInsecureTransport: true
+      allowPlainHttpTransport: true
     });
-    await insecureTransport.send('payload');
+    await plainHttpTransport.send('payload');
 
-    const insecureOptions = insecureRequestSpy.mock.calls[0]?.[0] as Record<string, unknown>;
-    expect(insecureOptions.rejectUnauthorized).toBe(true);
+    const plainHttpOptions = plainHttpRequestSpy.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(plainHttpOptions.rejectUnauthorized).toBe(true);
 
     const invalidCertRequestSpy = createMockRequest({ statuses: [200] });
     httpsModule.request = invalidCertRequestSpy as typeof httpsModule.request;

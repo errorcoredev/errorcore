@@ -190,8 +190,12 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   const captureResponseBodies = explicitBodyControlsProvided
     ? userConfig.captureResponseBodies ?? false
     : userConfig.captureBody ?? false;
-  const allowPlainHttpTransport =
-    userConfig.allowPlainHttpTransport ?? userConfig.allowInsecureTransport ?? false;
+  if ((userConfig as { allowInsecureTransport?: unknown }).allowInsecureTransport !== undefined) {
+    throw new Error(
+      'allowInsecureTransport was removed. Use allowPlainHttpTransport to enable plain-http collector URLs.'
+    );
+  }
+  const allowPlainHttpTransport = userConfig.allowPlainHttpTransport ?? false;
   const allowInvalidCollectorCertificates =
     userConfig.allowInvalidCollectorCertificates ?? false;
 
@@ -266,10 +270,15 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   }
 
   if (userConfig.encryptionKey !== undefined) {
-    const keyEntropy = hexKeyEntropy(userConfig.encryptionKey);
-    if (keyEntropy < 2.0) {
+    // Shannon entropy over the hex alphabet (max 4.0 bits per character).
+    // A uniformly random 32-byte hex key scores ~3.93. Threshold of 3.5
+    // rejects trivially repetitive keys (all-zeros, single-letter, short
+    // repeating patterns) while still passing any key generated from
+    // crypto.randomBytes.
+    const characterDistribution = hexKeyEntropy(userConfig.encryptionKey);
+    if (characterDistribution < 3.5) {
       throw new Error(
-        'encryptionKey has insufficient entropy (all-zeros, repeated characters, or trivially predictable). ' +
+        'encryptionKey has insufficient character diversity (all-zeros, repeated characters, or trivially predictable). ' +
         'Generate a random key with: ' +
         'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
       );
@@ -397,7 +406,11 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     envAllowlist: [...(userConfig.envAllowlist ?? DEFAULT_ENV_ALLOWLIST)],
     envBlocklist: [...(userConfig.envBlocklist ?? DEFAULT_ENV_BLOCKLIST)],
     encryptionKey: userConfig.encryptionKey,
-    allowUnencrypted: userConfig.allowUnencrypted ?? !isProduction(),
+    // allowUnencrypted defaults to false regardless of NODE_ENV so a
+    // misspelled environment variable (e.g. NODE_ENV=prod or Production)
+    // cannot silently disable encryption in production. Dev setups that
+    // want plaintext must opt in explicitly in their config.
+    allowUnencrypted: userConfig.allowUnencrypted ?? false,
     transport: resolvedTransport,
     captureLocalVariables: userConfig.captureLocalVariables ?? false,
     captureDbBindParams: userConfig.captureDbBindParams ?? false,
@@ -417,7 +430,6 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     uncaughtExceptionExitDelayMs,
     allowPlainHttpTransport,
     allowInvalidCollectorCertificates,
-    allowInsecureTransport: allowPlainHttpTransport,
     deadLetterPath,
     maxDrainOnStartup,
     useWorkerAssembly,

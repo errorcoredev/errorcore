@@ -367,7 +367,6 @@ export interface SDKConfig {
   uncaughtExceptionExitDelayMs?: number;
   allowPlainHttpTransport?: boolean;
   allowInvalidCollectorCertificates?: boolean;
-  allowInsecureTransport?: boolean;
   deadLetterPath?: string;
   maxDrainOnStartup?: number;
   useWorkerAssembly?: boolean;
@@ -407,7 +406,6 @@ export interface ResolvedConfig {
   uncaughtExceptionExitDelayMs: number;
   allowPlainHttpTransport: boolean;
   allowInvalidCollectorCertificates: boolean;
-  allowInsecureTransport: boolean;
   deadLetterPath: string | undefined;
   maxDrainOnStartup: number;
   useWorkerAssembly: boolean;
