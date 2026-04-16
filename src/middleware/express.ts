@@ -2,6 +2,7 @@
 import {
   filterHeaders,
   getModuleInstance,
+  warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
 
@@ -13,7 +14,13 @@ export function expressMiddleware(sdk?: SDKInstanceLike) {
   ): void => {
     const instance = sdk ?? getModuleInstance();
 
-    if (instance === null || !instance.isActive() || res.finished === true) {
+    if (instance === null || !instance.isActive()) {
+      warnIfUninitialized('expressMiddleware()');
+      next();
+      return;
+    }
+
+    if (res.finished === true) {
       next();
       return;
     }

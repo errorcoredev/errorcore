@@ -17,17 +17,60 @@ Errorcore captures the state around a failure so you can inspect what happened a
 
 ## Getting started
 
-1. Install the package
+```bash
+npm install errorcore
+```
 
-   ```bash
-   npm install errorcore
-   ```
+Add two lines to the top of your application entry point:
 
-2. Configure your collector endpoint
+```js
+const errorcore = require('errorcore');
+errorcore.init();
+```
 
-3. Initialize at the top of your application entry point
+That's it. In development (`NODE_ENV !== 'production'`), errorcore defaults to stdout transport and unencrypted payloads. Throw an error and the captured payload prints to your terminal.
 
-Errors are captured and sent to your collector.
+### Quick start (fastest path)
+
+```bash
+npm install errorcore
+npx errorcore init --quickstart
+node errorcore-test.js
+```
+
+### Framework middleware
+
+```js
+// Express
+const { expressMiddleware } = require('errorcore');
+app.use(expressMiddleware());
+
+// Fastify
+const { fastifyPlugin } = require('errorcore');
+fastify.register(fastifyPlugin);
+
+// Koa
+const { koaMiddleware } = require('errorcore');
+app.use(koaMiddleware());
+```
+
+### Production setup
+
+Before deploying, configure a transport and encryption key:
+
+```js
+// errorcore.config.js
+module.exports = {
+  transport: {
+    type: 'http',
+    url: 'https://collector.example.com/v1/errors',
+    authorization: 'Bearer <token>',
+  },
+  encryptionKey: process.env.ERRORCORE_ENCRYPTION_KEY,
+};
+```
+
+Generate a key: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
 
 ## Documentation
 

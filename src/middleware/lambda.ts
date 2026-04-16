@@ -2,6 +2,7 @@
 import {
   filterHeaders,
   getModuleInstance,
+  warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
 
@@ -128,6 +129,7 @@ export function wrapLambda<TEvent = unknown, TResult = unknown>(
     const instance = sdk ?? getModuleInstance();
 
     if (instance === null || !instance.isActive()) {
+      warnIfUninitialized('wrapLambda()');
       return handler(event, lambdaContext);
     }
 
@@ -227,6 +229,7 @@ export function wrapServerless<TArgs extends unknown[], TResult>(
     const instance = getModuleInstance();
 
     if (instance === null || !instance.isActive()) {
+      warnIfUninitialized('wrapServerless()');
       return handler(...args);
     }
 

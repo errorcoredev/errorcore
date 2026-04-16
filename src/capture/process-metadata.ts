@@ -41,6 +41,8 @@ export class ProcessMetadata {
 
   private codeVersion: { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string } = {};
 
+  private codeVersionResolved = false;
+
   private serverlessMeta: { functionName: string; functionVersion: string; invokedFunctionArn: string; lambdaRequestId: string } | null = null;
 
   private environment: Record<string, string> = {};
@@ -74,8 +76,12 @@ export class ProcessMetadata {
         process.env.COMMIT_SHA ??
         process.env.SOURCE_VERSION ??
         this.readGitHead(),
+      // Resolve package version eagerly at init so that readPackageVersion()
+      // (which does synchronous directory walk-up) never runs on the error
+      // capture hot path.
       packageVersion: process.env.npm_package_version || this.readPackageVersion() || undefined
     };
+    this.codeVersionResolved = true;
     this.environment = this.filterEnvironment(process.env as Record<string, string | undefined>);
   }
 

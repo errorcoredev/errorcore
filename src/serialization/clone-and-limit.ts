@@ -43,19 +43,20 @@ function cloneMap(
   value: Map<unknown, unknown>,
   limits: SerializationLimits,
   currentDepth: number,
-  visited: Set<object>
+  visited: Set<object>,
+  budget: CloneBudget
 ): { _type: 'Map'; size: number; entries: unknown[][] } {
   const entries: unknown[][] = [];
   let index = 0;
 
   for (const [key, entryValue] of value.entries()) {
-    if (index >= limits.maxArrayItems) {
+    if (index >= limits.maxArrayItems || budget.remaining <= 0) {
       break;
     }
 
     entries.push([
-      cloneAndLimitInternal(key, limits, currentDepth + 1, visited),
-      cloneAndLimitInternal(entryValue, limits, currentDepth + 1, visited)
+      cloneAndLimitInternal(key, limits, currentDepth + 1, visited, budget),
+      cloneAndLimitInternal(entryValue, limits, currentDepth + 1, visited, budget)
     ]);
     index += 1;
   }
@@ -71,17 +72,18 @@ function cloneSet(
   value: Set<unknown>,
   limits: SerializationLimits,
   currentDepth: number,
-  visited: Set<object>
+  visited: Set<object>,
+  budget: CloneBudget
 ): { _type: 'Set'; size: number; values: unknown[] } {
   const values: unknown[] = [];
   let index = 0;
 
   for (const entryValue of value.values()) {
-    if (index >= limits.maxArrayItems) {
+    if (index >= limits.maxArrayItems || budget.remaining <= 0) {
       break;
     }
 
-    values.push(cloneAndLimitInternal(entryValue, limits, currentDepth + 1, visited));
+    values.push(cloneAndLimitInternal(entryValue, limits, currentDepth + 1, visited, budget));
     index += 1;
   }
 
@@ -117,18 +119,24 @@ function cloneArray(
   value: unknown[],
   limits: SerializationLimits,
   currentDepth: number,
-  visited: Set<object>
+  visited: Set<object>,
+  budget: CloneBudget
 ): unknown {
   const itemCount = Math.min(value.length, limits.maxArrayItems);
   const clonedItems = new Array<unknown>(itemCount);
 
   for (let index = 0; index < itemCount; index += 1) {
+    if (budget.remaining <= 0) {
+      clonedItems[index] = '[Payload size limit]';
+      continue;
+    }
     try {
       clonedItems[index] = cloneAndLimitInternal(
         value[index],
         limits,
         currentDepth + 1,
-        visited
+        visited,
+        budget
       );
     } catch (error) {
       clonedItems[index] = `[Serialization error: ${getErrorMessage(error)}]`;
@@ -150,21 +158,30 @@ function cloneObject(
   value: object,
   limits: SerializationLimits,
   currentDepth: number,
-  visited: Set<object>
+  visited: Set<object>,
+  budget: CloneBudget
 ): Record<string, unknown> {
   const keys = Object.keys(value);
   const keyCount = Math.min(keys.length, limits.maxObjectKeys);
   const cloned: Record<string, unknown> = {};
 
   for (let index = 0; index < keyCount; index += 1) {
+    if (budget.remaining <= 0) {
+      cloned._truncated = true;
+      cloned._originalKeyCount = keys.length;
+      break;
+    }
+
     const key = keys[index];
+    budget.remaining -= key.length;
 
     try {
       cloned[key] = cloneAndLimitInternal(
         (value as Record<string, unknown>)[key],
         limits,
         currentDepth + 1,
-        visited
+        visited,
+        budget
       );
     } catch (error) {
       cloned[key] = `[Serialization error: ${getErrorMessage(error)}]`;
@@ -179,22 +196,32 @@ function cloneObject(
   return cloned;
 }
 
+interface CloneBudget {
+  remaining: number;
+}
+
 export function cloneAndLimit(
   value: unknown,
   limits: SerializationLimits,
   currentDepth?: number,
   visited?: Set<object>
 ): unknown {
-  return cloneAndLimitInternal(value, limits, currentDepth ?? 0, visited ?? new Set<object>());
+  const budget: CloneBudget = { remaining: limits.maxPayloadSize };
+  return cloneAndLimitInternal(value, limits, currentDepth ?? 0, visited ?? new Set<object>(), budget);
 }
 
 function cloneAndLimitInternal(
   value: unknown,
   limits: SerializationLimits,
   currentDepth: number,
-  visited: Set<object>
+  visited: Set<object>,
+  budget: CloneBudget
 ): unknown {
   try {
+    if (budget.remaining <= 0) {
+      return '[Payload size limit]';
+    }
+
     if (currentDepth > limits.maxDepth) {
       return '[Depth limit]';
     }
@@ -212,14 +239,18 @@ function cloneAndLimitInternal(
     }
 
     if (typeof value === 'bigint') {
+      const str = value.toString();
+      budget.remaining -= str.length + 20;
       return {
         _type: 'BigInt',
-        value: value.toString()
+        value: str
       };
     }
 
     if (typeof value === 'string') {
-      return truncateString(value, limits.maxStringLength);
+      const result = truncateString(value, limits.maxStringLength);
+      budget.remaining -= result.length;
+      return result;
     }
 
     if (typeof value === 'symbol') {
@@ -268,7 +299,7 @@ function cloneAndLimitInternal(
       visited.add(value);
 
       try {
-        return cloneMap(value, limits, currentDepth, visited);
+        return cloneMap(value, limits, currentDepth, visited, budget);
       } finally {
         visited.delete(value);
       }
@@ -282,7 +313,7 @@ function cloneAndLimitInternal(
       visited.add(value);
 
       try {
-        return cloneSet(value, limits, currentDepth, visited);
+        return cloneSet(value, limits, currentDepth, visited, budget);
       } finally {
         visited.delete(value);
       }
@@ -314,7 +345,7 @@ function cloneAndLimitInternal(
       visited.add(value);
 
       try {
-        return cloneArray(value, limits, currentDepth, visited);
+        return cloneArray(value, limits, currentDepth, visited, budget);
       } finally {
         visited.delete(value);
       }
@@ -328,7 +359,7 @@ function cloneAndLimitInternal(
       visited.add(value);
 
       try {
-        return cloneObject(value, limits, currentDepth, visited);
+        return cloneObject(value, limits, currentDepth, visited, budget);
       } finally {
         visited.delete(value);
       }

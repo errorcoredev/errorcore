@@ -1,8 +1,11 @@
 
 import { STANDARD_LIMITS, cloneAndLimit } from '../serialization/clone-and-limit';
+import { createDebug } from '../debug';
 import type { Encryption } from '../security/encryption';
 import type { RateLimiter } from '../security/rate-limiter';
 import type { ALSManager } from '../context/als-manager';
+
+const debug = createDebug('capturer');
 import type { RequestTracker } from '../context/request-tracker';
 import type { InspectorManager } from './inspector-manager';
 import { finalizePackageAssemblyResult } from './package-builder';
@@ -54,6 +57,12 @@ interface StateTrackerStatusLike {
   isTrackingEnabled(): boolean;
 }
 
+export interface CaptureDeliveryDiagnostics {
+  sent: number;
+  deadLettered: number;
+  dropped: number;
+}
+
 type ErrorCapturerWarningCode =
   | 'capture_failed'
   | 'capture_fallback_failed'
@@ -64,16 +73,16 @@ function emitSafeWarning(code: ErrorCapturerWarningCode, detail?: string): void 
   const suffix = detail ? `: ${detail}` : '';
   switch (code) {
     case 'capture_failed':
-      console.warn(`[ErrorCore] Error capture failed${suffix} [code=errorcore_capture_failed]`);
+      console.warn(`[ErrorCore] Error capture failed${suffix} [code=errorcore_capture_failed]. If this recurs, check onInternalWarning for details.`);
       return;
     case 'capture_fallback_failed':
-      console.warn(`[ErrorCore] Error capture fallback failed${suffix} [code=errorcore_capture_fallback_failed]`);
+      console.warn(`[ErrorCore] Error capture fallback failed${suffix} [code=errorcore_capture_fallback_failed]. Both the worker and inline capture paths failed.`);
       return;
     case 'transport_dispatch_failed':
-      console.warn(`[ErrorCore] Transport dispatch failed${suffix} [code=errorcore_transport_dispatch_failed]`);
+      console.warn(`[ErrorCore] Transport dispatch failed${suffix} [code=errorcore_transport_dispatch_failed]. Payload dead-lettered (if configured). Check collector connectivity.`);
       return;
     case 'dead_letter_write_failed':
-      console.warn(`[ErrorCore] Dead-letter store write failed${suffix} [code=errorcore_dead_letter_write_failed]`);
+      console.warn(`[ErrorCore] Dead-letter store write failed${suffix} [code=errorcore_dead_letter_write_failed]. Check disk space and permissions at deadLetterPath.`);
       return;
   }
 }
@@ -178,6 +187,12 @@ export class ErrorCapturer {
 
   private readonly pendingTransportDispatches = new Set<Promise<void>>();
 
+  private readonly deliveryDiagnostics: CaptureDeliveryDiagnostics = {
+    sent: 0,
+    deadLettered: 0,
+    dropped: 0
+  };
+
   public constructor(deps: {
     buffer: IOEventBufferLike;
     als: ALSManager;
@@ -218,7 +233,9 @@ export class ErrorCapturer {
     const captureFailures: string[] = [];
 
     try {
+      debug(`capture() called for ${error.name}: ${error.message}`);
       if (!this.rateLimiter.tryAcquire()) {
+        debug('capture() rate-limited, dropping');
         return null;
       }
 
@@ -299,7 +316,7 @@ export class ErrorCapturer {
 
       return this.captureInline(parts);
     } catch (captureError) {
-      emitSafeWarning('capture_failed');
+      emitSafeWarning('capture_failed', captureError instanceof Error ? captureError.constructor.name : 'unknown');
 
       if (this.deadLetterStore !== null) {
         try {
@@ -357,6 +374,14 @@ export class ErrorCapturer {
     }
   }
 
+  public getDiagnostics(): CaptureDeliveryDiagnostics {
+    const snapshot = { ...this.deliveryDiagnostics };
+    this.deliveryDiagnostics.sent = 0;
+    this.deliveryDiagnostics.deadLettered = 0;
+    this.deliveryDiagnostics.dropped = 0;
+    return snapshot;
+  }
+
   private toRequestContextData(
     context: RequestContext | undefined
   ): ErrorPackageRequestContextData | undefined {
@@ -410,17 +435,28 @@ export class ErrorCapturer {
   private dispatchTransport(payload: string): void {
     let sendPromise = Promise.resolve()
       .then(() => this.transport.send(payload))
+      .then(() => {
+        this.deliveryDiagnostics.sent += 1;
+      })
       .catch((transportError) => {
         void transportError;
         emitSafeWarning('transport_dispatch_failed');
 
         if (this.deadLetterStore !== null) {
           try {
-            this.deadLetterStore.appendPayloadSync(payload);
+            const stored = this.deadLetterStore.appendPayloadSync(payload);
+            if (stored) {
+              this.deliveryDiagnostics.deadLettered += 1;
+            } else {
+              this.deliveryDiagnostics.dropped += 1;
+            }
           } catch (dlError) {
             void dlError;
             emitSafeWarning('dead_letter_write_failed');
+            this.deliveryDiagnostics.dropped += 1;
           }
+        } else {
+          this.deliveryDiagnostics.dropped += 1;
         }
       })
       .finally(() => {

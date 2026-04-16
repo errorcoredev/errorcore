@@ -192,7 +192,7 @@ export function renderHTML(apiToken?: string): string {
       if (typeof s !== 'string') return s == null ? '' : String(s);
       return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;');
     }
-    const API_TOKEN = ${apiToken ? `'${apiToken.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'` : 'null'};
+    const API_TOKEN = ${apiToken ? JSON.stringify(apiToken) : 'null'};
     const authHeaders = API_TOKEN ? { 'Authorization': 'Bearer ' + API_TOKEN } : {};
 
     function typeClass(t) {

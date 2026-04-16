@@ -374,6 +374,7 @@ export interface SDKConfig {
   flushIntervalMs?: number;
   resolveSourceMaps?: boolean;
   serverless?: boolean | 'auto';
+  onInternalWarning?: (warning: { code: string; message: string; count: number }) => void;
 }
 
 export interface ResolvedConfig {
@@ -413,6 +414,7 @@ export interface ResolvedConfig {
   flushIntervalMs: number;
   resolveSourceMaps: boolean;
   serverless: boolean;
+  onInternalWarning: ((warning: { code: string; message: string; count: number }) => void) | undefined;
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {

@@ -2,6 +2,7 @@
 import {
   filterHeaders,
   getModuleInstance,
+  warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
 
@@ -14,12 +15,13 @@ export function wrapHandler<
   return ((req, res) => {
     const instance = sdk ?? getModuleInstance();
 
-    if (
-      instance === null ||
-      !instance.isActive() ||
-      res.finished === true ||
-      instance.als.getContext?.() !== undefined
-    ) {
+    if (instance === null || !instance.isActive()) {
+      warnIfUninitialized('wrapHandler()');
+      handler(req, res);
+      return;
+    }
+
+    if (res.finished === true || instance.als.getContext?.() !== undefined) {
       handler(req, res);
       return;
     }

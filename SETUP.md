@@ -26,17 +26,41 @@ npm run build
 
 The build step compiles TypeScript from `src/` into `dist/` using `tsc`.
 
+## Zero-config quick start
+
+In development (`NODE_ENV !== 'production'`), errorcore works with no config file at all:
+
+```js
+require('errorcore').init();
+// Defaults to stdout transport, unencrypted payloads
+```
+
+Or use the quickstart command to scaffold a working example:
+
+```bash
+npx errorcore init --quickstart
+node errorcore-test.js
+```
+
 ## Configuration
 
 Generate a config file in your project root:
 
 ```bash
-npx errorcore init
+npx errorcore init          # minimal config (recommended)
+npx errorcore init --full   # all options with defaults
 ```
 
-This copies the template from `config-template/errorcore.config.js` into your working directory.
+This creates `errorcore.config.js`. The minimal template is all you need to get started:
 
-Open `errorcore.config.js` and configure the required settings:
+```js
+module.exports = {
+  transport: { type: 'stdout' },
+  allowUnencrypted: true,
+};
+```
+
+For the full configuration reference, see below or run `npx errorcore init --full`.
 
 ### Transport (required)
 

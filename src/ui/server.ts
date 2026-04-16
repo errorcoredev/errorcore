@@ -1,10 +1,20 @@
 
-import { Hono, type Context } from 'hono';
-import { serve } from '@hono/node-server';
-
 import { NdjsonReader } from './ndjson-reader';
 import { renderHTML } from './frontend';
 import type { Encryption } from '../security/encryption';
+
+function loadHono(): { Hono: typeof import('hono').Hono; serve: typeof import('@hono/node-server').serve } {
+  try {
+    const { Hono } = require('hono') as typeof import('hono');
+    const { serve } = require('@hono/node-server') as typeof import('@hono/node-server');
+    return { Hono, serve };
+  } catch {
+    throw new Error(
+      'The errorcore dashboard requires hono and @hono/node-server.\n' +
+      'Install them with: npm install hono @hono/node-server'
+    );
+  }
+}
 
 export interface DashboardOptions {
   filePath: string;
@@ -14,13 +24,21 @@ export interface DashboardOptions {
   hostname?: string;
 }
 
-export function startDashboard(options: DashboardOptions): ReturnType<typeof serve> {
+export function startDashboard(options: DashboardOptions): unknown {
+  const { Hono, serve } = loadHono();
   const { filePath, port, encryption } = options;
   const token = options.token ?? process.env.EC_DASHBOARD_TOKEN;
 
   if (token !== undefined && token !== '' && !/^[a-zA-Z0-9_\-]+$/.test(token)) {
     throw new Error(
       'Dashboard token must contain only alphanumeric characters, hyphens, and underscores'
+    );
+  }
+
+  if (token !== undefined && token !== '' && token.length < 16) {
+    throw new Error(
+      'Dashboard token must be at least 16 characters. ' +
+      'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(24).toString(\'base64url\'))"'
     );
   }
 
@@ -49,11 +67,11 @@ export function startDashboard(options: DashboardOptions): ReturnType<typeof ser
     await next();
   });
 
-  app.get('/', (c: Context) => {
+  app.get('/', (c: any) => {
     return c.html(renderHTML(effectiveToken));
   });
 
-  app.get('/api/errors', (c: Context) => {
+  app.get('/api/errors', (c: any) => {
     const page = parseInt(c.req.query('page') ?? '1', 10) || 1;
     const limit = Math.min(parseInt(c.req.query('limit') ?? '25', 10) || 25, 100);
     const search = c.req.query('search') ?? undefined;
@@ -64,7 +82,7 @@ export function startDashboard(options: DashboardOptions): ReturnType<typeof ser
     return c.json(result);
   });
 
-  app.get('/api/errors/:id', (c: Context) => {
+  app.get('/api/errors/:id', (c: any) => {
     const id = c.req.param('id') ?? '';
     const pkg = reader.getById(id);
 
@@ -75,16 +93,16 @@ export function startDashboard(options: DashboardOptions): ReturnType<typeof ser
     return c.json(pkg);
   });
 
-  app.get('/api/stats', (c: Context) => {
+  app.get('/api/stats', (c: any) => {
     return c.json(reader.getStats());
   });
 
-  app.post('/api/refresh', (c: Context) => {
+  app.post('/api/refresh', (c: any) => {
     reader.refresh();
     return c.json({ ok: true });
   });
 
-  app.get('/api/health', (c: Context) => {
+  app.get('/api/health', (c: any) => {
     return c.json({ status: 'ok' });
   });
 

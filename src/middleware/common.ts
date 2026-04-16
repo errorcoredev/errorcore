@@ -55,6 +55,22 @@ export function getModuleInstance(): SDKInstanceLike | null {
   }
 }
 
+let middlewareWarningEmitted = false;
+
+export function warnIfUninitialized(source: string): void {
+  if (!middlewareWarningEmitted) {
+    middlewareWarningEmitted = true;
+    console.warn(
+      `[errorcore] ${source} is active but init() was not called. ` +
+      'Requests are not being tracked. Call errorcore.init() at the top of your application entry point.'
+    );
+  }
+}
+
+export function resetMiddlewareWarning(): void {
+  middlewareWarningEmitted = false;
+}
+
 export function filterHeaders(
   sdk: SDKInstanceLike,
   headers: Record<string, unknown>

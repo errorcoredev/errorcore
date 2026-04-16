@@ -288,10 +288,15 @@ describe('SDK composition', () => {
     expect(sdk.isActive()).toBe(false);
   });
 
-  it('init twice throws and shutdown then init again works', async () => {
+  it('init twice warns and returns existing instance, shutdown then init again works', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const first = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
 
-    expect(() => init()).toThrow('SDK already initialized. Call shutdown() first.');
+    const duplicate = init();
+
+    expect(duplicate).toBe(first);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy.mock.calls[0][0]).toContain('already active');
 
     await shutdownFacade();
 
@@ -336,8 +341,16 @@ describe('SDK composition', () => {
     }
   });
 
-  it('trackState facade requires initialization and withContext facade passes through when absent', async () => {
-    expect(() => trackStateFacade('cache', new Map())).toThrow('SDK is not initialized');
+  it('trackState facade warns and returns container when uninitialized, withContext facade passes through when absent', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const container = new Map();
+    const result = trackStateFacade('cache', container);
+
+    expect(result).toBe(container);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy.mock.calls[0][0]).toContain('before init()');
+    warnSpy.mockRestore();
+
     expect(withContextFacade(() => 'value')).toBe('value');
 
     const sdk = init({ transport: { type: 'stdout' }, allowUnencrypted: true });

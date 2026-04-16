@@ -2,6 +2,7 @@
 import {
   filterHeaders,
   getModuleInstance,
+  warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
 
@@ -27,12 +28,12 @@ export const hapiPlugin = {
     server.ext('onRequest', (request, h) => {
       const instance = options.sdk ?? getModuleInstance();
 
-      if (
-        instance === null ||
-        !instance.isActive() ||
-        request.raw.res.finished === true ||
-        instance.als.getContext?.() !== undefined
-      ) {
+      if (instance === null || !instance.isActive()) {
+        warnIfUninitialized('hapiPlugin');
+        return h.continue;
+      }
+
+      if (request.raw.res.finished === true || instance.als.getContext?.() !== undefined) {
         return h.continue;
       }
 

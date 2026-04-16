@@ -108,13 +108,13 @@ function estimateBodySize(body: unknown): number {
 
 function signSerializedPackage(
   serializedPackage: string,
-  encryptionKey: string | undefined
+  hmacKey: string | undefined
 ): string | null {
-  if (!encryptionKey) {
+  if (!hmacKey) {
     return null;
   }
 
-  return createHmac('sha256', encryptionKey).update(serializedPackage).digest('base64');
+  return createHmac('sha256', hmacKey).update(serializedPackage).digest('base64');
 }
 
 function findLargestBodyEvent(ioTimeline: IOEventSerialized[]): {
@@ -151,9 +151,10 @@ export function finalizePackageAssemblyResult(input: {
 }): PackageAssemblyResult {
   const { packageObject, config } = input;
   const serializedPackageForSignature = JSON.stringify(packageObject);
+  const hmacKey = input.encryption?.getHmacKeyHex() ?? undefined;
   const integritySignature = signSerializedPackage(
     serializedPackageForSignature,
-    config.encryptionKey
+    hmacKey
   );
 
   if (integritySignature !== null) {
@@ -266,6 +267,16 @@ export class PackageBuilder {
       })
     };
 
+    // Early size estimate BEFORE scrubbing. If the raw package is far over
+    // the limit, shed bodies first to avoid wasting CPU on PII-scrubbing
+    // data that will be immediately discarded. Uses a rough estimate to
+    // avoid a full JSON.stringify on the pre-scrub package.
+    const maxPackageSize = this.config.serialization.maxTotalPackageSize;
+    const roughSize = this.estimatePackageSizeRough(packageObject);
+    if (roughSize > maxPackageSize * 2) {
+      this.shedIfNeeded(packageObject, parts);
+    }
+
     const scrubbedPackage = this.scrubber.scrubObject(packageObject) as ErrorPackage;
 
     if ((scrubbedPackage as { request?: ErrorPackage['request'] | null }).request === null) {
@@ -295,9 +306,10 @@ export class PackageBuilder {
       return;
     }
 
-    // Strip bodies from the largest IO events until the estimate is under the limit.
-    // Use estimated subtraction inside the loop to avoid re-serializing the entire
-    // package on every iteration. Re-measure once after the loop for accuracy.
+    // Strip bodies from the largest IO events until the estimate is under the
+    // limit. Use estimated subtraction inside the loop to avoid re-serializing
+    // the entire package on every iteration. Re-measure exactly ONCE after the
+    // loop for accuracy.
     let strippedAnyBody = false;
     while (currentPackageSize > maxPackageSize) {
       const largestBody = findLargestBodyEvent(pkg.ioTimeline);
@@ -321,13 +333,16 @@ export class PackageBuilder {
       strippedAnyBody = true;
     }
 
+    // Single re-serialization after the loop to get an accurate measurement.
+    // This value is reused for the subsequent timeline/stateReads shedding
+    // decisions to avoid additional full serializations.
     if (strippedAnyBody) {
       currentPackageSize = this.getPackageSize(pkg);
     }
 
     if (currentPackageSize > maxPackageSize && parts.usedAmbientEvents) {
       pkg.ioTimeline = [];
-      currentPackageSize = this.getPackageSize(pkg);
+      // Don't re-measure — clearing the timeline always reduces size.
     }
 
     if (currentPackageSize > maxPackageSize) {
@@ -374,6 +389,18 @@ export class PackageBuilder {
       captureFailures: [...parts.captureFailures],
       rateLimiterDrops: parts.rateLimiterDrops
     };
+  }
+
+  private estimatePackageSizeRough(pkg: ErrorPackage): number {
+    let estimate = 4096; // base overhead for metadata, completeness, etc.
+    estimate += Buffer.byteLength(pkg.error.stack, 'utf8');
+    estimate += Buffer.byteLength(pkg.error.message, 'utf8');
+    for (const event of pkg.ioTimeline) {
+      estimate += 256; // per-event metadata overhead
+      estimate += estimateBodySize(event.requestBody);
+      estimate += estimateBodySize(event.responseBody);
+    }
+    return estimate;
   }
 
   private getPackageSize(pkg: ErrorPackage): number {

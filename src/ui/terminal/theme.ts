@@ -1,52 +1,77 @@
 
-import chalk from 'chalk';
+const isTTY = process.stdout.isTTY === true;
+
+type StyleFn = (text: string) => string;
+
+function ansi(open: string, close: string): StyleFn {
+  if (!isTTY) return (text: string) => text;
+  return (text: string) => `\x1b[${open}m${text}\x1b[${close}m`;
+}
+
+function compose(...fns: StyleFn[]): StyleFn {
+  return (text: string) => fns.reduceRight((acc, fn) => fn(acc), text);
+}
+
+const bold = ansi('1', '22');
+const dim = ansi('2', '22');
+const italic = ansi('3', '23');
+
+const red = ansi('31', '39');
+const green = ansi('32', '39');
+const yellow = ansi('33', '39');
+const magenta = ansi('35', '39');
+const cyan = ansi('36', '39');
+const white = ansi('37', '39');
+const gray = ansi('90', '39');
+const redBright = ansi('91', '39');
+const yellowBright = ansi('93', '39');
 
 export const theme = {
-  errorType: chalk.bold.redBright,
-  errorMessage: chalk.red,
+  errorType: compose(bold, redBright),
+  errorMessage: red,
 
-  timestamp: chalk.gray,
-  dim: chalk.dim,
-  sectionLabel: chalk.dim.gray,
+  timestamp: gray,
+  dim: dim,
+  sectionLabel: compose(dim, gray),
 
-  filePath: chalk.yellow,
-  lineNumber: chalk.yellow,
-  functionName: chalk.yellowBright,
+  filePath: yellow,
+  lineNumber: yellow,
+  functionName: yellowBright,
 
-  methodGet: chalk.green,
-  methodPost: chalk.magenta,
-  methodPut: chalk.yellow,
-  methodDelete: chalk.red,
-  methodPatch: chalk.cyan,
-  methodDefault: chalk.gray,
+  methodGet: green,
+  methodPost: magenta,
+  methodPut: yellow,
+  methodDelete: red,
+  methodPatch: cyan,
+  methodDefault: gray,
 
-  status2xx: chalk.green,
-  status3xx: chalk.yellow,
-  status4xx: chalk.red,
-  status5xx: chalk.redBright,
+  status2xx: green,
+  status3xx: yellow,
+  status4xx: red,
+  status5xx: redBright,
 
-  label: chalk.gray,
-  value: chalk.white,
+  label: gray,
+  value: white,
 
-  appFrame: chalk.white,
-  vendorFrame: chalk.dim,
-  collapsedFrames: chalk.dim.italic,
+  appFrame: white,
+  vendorFrame: dim,
+  collapsedFrames: compose(dim, italic),
 
-  durationNormal: chalk.gray,
-  durationSlow: chalk.yellow,
-  durationVerySlow: chalk.red,
+  durationNormal: gray,
+  durationSlow: yellow,
+  durationVerySlow: red,
 
-  localKey: chalk.cyan,
-  localValue: chalk.white,
-  localNull: chalk.dim,
-  localString: chalk.green,
-  localNumber: chalk.yellowBright,
-  localBoolean: chalk.magenta,
+  localKey: cyan,
+  localValue: white,
+  localNull: dim,
+  localString: green,
+  localNumber: yellowBright,
+  localBoolean: magenta,
 
-  ioType: chalk.dim.cyan,
+  ioType: compose(dim, cyan),
 } as const;
 
-export function colorForMethod(method: string): chalk.Chalk {
+export function colorForMethod(method: string): StyleFn {
   switch (method.toUpperCase()) {
     case 'GET': return theme.methodGet;
     case 'POST': return theme.methodPost;
@@ -57,7 +82,7 @@ export function colorForMethod(method: string): chalk.Chalk {
   }
 }
 
-export function colorForStatus(status: number): chalk.Chalk {
+export function colorForStatus(status: number): StyleFn {
   if (status >= 500) return theme.status5xx;
   if (status >= 400) return theme.status4xx;
   if (status >= 300) return theme.status3xx;
@@ -65,7 +90,7 @@ export function colorForStatus(status: number): chalk.Chalk {
   return theme.dim;
 }
 
-export function colorForDuration(ms: number): chalk.Chalk {
+export function colorForDuration(ms: number): StyleFn {
   if (ms >= 5000) return theme.durationVerySlow;
   if (ms >= 1000) return theme.durationSlow;
   return theme.durationNormal;

@@ -40,6 +40,18 @@ function getTransportAuthorization(
   return transport?.type === 'http' ? transport.authorization : undefined;
 }
 
+function parseDerivedKeyFromEnv(): Buffer | undefined {
+  const hex = process.env.ERRORCORE_DERIVED_KEY;
+  if (hex === undefined || hex === '') return undefined;
+  if (!/^[0-9a-f]{64}$/i.test(hex)) {
+    console.warn(
+      '[errorcore] ERRORCORE_DERIVED_KEY must be a 64-character hex string (32 bytes). Falling back to runtime key derivation.'
+    );
+    return undefined;
+  }
+  return Buffer.from(hex, 'hex');
+}
+
 function deriveDeadLetterIntegrityKey(
   config: ResolvedConfig,
   transportAuthorization: string | undefined
@@ -172,6 +184,7 @@ export class SDKInstance {
 
     if (this.config.flushIntervalMs > 0) {
       const flushTimer = setInterval(() => {
+        this.emitDiagnosticsIfNeeded();
         void this.transport.flush().catch(() => undefined);
       }, this.config.flushIntervalMs);
       flushTimer.unref();
@@ -330,6 +343,38 @@ export class SDKInstance {
     }
   }
 
+  private emitDiagnosticsIfNeeded(): void {
+    if (this.config.onInternalWarning === undefined) {
+      return;
+    }
+
+    const diagnostics = this.errorCapturer.getDiagnostics();
+
+    if (diagnostics.dropped > 0) {
+      try {
+        this.config.onInternalWarning({
+          code: 'errorcore_payloads_dropped',
+          message: `${diagnostics.dropped} error package(s) could not be delivered or dead-lettered`,
+          count: diagnostics.dropped
+        });
+      } catch {
+        // onInternalWarning must never crash the host.
+      }
+    }
+
+    if (diagnostics.deadLettered > 0) {
+      try {
+        this.config.onInternalWarning({
+          code: 'errorcore_payloads_dead_lettered',
+          message: `${diagnostics.deadLettered} error package(s) stored in dead-letter queue for retry`,
+          count: diagnostics.deadLettered
+        });
+      } catch {
+        // onInternalWarning must never crash the host.
+      }
+    }
+  }
+
   public enableAutoShutdown(): void {
     if (this.config.serverless) {
       return;
@@ -355,10 +400,26 @@ export class SDKInstance {
 
     this.processListeners.length = 0;
 
+    // Snapshot listener count before registering so we know if the SDK is
+    // the only handler. If it is, emit a process warning after capture so
+    // Node's default unhandledRejection behavior is preserved.
+    const preExistingRejectionListenerCount = process.listenerCount('unhandledRejection');
+
     const unhandledRejectionHandler = (reason: unknown) => {
       const error = reason instanceof Error ? reason : new Error(String(reason));
 
       this.errorCapturer.capture(error);
+
+      // If the SDK is the only unhandledRejection listener, emit a warning
+      // so Node's default behavior (log + future termination) is preserved.
+      const currentCount = process.listenerCount('unhandledRejection');
+      if (currentCount === preExistingRejectionListenerCount + 1) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.emitWarning(
+          `Unhandled promise rejection captured by ErrorCore: ${message}`,
+          'UnhandledPromiseRejectionWarning'
+        );
+      }
     };
 
     process.on('unhandledRejection', unhandledRejectionHandler);
@@ -418,7 +479,9 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     maxCaptures: config.rateLimitPerMinute,
     windowMs: config.rateLimitWindowMs
   });
-  const encryption = config.encryptionKey ? new Encryption(config.encryptionKey) : null;
+  const encryption = config.encryptionKey
+    ? new Encryption(config.encryptionKey, { derivedKey: parseDerivedKeyFromEnv() })
+    : null;
   const processMetadata = new ProcessMetadata(config);
   const inspector = new InspectorManager(config, {
     getRequestId: () => als.getRequestId()
@@ -498,6 +561,12 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
   const sourceMapResolver = config.resolveSourceMaps
     ? new SourceMapResolver()
     : null;
+
+  // Pre-populate the source map cache so the first error capture doesn't
+  // block the event loop with synchronous file I/O for common app files.
+  if (sourceMapResolver !== null) {
+    sourceMapResolver.warmCache();
+  }
   const packageAssemblyDispatcher = config.useWorkerAssembly
     ? new PackageAssemblyDispatcher({ config })
     : null;

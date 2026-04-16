@@ -75,7 +75,7 @@ describe('SourceMapResolver', () => {
   });
 
   describe('resolveStack – source map resolution', () => {
-    it('resolves frames when an adjacent .map file exists', () => {
+    it('resolves frames when an adjacent .map file exists', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
@@ -83,13 +83,18 @@ describe('SourceMapResolver', () => {
       // Frame at line 10, col 5 => originalPositionFor({line:10, column:4})
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error: boom\n    at minified (/app/dist/bundle.js:10:5)';
+      // First call returns unresolved (cache miss triggers background warm)
+      resolver.resolveStack(stack);
+      // Wait for background warm to complete
+      await new Promise(r => setImmediate(r));
+      // Second call uses the now-populated cache
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('original.ts:5:11');
       expect(result).toContain('myFunc');
     });
 
-    it('uses the original function name from the source map', () => {
+    it('uses the original function name from the source map', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
@@ -97,12 +102,14 @@ describe('SourceMapResolver', () => {
       // Frame at line 20, col 3 => originalPositionFor({line:20, column:2})
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error: test\n    at minifiedName (/app/dist/bundle.js:20:3)';
+      resolver.resolveStack(stack);
+      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('myFunc (original.ts:5:11)');
     });
 
-    it('formats frames without a function name correctly', () => {
+    it('formats frames without a function name correctly', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMELESS_SOURCEMAP_JSON);
 
@@ -110,6 +117,8 @@ describe('SourceMapResolver', () => {
       // Anonymous frame at line 20, col 3 => originalPositionFor({line:20, column:2})
       // => { source: 'original.ts', line: 5, column: 10, name: null }
       const stack = 'Error: test\n    at /app/dist/bundle.js:20:3';
+      resolver.resolveStack(stack);
+      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       const resolvedLine = result.split('\n')[1];
@@ -130,53 +139,63 @@ describe('SourceMapResolver', () => {
   });
 
   describe('cache behavior', () => {
-    it('does not re-read the file on the second call for the same path', () => {
+    it('does not re-read the file on the second call for the same path', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at fn (/app/dist/bundle.js:1:1)';
 
+      // First call triggers background warm
       resolver.resolveStack(stack);
+      await new Promise(r => setImmediate(r));
       const firstCallCount = readFileSync.mock.calls.length;
 
+      // Second call should use cache, no new reads
       resolver.resolveStack(stack);
       expect(readFileSync.mock.calls.length).toBe(firstCallCount);
     });
 
-    it('caches null results so the filesystem is not re-checked', () => {
+    it('caches null results so the filesystem is not re-checked', async () => {
       existsSync.mockReturnValue(false);
 
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at fn (/app/dist/missing.js:1:1)';
 
+      // First call triggers background warm (which caches null)
       resolver.resolveStack(stack);
+      await new Promise(r => setImmediate(r));
       const firstExistsCount = existsSync.mock.calls.length;
 
+      // Second call should use cached null, no new filesystem checks
       resolver.resolveStack(stack);
       expect(existsSync.mock.calls.length).toBe(firstExistsCount);
     });
   });
 
   describe('V8 frame parsing', () => {
-    it('parses named function frames: "    at func (/path/file.js:10:5)"', () => {
+    it('parses named function frames: "    at func (/path/file.js:10:5)"', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
       const resolver = new SourceMapResolver();
       // line:10, col:5 in frame => resolver passes {line:10, column:4} to consumer
       const stack = 'Error\n    at func (/path/file.js:10:5)';
+      resolver.resolveStack(stack);
+      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('myFunc (original.ts:5:11)');
     });
 
-    it('parses anonymous frames: "    at /path/file.js:10:5"', () => {
+    it('parses anonymous frames: "    at /path/file.js:10:5"', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at /path/file.js:10:5';
+      resolver.resolveStack(stack);
+      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       // name='myFunc' from the map
@@ -202,7 +221,7 @@ describe('SourceMapResolver', () => {
       expect(result).toContain(frame);
     });
 
-    it('allows sourceMappingURL within the same directory', () => {
+    it('allows sourceMappingURL within the same directory', async () => {
       const sourceContent = 'var x = 1;\n//# sourceMappingURL=bundle.js.map';
 
       existsSync.mockReturnValue(true);
@@ -215,6 +234,8 @@ describe('SourceMapResolver', () => {
       // Line 1, col 1 => originalPositionFor({line:1, column:0})
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error\n    at fn (/app/dist/bundle.js:1:1)';
+      resolver.resolveStack(stack);
+      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('original.ts:5:11');
@@ -273,7 +294,7 @@ describe('SourceMapResolver', () => {
   });
 
   describe('eviction', () => {
-    it('evicts the oldest entry after 50+ unique files are cached', () => {
+    it('evicts the oldest entry after 50+ unique files are cached', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
@@ -284,21 +305,27 @@ describe('SourceMapResolver', () => {
         resolver.resolveStack(`Error\n    at fn (/app/file${i}.js:1:1)`);
       }
 
+      // Wait for all background warms to populate the cache
+      await resolver.flushWarmQueue();
+
       readFileSync.mockClear();
       existsSync.mockClear();
 
-      // file0 was the first inserted and should have been evicted
+      // file0 was the first inserted and should have been evicted.
+      // This call triggers a new background warm for the evicted entry.
       resolver.resolveStack('Error\n    at fn (/app/file0.js:1:1)');
+      await resolver.flushWarmQueue();
 
       expect(readFileSync).toHaveBeenCalled();
     });
 
-    it('preferentially evicts null cache entries', () => {
+    it('preferentially evicts null cache entries', async () => {
       const resolver = new SourceMapResolver();
 
       // Insert a null cache entry first
       existsSync.mockReturnValue(false);
       resolver.resolveStack('Error\n    at fn (/app/null-entry.js:1:1)');
+      await resolver.flushWarmQueue();
 
       // Now fill with valid entries up to the limit
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
@@ -307,12 +334,15 @@ describe('SourceMapResolver', () => {
       for (let i = 0; i < 50; i++) {
         resolver.resolveStack(`Error\n    at fn (/app/valid${i}.js:1:1)`);
       }
+      await resolver.flushWarmQueue();
 
       readFileSync.mockClear();
       existsSync.mockClear();
 
-      // The null entry should have been evicted (not a valid entry)
+      // The null entry should have been evicted (not a valid entry).
+      // This call triggers a new background warm for the evicted entry.
       resolver.resolveStack('Error\n    at fn (/app/null-entry.js:1:1)');
+      await resolver.flushWarmQueue();
 
       expect(existsSync).toHaveBeenCalled();
     });

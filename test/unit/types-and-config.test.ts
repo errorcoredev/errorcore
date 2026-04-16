@@ -70,7 +70,7 @@ describe('resolveConfig', () => {
       ],
       envBlocklist: [/key|secret|token|password|credential|auth|private/i],
       encryptionKey: undefined,
-      allowUnencrypted: false,
+      allowUnencrypted: true,
       transport: { type: 'stdout' },
       captureLocalVariables: false,
       captureDbBindParams: false,
@@ -165,9 +165,24 @@ describe('resolveConfig', () => {
     expect(() => resolveTestConfig({ encryptionKey: 'zz' + 'a'.repeat(62) })).toThrow(
       'encryptionKey must be a 64-character hex string'
     );
+    const validKey = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2';
     expect(() =>
-      resolveTestConfig({ encryptionKey: 'ab'.repeat(32) })
+      resolveTestConfig({ encryptionKey: validKey })
     ).not.toThrow();
+  });
+
+  it('rejects low-entropy encryptionKey', () => {
+    expect(() => resolveTestConfig({ encryptionKey: '0'.repeat(64) })).toThrow(
+      'insufficient entropy'
+    );
+    expect(() => resolveTestConfig({ encryptionKey: 'a'.repeat(64) })).toThrow(
+      'insufficient entropy'
+    );
+    expect(() => resolveTestConfig({ encryptionKey: 'ab'.repeat(32) })).toThrow(
+      'insufficient entropy'
+    );
+    const randomKey = require('node:crypto').randomBytes(32).toString('hex');
+    expect(() => resolveTestConfig({ encryptionKey: randomKey })).not.toThrow();
   });
 
   it('rejects non-function piiScrubber', () => {
@@ -242,8 +257,25 @@ describe('resolveConfig', () => {
     expect(JSON.stringify(resolved)).not.toContain('secret-token');
   });
 
-  it('requires transport to be configured explicitly in all environments', () => {
-    expect(() => resolveConfig({})).toThrow('transport must be configured explicitly');
+  it('requires transport to be configured explicitly in production', () => {
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      expect(() => resolveConfig({})).toThrow('transport must be configured explicitly');
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
+  });
+
+  it('defaults to stdout transport in non-production', () => {
+    const prev = process.env.NODE_ENV;
+    delete process.env.NODE_ENV;
+    try {
+      const resolved = resolveConfig({});
+      expect(resolved.transport).toEqual({ type: 'stdout' });
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
   });
 
   it('uses the split HTTP transport flags', () => {

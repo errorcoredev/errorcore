@@ -1,15 +1,26 @@
 {
   "name": "errorcore",
   "version": "0.1.1",
+  "description": "Lightweight error monitoring SDK for Node.js — captures errors with full I/O context, local variables, and request replay data",
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
       "default": "./dist/index.js"
     }
   },
+  "keywords": [
+    "error",
+    "monitoring",
+    "error-tracking",
+    "debugging",
+    "observability",
+    "node"
+  ],
   "bin": {
     "errorcore": "bin/errorcore.js"
   },
@@ -27,13 +38,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm run test"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.13",
-    "chalk": "^4.1.2",
-    "hono": "^4.12.12",
-    "source-map-js": "^1.2.1"
+    "source-map-js": "1.2.1"
   },
   "devDependencies": {
     "@types/node": "^20.19.37",
@@ -41,12 +50,20 @@
     "vitest": "^4.0.18"
   },
   "peerDependencies": {
+    "hono": ">=4",
+    "@hono/node-server": ">=1",
     "ioredis": ">=4",
     "mongodb": ">=5",
     "mysql2": ">=2",
     "pg": ">=8"
   },
   "peerDependenciesMeta": {
+    "hono": {
+      "optional": true
+    },
+    "@hono/node-server": {
+      "optional": true
+    },
     "ioredis": {
       "optional": true
     },
@@ -60,5 +77,5 @@
       "optional": true
     }
   },
-  "license": "PolyForm-Small-Business-1.0.0"
+  "license": "SEE LICENSE IN LICENSE.md"
 }

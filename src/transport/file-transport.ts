@@ -46,7 +46,41 @@ export class FileTransport {
   }
 
   public async flush(): Promise<void> {
-    return Promise.resolve();
+    // fsync to ensure all prior appendFile writes are durable on disk.
+    const fd = await new Promise<number>((resolve, reject) => {
+      fs.open(this.path, 'r', (error, value) => {
+        if (error) {
+          // File may not exist yet if nothing was written. That's fine.
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            resolve(-1);
+            return;
+          }
+          reject(error);
+          return;
+        }
+        resolve(value);
+      });
+    });
+
+    if (fd === -1) {
+      return;
+    }
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        fs.fsync(fd, (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    } finally {
+      await new Promise<void>((resolve) => {
+        fs.close(fd, () => resolve());
+      });
+    }
   }
 
   public async shutdown(): Promise<void> {

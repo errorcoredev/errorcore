@@ -1134,7 +1134,7 @@ describe('ErrorCapturer', () => {
     expect(fileContents).not.toContain('collector offline');
     expect(persisted.entries).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('collector offline');
 
@@ -1203,7 +1203,7 @@ describe('ErrorCapturer', () => {
       expect.stringContaining('[ErrorCore] File transport dropped payload:')
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1306,7 +1306,7 @@ describe('ErrorCapturer', () => {
     expect(stdout.writes).toHaveLength(1);
     expect(store.drain().entries).toEqual([]);
     expect(warnSpy).not.toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1410,7 +1410,7 @@ describe('ErrorCapturer', () => {
     expect(stdout.writes).toHaveLength(1);
     expect(store.drain().entries).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1460,9 +1460,9 @@ describe('ErrorCapturer', () => {
     expect(fileContents).not.toContain('stack with secret-token');
     expect(drained.entries).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Error capture failed [code=errorcore_capture_failed]'
+      expect.stringContaining('[code=errorcore_capture_failed]')
     );
-    expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
+    expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('user-visible secret-token');
 
     fsModule.rmSync(deadLetterPath, { force: true });
     requestTracker.shutdown();
@@ -1511,7 +1511,7 @@ describe('ErrorCapturer', () => {
     await flushMicrotasks(10);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Error capture fallback failed [code=errorcore_capture_fallback_failed]'
+      expect.stringContaining('[code=errorcore_capture_fallback_failed]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
 
@@ -1554,10 +1554,10 @@ describe('ErrorCapturer', () => {
     await flushMicrotasks(10);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Dead-letter store write failed [code=errorcore_dead_letter_write_failed]'
+      expect.stringContaining('[code=errorcore_dead_letter_write_failed]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
 

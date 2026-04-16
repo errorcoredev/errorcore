@@ -18,11 +18,21 @@ export class SourceMapResolver {
 
   private warnedNoMaps = false;
 
+  private readonly pendingWarms = new Set<string>();
+
+  private warmPromises: Promise<void>[] = [];
+
+  /**
+   * Resolve stack frames using only cached source maps. No disk I/O.
+   * Schedules background warming for any cache misses so subsequent
+   * captures of the same file will resolve correctly.
+   */
   public resolveStack(stack: string): string {
     const lines = stack.split('\n');
     const resolved: string[] = [];
     let frameCount = 0;
     let resolvedCount = 0;
+    const missedPaths: string[] = [];
 
     for (const line of lines) {
       const match = V8_FRAME_RE.exec(line);
@@ -39,9 +49,9 @@ export class SourceMapResolver {
       frameCount++;
 
       const effectivePath = this.normalizeWebpackPath(filePath);
-      const consumer = this.getConsumer(effectivePath);
 
-      if (consumer === null) {
+      if (!this.cache.has(effectivePath)) {
+        missedPaths.push(effectivePath);
         if (effectivePath !== filePath) {
           if (funcName) {
             resolved.push(`${indent}${funcName} (${effectivePath}:${lineStr}:${colStr})`);
@@ -54,7 +64,14 @@ export class SourceMapResolver {
         continue;
       }
 
-      const original = consumer.originalPositionFor({
+      const cached = this.cache.get(effectivePath)!;
+      if (cached === null) {
+        resolved.push(line);
+        continue;
+      }
+
+      cached.usedAt = Date.now();
+      const original = cached.consumer.originalPositionFor({
         line: lineNum,
         column: colNum - 1
       });
@@ -90,7 +107,128 @@ export class SourceMapResolver {
       );
     }
 
+    for (const missedPath of missedPaths) {
+      this.scheduleWarm(missedPath);
+    }
+
     return resolved.join('\n');
+  }
+
+  /**
+   * Resolve stack frames using only cached source maps. No disk I/O.
+   * Used on the uncaughtException path where blocking is unacceptable.
+   * Returns the raw frame for any cache miss.
+   */
+  public resolveStackCacheOnly(stack: string): string {
+    const lines = stack.split('\n');
+    const resolved: string[] = [];
+
+    for (const line of lines) {
+      const match = V8_FRAME_RE.exec(line);
+
+      if (match === null) {
+        resolved.push(line);
+        continue;
+      }
+
+      const [, indent, funcName, filePath, lineStr, colStr] = match;
+      const lineNum = parseInt(lineStr, 10);
+      const colNum = parseInt(colStr, 10);
+
+      const effectivePath = this.normalizeWebpackPath(filePath);
+
+      // Only use the cache — never load from disk.
+      if (!this.cache.has(effectivePath)) {
+        resolved.push(line);
+        continue;
+      }
+
+      const cached = this.cache.get(effectivePath)!;
+      if (cached === null) {
+        resolved.push(line);
+        continue;
+      }
+
+      cached.usedAt = Date.now();
+      const original = cached.consumer.originalPositionFor({
+        line: lineNum,
+        column: colNum - 1
+      });
+
+      if (original.source === null || original.line === null) {
+        resolved.push(line);
+        continue;
+      }
+
+      const resolvedFunc = original.name ?? funcName;
+      const resolvedCol = (original.column ?? 0) + 1;
+
+      if (resolvedFunc) {
+        resolved.push(`${indent}${resolvedFunc} (${original.source}:${original.line}:${resolvedCol})`);
+      } else {
+        resolved.push(`${indent}${original.source}:${original.line}:${resolvedCol}`);
+      }
+    }
+
+    return resolved.join('\n');
+  }
+
+  /**
+   * Pre-populate the source map cache for files already loaded by Node.
+   * Called at SDK init to avoid disk I/O on the first error capture.
+   */
+  public warmCache(): void {
+    if (typeof require === 'undefined' || require.cache === undefined) {
+      return;
+    }
+
+    const filePaths = Object.keys(require.cache).filter(
+      (p) => !p.includes('node_modules') && (p.endsWith('.js') || p.endsWith('.mjs'))
+    );
+
+    for (const filePath of filePaths) {
+      if (this.cache.size >= MAX_CACHE_SIZE) {
+        break;
+      }
+      // getConsumer handles caching + eviction internally
+      this.getConsumer(filePath);
+    }
+  }
+
+  /**
+   * Schedule a background load for a source map file that was not in cache.
+   * Uses setImmediate to avoid blocking the current tick.
+   */
+  private scheduleWarm(filePath: string): void {
+    if (this.pendingWarms.has(filePath) || this.cache.has(filePath)) {
+      return;
+    }
+
+    this.pendingWarms.add(filePath);
+    const promise = new Promise<void>((resolve) => {
+      setImmediate(() => {
+        try {
+          this.getConsumer(filePath);
+        } catch {
+          // Ignore — cache will store null for failures
+        } finally {
+          this.pendingWarms.delete(filePath);
+          resolve();
+        }
+      });
+    });
+    this.warmPromises.push(promise);
+  }
+
+  /**
+   * Await all pending background warm operations. Called during shutdown.
+   */
+  public async flushWarmQueue(): Promise<void> {
+    if (this.warmPromises.length === 0) {
+      return;
+    }
+    await Promise.allSettled(this.warmPromises);
+    this.warmPromises = [];
   }
 
   private getConsumer(filePath: string): SourceMapConsumer | null {

@@ -29,8 +29,6 @@ module.exports = {
 
   captureLocalVariables: false,
 
-  // Deprecated compatibility alias. When true, this enables both request and response body capture.
-  captureBody: false,
   captureRequestBodies: false,
   captureResponseBodies: false,
   captureBodyDigest: false,
@@ -51,8 +49,6 @@ module.exports = {
   // before deploying to production.
   allowUnencrypted: true,
 
-  // Deprecated compatibility alias: allowInsecureTransport maps only to plain HTTP.
-  allowInsecureTransport: false,
   allowPlainHttpTransport: false,
 
   // Local-development only. This disables TLS certificate validation for HTTPS collectors.
@@ -128,7 +124,7 @@ module.exports = {
   maxCachedLocals: 50,
   maxLocalsFrames: 5,
   uncaughtExceptionExitDelayMs: 1500,
-  useWorkerAssembly: false,
+  // useWorkerAssembly: true,  // default: true (non-serverless), false (serverless)
   deadLetterPath: undefined,
 
   // Resolve minified stack traces using source maps at capture time.

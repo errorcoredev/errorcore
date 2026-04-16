@@ -2,6 +2,7 @@
 import {
   filterHeaders,
   getModuleInstance,
+  warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
 
@@ -25,6 +26,7 @@ export function withErrorcore<
     const instance = sdk ?? getModuleInstance();
 
     if (instance === null || !instance.isActive()) {
+      warnIfUninitialized('withErrorcore()');
       return handler(req, routeContext);
     }
 

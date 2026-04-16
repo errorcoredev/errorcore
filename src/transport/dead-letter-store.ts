@@ -88,13 +88,13 @@ export class DeadLetterStore {
     this.requireEncryptedPayload = options.requireEncryptedPayload ?? false;
   }
 
-  public appendPayloadSync(payload: string): void {
+  public appendPayloadSync(payload: string): boolean {
     if (getUtf8ByteLength(payload) > this.maxPayloadBytes) {
       console.warn('[ErrorCore] Dead-letter payload exceeds maximum size; dropping payload');
-      return;
+      return false;
     }
 
-    this.appendEnvelopeSync({
+    return this.appendEnvelopeSync({
       version: 1,
       kind: 'payload',
       storedAt: new Date().toISOString(),
@@ -102,8 +102,8 @@ export class DeadLetterStore {
     });
   }
 
-  public appendFailureMarkerSync(code: string): void {
-    this.appendEnvelopeSync({
+  public appendFailureMarkerSync(code: string): boolean {
+    return this.appendEnvelopeSync({
       version: 1,
       kind: 'marker',
       storedAt: new Date().toISOString(),
@@ -169,22 +169,49 @@ export class DeadLetterStore {
   }
 
   public clearSent(sentLineCount: number): void {
+    const tempPath = this.filePath + '.clearing';
+
     try {
-      if (!fs.existsSync(this.filePath)) {
-        return;
+      // Atomically rename the file so new appendPayloadSync calls create a
+      // fresh file instead of racing with our read-modify-write.
+      try {
+        fs.renameSync(this.filePath, tempPath);
+      } catch (renameError) {
+        // File gone (already cleared or never existed) — nothing to do.
+        if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
+          return;
+        }
+        throw renameError;
       }
 
-      const content = fs.readFileSync(this.filePath, 'utf8');
+      const content = fs.readFileSync(tempPath, 'utf8');
       const lines = content.split('\n').filter((line) => line.length > 0);
 
-      if (lines.length <= sentLineCount) {
-        fs.unlinkSync(this.filePath);
-        return;
+      if (lines.length > sentLineCount) {
+        const remaining = lines.slice(sentLineCount).join('\n') + '\n';
+        // Write remaining lines back. If a new file was created by
+        // appendPayloadSync in the meantime, append to it.
+        fs.appendFileSync(this.filePath, remaining, {
+          encoding: 'utf8',
+          mode: 0o600
+        });
       }
 
-      const remaining = lines.slice(sentLineCount).join('\n') + '\n';
-      fs.writeFileSync(this.filePath, remaining, { encoding: 'utf8', mode: 0o600 });
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {
+        // Best-effort cleanup of temp file
+      }
     } catch (error) {
+      // If we renamed but failed to process, try to restore the original.
+      try {
+        if (fs.existsSync(tempPath) && !fs.existsSync(this.filePath)) {
+          fs.renameSync(tempPath, this.filePath);
+        }
+      } catch {
+        // Best-effort restore
+      }
+
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ErrorCore] Dead-letter store clearSent failed: ${message}`);
     }
@@ -203,7 +230,7 @@ export class DeadLetterStore {
     input:
       | Omit<DeadLetterPayloadEnvelope, 'mac'>
       | Omit<DeadLetterMarkerEnvelope, 'mac'>
-  ): void {
+  ): boolean {
     try {
       const dir = path.dirname(this.filePath);
       if (!fs.existsSync(dir)) {
@@ -212,7 +239,7 @@ export class DeadLetterStore {
 
       if (this.exceedsMaxSize()) {
         console.warn('[ErrorCore] Dead-letter store at capacity; dropping payload');
-        return;
+        return false;
       }
 
       const envelope: DeadLetterEnvelope =
@@ -230,9 +257,11 @@ export class DeadLetterStore {
         encoding: 'utf8',
         mode: 0o600
       });
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ErrorCore] Dead-letter store append failed: ${message}`);
+      return false;
     }
   }
 

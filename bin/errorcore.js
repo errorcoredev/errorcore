@@ -6,6 +6,7 @@ const path = require('node:path');
 
 const distDir = path.join(__dirname, '..', 'dist');
 const templatePath = path.join(__dirname, '..', 'config-template', 'errorcore.config.js');
+const minimalTemplatePath = path.join(__dirname, '..', 'config-template', 'errorcore.config.minimal.js');
 
 const isTTY = process.stdout.isTTY === true;
 
@@ -43,7 +44,10 @@ function loadConfigFile(configPath) {
     return require(abs);
   } catch (err) {
     if (err && err.code === 'MODULE_NOT_FOUND') {
-      die(`Config file not found: ${abs}`);
+      die(
+        `Config file not found: ${abs}\n` +
+        `Run ${cyan('npx errorcore init')} to create one.`
+      );
     }
     throw err;
   }
@@ -60,6 +64,10 @@ function parseArgs(argv) {
       flags.dryRun = true;
     } else if (arg === '--force') {
       flags.force = true;
+    } else if (arg === '--full') {
+      flags.full = true;
+    } else if (arg === '--quickstart') {
+      flags.quickstart = true;
     } else if (arg === '--port' && i + 1 < argv.length) {
       flags.port = parseInt(argv[++i], 10);
     } else if (!arg.startsWith('--')) {
@@ -99,7 +107,7 @@ ${bold('Usage:')}
   errorcore <command> [options]
 
 ${bold('Commands:')}
-  ${cyan('init')}                          Create errorcore.config.js in the current directory
+  ${cyan('init')}       [--full] [--quickstart]  Create errorcore.config.js
   ${cyan('validate')} [--config <path>]    Validate config and print resolved values
   ${cyan('status')}   [--config <path>]    Show dead-letter store status
   ${cyan('drain')}    [--config <path>]    Re-send dead-letter payloads
@@ -116,41 +124,69 @@ ${bold('Examples:')}
   errorcore drain --dry-run
   errorcore drain --force
   errorcore drain
+  errorcore init --quickstart
+  errorcore init --full
 `.trimStart();
 
   process.stdout.write(text);
 }
 
-function cmdInit() {
+function cmdInit(flags) {
   const dest = path.join(process.cwd(), 'errorcore.config.js');
   if (fs.existsSync(dest)) {
     die('errorcore.config.js already exists in the current directory');
   }
 
-  if (!fs.existsSync(templatePath)) {
-    die(
-      'Config template not found at ' + templatePath + '.\n' +
-      'This usually means the package was not installed correctly.\n' +
-      'Try: npm install errorcore'
-    );
+  const source = flags.full ? templatePath : minimalTemplatePath;
+  const fallback = flags.full ? null : templatePath;
+
+  if (!fs.existsSync(source)) {
+    if (fallback && fs.existsSync(fallback)) {
+      fs.copyFileSync(fallback, dest);
+    } else {
+      die(
+        'Config template not found at ' + source + '.\n' +
+        'This usually means the package was not installed correctly.\n' +
+        'Try: npm install errorcore'
+      );
+    }
+  } else {
+    fs.copyFileSync(source, dest);
   }
 
-  fs.copyFileSync(templatePath, dest);
-  process.stdout.write(green('Created errorcore.config.js') + '\n\n');
-  process.stdout.write(bold('Next steps:') + '\n');
-  process.stdout.write('  1. Edit errorcore.config.js to match your environment\n');
-  process.stdout.write('  2. Add to your application entry point:\n\n');
-  process.stdout.write(`     ${cyan("const errorcore = require('errorcore');")}\n`);
-  process.stdout.write(`     ${cyan("errorcore.init(require('./errorcore.config.js'));")}\n\n`);
-  process.stdout.write('  3. Run ' + cyan('errorcore validate') + ' to check your config\n\n');
-  process.stdout.write(yellow('Note: ') + 'allowUnencrypted is enabled for local development.\n');
-  process.stdout.write('Set encryptionKey before deploying to production:\n');
-  process.stdout.write(`  ${dim('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"')}\n\n`);
-  process.stdout.write(bold('Source maps:') + ' For readable stack traces in Next.js, add to next.config.mjs:\n');
-  process.stdout.write(`  ${dim('webpack: (config, { isServer }) => {')}\n`);
-  process.stdout.write(`  ${dim('  if (isServer) config.devtool = "source-map";')}\n`);
-  process.stdout.write(`  ${dim('  return config;')}\n`);
-  process.stdout.write(`  ${dim('},')}\n`);
+  process.stdout.write(green('Created errorcore.config.js') + (flags.full ? ' (full template)' : '') + '\n\n');
+
+  if (flags.quickstart) {
+    const testDest = path.join(process.cwd(), 'errorcore-test.js');
+    if (!fs.existsSync(testDest)) {
+      fs.writeFileSync(testDest, [
+        "const errorcore = require('errorcore');",
+        "errorcore.init(require('./errorcore.config.js'));",
+        '',
+        '// Simulate an error — the captured payload prints to stdout.',
+        "throw new Error('Hello from errorcore!');",
+        ''
+      ].join('\n'));
+      process.stdout.write(green('Created errorcore-test.js') + '\n\n');
+    }
+    process.stdout.write(bold('Run it:') + '\n');
+    process.stdout.write(`  ${cyan('node errorcore-test.js')}\n\n`);
+    process.stdout.write('You should see a captured error payload printed to your terminal.\n\n');
+  } else {
+    process.stdout.write(bold('Next steps:') + '\n');
+    process.stdout.write('  1. Add to your application entry point:\n\n');
+    process.stdout.write(`     ${cyan("const errorcore = require('errorcore');")}\n`);
+    process.stdout.write(`     ${cyan("errorcore.init(require('./errorcore.config.js'));")}\n\n`);
+    process.stdout.write('  2. Start your app and trigger an error — the captured payload prints to stdout.\n');
+    process.stdout.write('  3. Run ' + cyan('errorcore validate') + ' to check your config\n\n');
+  }
+
+  if (!flags.full) {
+    process.stdout.write(dim('Tip: Run ') + cyan('errorcore init --full') + dim(' for all config options.') + '\n\n');
+  }
+
+  process.stdout.write(yellow('Before production: ') + 'set encryptionKey and switch to http transport.\n');
+  process.stdout.write('Generate a key: ' + dim('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"') + '\n');
 }
 
 function cmdValidate(flags) {
@@ -166,19 +202,26 @@ function cmdValidate(flags) {
   }
 
   if (resolved.allowUnencrypted === true && resolved.encryptionKey === undefined) {
-    process.stdout.write(
-      yellow('WARNING: ') +
-      'allowUnencrypted is true and no encryptionKey is set \u2014 packages are stored in plaintext.\n' +
-      'Set encryptionKey before deploying to production. Generate one with:\n' +
-      `  ${cyan('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"')}\n\n`
-    );
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd) {
+      process.stdout.write(
+        red('WARNING: ') +
+        'Running in production with allowUnencrypted=true and no encryptionKey. ' +
+        'Error packages are stored in plaintext.\n' +
+        'Generate a key: ' +
+        cyan('node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"') + '\n\n'
+      );
+    } else {
+      process.stdout.write(
+        dim('Note: allowUnencrypted is true (default for development). ') +
+        dim('Set encryptionKey before deploying to production.') + '\n\n'
+      );
+    }
   }
 
-  if (resolved.resolveSourceMaps === true) {
+  if (resolved.resolveSourceMaps === true && userConfig.resolveSourceMaps === true) {
     process.stdout.write(
-      cyan('NOTE: ') +
-      'resolveSourceMaps is enabled. Ensure your bundler emits .map files for server-side code.\n' +
-      'Without source maps, captured stack traces will reference minified locations.\n\n'
+      dim('Source maps: enabled. Ensure your bundler emits .map files for server-side code.') + '\n\n'
     );
   }
 
@@ -468,7 +511,7 @@ switch (command) {
     break;
 
   case 'init':
-    cmdInit();
+    cmdInit(flags);
     break;
 
   case 'validate':

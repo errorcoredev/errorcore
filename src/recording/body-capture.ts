@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { IOEventSlot, RequestContext } from '../types';
 
 const METADATA_OVERHEAD = 256;
+const MAX_STATE_POOL_SIZE = 200;
 const BODY_CAPTURE_STATE = Symbol('errorcore.bodyCaptureState');
 const INBOUND_REQUEST_CAPTURE = Symbol('errorcore.inboundRequestCapture');
 const OUTBOUND_RESPONSE_CAPTURE = Symbol('errorcore.outboundResponseCapture');
@@ -646,7 +647,11 @@ export class BodyCapture {
     state.digest = null;
     state.digestHex = null;
     state.headers = null;
-    this.statePool.push(state);
+    // Cap the pool size to avoid unbounded memory growth from pooled objects
+    // when many concurrent streams were active. Let excess states be GC'd.
+    if (this.statePool.length < MAX_STATE_POOL_SIZE) {
+      this.statePool.push(state);
+    }
   }
 
   private finalizeCapture(input: {

@@ -1,7 +1,9 @@
 // Copyright 2026 ErrorCore Dev — PolyForm Small Business 1.0.0 — see LICENSE.md
 
+import * as path from 'node:path';
 import type { SDKConfig } from './types';
 import { SDKInstance, createSDK } from './sdk';
+import { resetMiddlewareWarning } from './middleware/common';
 
 /**
  * Global singleton storage using Symbol.for() to survive webpack chunk boundaries.
@@ -15,6 +17,9 @@ import { SDKInstance, createSDK } from './sdk';
  * Prisma, and other SDKs that need cross-chunk singleton identity.
  */
 const INSTANCE_KEY = Symbol.for('errorcore.sdk.instance');
+const CAPTURE_WARNING_KEY = Symbol.for('errorcore.capture.warned');
+
+let initializing = false;
 
 function getGlobalInstance(): SDKInstance | null {
   return (globalThis as Record<symbol, SDKInstance | null>)[INSTANCE_KEY] ?? null;
@@ -24,33 +29,103 @@ function setGlobalInstance(instance: SDKInstance | null): void {
   (globalThis as Record<symbol, SDKInstance | null>)[INSTANCE_KEY] = instance;
 }
 
+function getCaptureWarningEmitted(): boolean {
+  return (globalThis as Record<symbol, boolean>)[CAPTURE_WARNING_KEY] === true;
+}
+
+function setCaptureWarningEmitted(value: boolean): void {
+  (globalThis as Record<symbol, boolean>)[CAPTURE_WARNING_KEY] = value;
+}
+
+function tryLoadConfigFile(): Partial<SDKConfig> | undefined {
+  try {
+    const configPath = path.join(process.cwd(), 'errorcore.config.js');
+    return require(configPath) as Partial<SDKConfig>;
+  } catch (error: unknown) {
+    if (
+      error !== null &&
+      typeof error === 'object' &&
+      (error as { code?: string }).code === 'MODULE_NOT_FOUND'
+    ) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Initialize the errorcore SDK.
+ *
+ * When called without arguments, attempts to load `errorcore.config.js` from the
+ * current working directory. If no config file is found, uses smart defaults:
+ * - `transport: { type: 'stdout' }` in non-production environments
+ * - `allowUnencrypted: true` in non-production environments
+ *
+ * @example
+ * // Minimal — zero config in development
+ * require('errorcore').init();
+ *
+ * @example
+ * // With explicit config
+ * require('errorcore').init({
+ *   transport: { type: 'http', url: 'https://collector.example.com/v1/errors' },
+ *   encryptionKey: process.env.ERRORCORE_ENCRYPTION_KEY,
+ * });
+ */
 export function init(config?: Partial<SDKConfig>): SDKInstance {
+  if (initializing) {
+    throw new Error('SDK initialization already in progress');
+  }
+
   const existing = getGlobalInstance();
 
   if (existing !== null) {
     if (!existing.isActive()) {
       setGlobalInstance(null);
     } else {
-      throw new Error('SDK already initialized. Call shutdown() first.');
+      console.warn(
+        '[errorcore] init() called while SDK is already active. Returning existing instance.'
+      );
+      return existing;
     }
   }
 
-  const nextInstance = createSDK(config ?? {});
-  setGlobalInstance(nextInstance);
+  initializing = true;
 
   try {
-    nextInstance.activate();
-  } catch (error) {
-    setGlobalInstance(null);
-    void nextInstance.shutdown().catch(() => undefined);
-    throw error;
-  }
+    const resolvedConfig = config ?? tryLoadConfigFile() ?? {};
+    const nextInstance = createSDK(resolvedConfig);
+    setGlobalInstance(nextInstance);
 
-  return nextInstance;
+    try {
+      nextInstance.activate();
+    } catch (error) {
+      setGlobalInstance(null);
+      void nextInstance.shutdown().catch(() => undefined);
+      throw error;
+    }
+
+    return nextInstance;
+  } finally {
+    initializing = false;
+  }
 }
 
 export function captureError(error: Error): void {
-  getGlobalInstance()?.captureError(error);
+  const instance = getGlobalInstance();
+
+  if (instance === null) {
+    if (!getCaptureWarningEmitted()) {
+      setCaptureWarningEmitted(true);
+      console.warn(
+        '[errorcore] captureError() called before init(). Errors are not being captured. ' +
+        'Call errorcore.init() at the top of your application entry point.'
+      );
+    }
+    return;
+  }
+
+  instance.captureError(error);
 }
 
 export function trackState<T extends Map<unknown, unknown> | Record<string, unknown>>(
@@ -60,7 +135,10 @@ export function trackState<T extends Map<unknown, unknown> | Record<string, unkn
   const instance = getGlobalInstance();
 
   if (instance === null) {
-    throw new Error('SDK is not initialized');
+    console.warn(
+      '[errorcore] trackState() called before init(). Returning unproxied container.'
+    );
+    return container;
   }
 
   return instance.trackState(name, container);
@@ -95,6 +173,9 @@ export async function shutdown(): Promise<void> {
 
   await instance.shutdown();
   setGlobalInstance(null);
+  setCaptureWarningEmitted(false);
+  initializing = false;
+  resetMiddlewareWarning();
 }
 
 export { createSDK };

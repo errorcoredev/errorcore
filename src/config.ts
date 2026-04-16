@@ -1,4 +1,5 @@
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import type {
@@ -79,6 +80,32 @@ function assertNonNegativeInteger(
   }
 }
 
+function hexKeyEntropy(key: string): number {
+  const length = key.length;
+  if (length === 0) return 0;
+  const counts = new Map<string, number>();
+  for (let i = 0; i < length; i++) {
+    const ch = key[i].toLowerCase();
+    counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  }
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function isWebpackBundled(): boolean {
+  try {
+    return typeof __webpack_require__ !== 'undefined';
+  } catch {
+    return false;
+  }
+}
+
+declare const __webpack_require__: unknown;
+
 export function detectServerlessEnvironment(): boolean {
   if (process.env.AWS_LAMBDA_FUNCTION_NAME) return true;
   if (process.env.FUNCTIONS_WORKER_RUNTIME) return true;
@@ -127,8 +154,14 @@ function resolveSerializationLimits(
   return resolved;
 }
 
+function isProduction(): boolean {
+  return process.env.NODE_ENV === 'production';
+}
+
 export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConfig {
-  const transport = userConfig.transport;
+  const transport: SDKConfig['transport'] | undefined =
+    userConfig.transport ??
+    (isProduction() ? undefined : { type: 'stdout' });
 
   const serverless =
     userConfig.serverless === true ? true :
@@ -212,7 +245,13 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   assertNonNegativeInteger(maxDrainOnStartup, 'maxDrainOnStartup');
 
   if (transport === undefined) {
-    throw new Error('transport must be configured explicitly');
+    throw new Error(
+      'transport must be configured explicitly in production.\n' +
+      'Set NODE_ENV to "development" for automatic stdout transport, or configure one:\n' +
+      '  transport: { type: \'stdout\' }          // local development\n' +
+      '  transport: { type: \'file\', path: ... }  // controlled environments\n' +
+      '  transport: { type: \'http\', url: ... }   // production collectors'
+    );
   }
 
   if (
@@ -226,11 +265,29 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     );
   }
 
+  if (userConfig.encryptionKey !== undefined) {
+    const keyEntropy = hexKeyEntropy(userConfig.encryptionKey);
+    if (keyEntropy < 2.0) {
+      throw new Error(
+        'encryptionKey has insufficient entropy (all-zeros, repeated characters, or trivially predictable). ' +
+        'Generate a random key with: ' +
+        'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
+      );
+    }
+  }
+
   if (
     userConfig.piiScrubber !== undefined &&
     typeof userConfig.piiScrubber !== 'function'
   ) {
     throw new Error('piiScrubber must be a function or undefined');
+  }
+
+  if (
+    userConfig.onInternalWarning !== undefined &&
+    typeof userConfig.onInternalWarning !== 'function'
+  ) {
+    throw new Error('onInternalWarning must be a function or undefined');
   }
 
   for (const [fieldName, value] of [
@@ -289,6 +346,13 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
 
   const useWorkerAssembly = userConfig.useWorkerAssembly ??
     (serverless ? false : true);
+
+  if (userConfig.useWorkerAssembly === true && isWebpackBundled()) {
+    console.warn(
+      '[ErrorCore] useWorkerAssembly is enabled but a bundled environment was detected. ' +
+      'Worker threads may not function correctly in bundlers — the SDK will fall back to main-thread processing at runtime.'
+    );
+  }
   const flushIntervalMs = userConfig.flushIntervalMs ??
     (serverless ? 0 : 5000);
   if (flushIntervalMs !== 0) {
@@ -302,6 +366,18 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   const deadLetterPath = serverless && userConfig.deadLetterPath === undefined
     ? undefined
     : resolveDeadLetterPath(userConfig, transport);
+
+  if (deadLetterPath !== undefined) {
+    try {
+      const dir = path.dirname(deadLetterPath);
+      fs.accessSync(dir, fs.constants.W_OK);
+    } catch {
+      console.warn(
+        `[ErrorCore] Dead-letter directory is not writable: ${path.dirname(deadLetterPath)}. ` +
+        'Dead-letter persistence will fail unless the directory is created before the first transport failure.'
+      );
+    }
+  }
 
   if (serverless && transport.type === 'file') {
     console.warn(
@@ -321,7 +397,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     envAllowlist: [...(userConfig.envAllowlist ?? DEFAULT_ENV_ALLOWLIST)],
     envBlocklist: [...(userConfig.envBlocklist ?? DEFAULT_ENV_BLOCKLIST)],
     encryptionKey: userConfig.encryptionKey,
-    allowUnencrypted: userConfig.allowUnencrypted ?? false,
+    allowUnencrypted: userConfig.allowUnencrypted ?? !isProduction(),
     transport: resolvedTransport,
     captureLocalVariables: userConfig.captureLocalVariables ?? false,
     captureDbBindParams: userConfig.captureDbBindParams ?? false,
@@ -347,7 +423,8 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     useWorkerAssembly,
     flushIntervalMs,
     resolveSourceMaps: userConfig.resolveSourceMaps ?? true,
-    serverless
+    serverless,
+    onInternalWarning: userConfig.onInternalWarning
   };
 }
 

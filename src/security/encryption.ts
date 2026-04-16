@@ -20,7 +20,9 @@ export class Encryption {
 
   private readonly keySalt: Buffer;
 
-  public constructor(encryptionKey: string) {
+  private readonly hmacKey: Buffer;
+
+  public constructor(encryptionKey: string, options?: { derivedKey?: Buffer }) {
     if (encryptionKey.length === 0) {
       throw new Error('encryptionKey must not be empty');
     }
@@ -32,13 +34,35 @@ export class Encryption {
     // derivation at init is sufficient. Per-message uniqueness comes from the
     // random IV, not from per-message key derivation.
     this.keySalt = Buffer.from('errorcore-v1-key-derivation', 'utf8');
-    this.derivedKey = pbkdf2Sync(
+
+    if (options?.derivedKey !== undefined) {
+      if (options.derivedKey.length !== 32) {
+        throw new Error('Pre-derived key must be exactly 32 bytes');
+      }
+      this.derivedKey = options.derivedKey;
+    } else {
+      this.derivedKey = pbkdf2Sync(
+        this.encryptionKey,
+        this.keySalt,
+        100000,
+        32,
+        'sha256'
+      );
+    }
+
+    // Derive a separate HMAC key using a different salt to maintain
+    // proper key separation between encryption and integrity signing.
+    this.hmacKey = pbkdf2Sync(
       this.encryptionKey,
-      this.keySalt,
+      Buffer.from('errorcore-v1-hmac-key', 'utf8'),
       100000,
       32,
       'sha256'
     );
+  }
+
+  public getHmacKeyHex(): string {
+    return this.hmacKey.toString('hex');
   }
 
   public encrypt(plaintext: string): EncryptedPayload {

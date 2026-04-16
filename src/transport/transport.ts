@@ -1,17 +1,12 @@
 
 import type { ResolvedConfig } from '../types';
 import type { Encryption } from '../security/encryption';
+import { createDebug } from '../debug';
 import { FileTransport } from './file-transport';
 import { HttpTransport } from './http-transport';
 import { StdoutTransport } from './stdout-transport';
 
-const debugEnabled = typeof process !== 'undefined' && process.env?.ERRORCORE_DEBUG === '1';
-
-function debug(message: string): void {
-  if (debugEnabled) {
-    console.debug(`[ErrorCore:transport] ${message}`);
-  }
-}
+const debug = createDebug('transport');
 
 function isWebpackBundled(): boolean {
   try {
@@ -221,11 +216,29 @@ function createTransport(
   throw new Error(`Unsupported transport type: ${(config.transport as { type: string }).type}`);
 }
 
+/**
+ * Transport behavioral contract.
+ *
+ * send():     Resolves when the payload has been accepted by the transport layer.
+ *             For file: data written to OS buffer. For HTTP: 2xx received.
+ *             MUST reject on failure so the caller can attempt dead-letter.
+ *
+ * flush():    Resolves when ALL previously sent payloads are durably stored.
+ *             For file: fsync completed. For HTTP: all in-flight requests resolved.
+ *             For stdout: no-op is acceptable (stdout is line-buffered).
+ *             MUST NOT resolve until prior data is durable.
+ *
+ * shutdown(): Resolves when transport resources (sockets, file handles) are released.
+ *             Implementations should implicitly flush before releasing.
+ */
 export interface Transport {
   send(payload: string | Buffer): Promise<void>;
   flush(): Promise<void>;
   shutdown(options?: { timeoutMs?: number }): Promise<void>;
 }
+
+const MAX_FALLBACK_QUEUE_SIZE = 1000;
+const MAX_FALLBACK_FLUSH_RESOLVERS = 100;
 
 export class TransportDispatcher implements Transport {
   private readonly config: ResolvedConfig;
@@ -484,6 +497,13 @@ export class TransportDispatcher implements Transport {
     this.ensureFallbackTransport();
 
     return new Promise<void>((resolve, reject) => {
+      // Drop the oldest queued item to stay within bounds. This preserves
+      // the most recent errors which are more likely to be actionable.
+      if (this.fallbackQueue.length >= MAX_FALLBACK_QUEUE_SIZE) {
+        const evicted = this.fallbackQueue.shift();
+        evicted?.reject(new Error('Transport fallback queue overflow; oldest payload evicted'));
+      }
+
       this.fallbackQueue.push({ payload, resolve, reject });
       this.scheduleFallbackProcessing();
     });
@@ -550,6 +570,10 @@ export class TransportDispatcher implements Transport {
   private async flushFallback(): Promise<void> {
     if (this.isFallbackIdle()) {
       return;
+    }
+
+    if (this.fallbackFlushResolvers.length >= MAX_FALLBACK_FLUSH_RESOLVERS) {
+      throw new Error('Too many concurrent flush() calls; transport may be stalled');
     }
 
     await new Promise<void>((resolve) => {

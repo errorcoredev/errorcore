@@ -2,6 +2,7 @@
 import {
   filterHeaders,
   getModuleInstance,
+  warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
 
@@ -23,12 +24,13 @@ export function fastifyPlugin(sdk?: SDKInstanceLike) {
     fastify.addHook('onRequest', (request, reply, next) => {
       const instance = sdk ?? getModuleInstance();
 
-      if (
-        instance === null ||
-        !instance.isActive() ||
-        reply.raw.finished === true ||
-        instance.als.getContext?.() !== undefined
-      ) {
+      if (instance === null || !instance.isActive()) {
+        warnIfUninitialized('fastifyPlugin()');
+        next();
+        return;
+      }
+
+      if (reply.raw.finished === true || instance.als.getContext?.() !== undefined) {
         next();
         return;
       }
