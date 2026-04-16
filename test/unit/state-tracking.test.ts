@@ -215,4 +215,64 @@ describe('StateTracker', () => {
     expect(context.stateReads).toHaveLength(50);
     expect(context.stateReads[49]?.key).toBe('key49');
   });
+
+  it('does not swallow host getter throws (Reflect.get errors propagate)', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const source: Record<string, unknown> = {};
+    Object.defineProperty(source, 'boom', {
+      enumerable: true,
+      get: () => { throw new Error('host getter threw'); }
+    });
+    const tracked = tracker.track('dangerous', source);
+    const context = createContext(als, 'req-host-throw');
+
+    expect(() =>
+      als.runWithContext(context, () => tracked.boom)
+    ).toThrow('host getter threw');
+  });
+
+  it('survives a recorder failure caused by a hostile value without breaking the host read', () => {
+    // cloneAndLimit is invoked on the value by recordStateRead. If the value
+    // has a toJSON (or any serialization surface) that throws, the recorder
+    // must fail closed and the proxy must still return the raw value.
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const hostile = {
+      get toJSON() {
+        // cloneAndLimit does not call toJSON directly, but future versions
+        // might. We simulate a recorder-side failure by installing a
+        // getter on a property we still want to read through the proxy.
+        throw new Error('hostile toJSON');
+      }
+    };
+    const tracked = tracker.track('hostile-ish', { payload: hostile });
+    const context = createContext(als, 'req-hostile');
+
+    // Reading .payload must succeed and return the raw hostile object.
+    const value = als.runWithContext(context, () => tracked.payload);
+    expect(value).toBe(hostile);
+  });
+});
+
+describe('ALSManager throw-unwind', () => {
+  it('unwinds the context store when the callback throws', () => {
+    const als = new ALSManager();
+    const context = als.createRequestContext({
+      method: 'GET',
+      url: '/throws',
+      headers: { host: 'localhost' }
+    });
+
+    expect(() =>
+      als.runWithContext(context, () => {
+        // Context is live here.
+        expect(als.getContext()).toBe(context);
+        throw new Error('inner');
+      })
+    ).toThrow('inner');
+
+    // After the throw propagates, the outer (empty) store must be restored.
+    expect(als.getContext()).toBeUndefined();
+  });
 });

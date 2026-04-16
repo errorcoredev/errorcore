@@ -55,7 +55,10 @@ unsafe implicit behaviors removed.
 
 ### Fixed
 
-(to be filled in as each commit lands)
+- StateTracker proxy traps no longer propagate exceptions from the internal
+  recorder (cloneAndLimit of a hostile value, ALS misbehavior). Host reads
+  of a tracked container always succeed; telemetry failures are silently
+  dropped. Host-side getter exceptions are still propagated normally.
 
 ### Security
 

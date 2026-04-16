@@ -59,7 +59,7 @@ export class StateTracker {
 
           return (key: unknown) => {
             const value = original.call(target, key);
-            this.recordStateRead(name, 'get', key, value);
+            this.safeRecordStateRead(name, 'get', key, value);
             return value;
           };
         }
@@ -72,7 +72,7 @@ export class StateTracker {
 
           return (key: unknown) => {
             const value = original.call(target, key);
-            this.recordStateRead(name, 'has', key, value);
+            this.safeRecordStateRead(name, 'has', key, value);
             return value;
           };
         }
@@ -84,7 +84,7 @@ export class StateTracker {
           >['entries'];
 
           return () => {
-            this.recordStateRead(name, 'entries', null, Array.from(target.entries()));
+            this.safeRecordStateRead(name, 'entries', null, this.safeArrayFromEntries(target));
             return original.call(target);
           };
         }
@@ -96,7 +96,7 @@ export class StateTracker {
           >['values'];
 
           return () => {
-            this.recordStateRead(name, 'values', null, Array.from(target.values()));
+            this.safeRecordStateRead(name, 'values', null, this.safeArrayFromValues(target));
             return original.call(target);
           };
         }
@@ -115,7 +115,7 @@ export class StateTracker {
             ) => void,
             thisArg?: unknown
           ) => {
-            this.recordStateRead(name, 'forEach', null, Array.from(target.entries()));
+            this.safeRecordStateRead(name, 'forEach', null, this.safeArrayFromEntries(target));
             return original.call(target, callback, thisArg);
           };
         }
@@ -133,6 +133,10 @@ export class StateTracker {
   ): Record<string, unknown> {
     return new Proxy(container, {
       get: (target, property, receiver) => {
+        // Reflect.get can throw for getters defined on the target. That is
+        // host-application behavior and must propagate. The recorder
+        // side-effect runs after the value is obtained and is wrapped below
+        // so a throwing recorder never masks or replaces that host behavior.
         const value = Reflect.get(target, property, receiver);
 
         if (
@@ -142,10 +146,45 @@ export class StateTracker {
           return value;
         }
 
-        this.recordStateRead(name, 'get', property, value);
+        this.safeRecordStateRead(name, 'get', property, value);
         return value;
       }
     });
+  }
+
+  private safeArrayFromEntries(target: Map<unknown, unknown>): unknown {
+    try {
+      return Array.from(target.entries());
+    } catch {
+      return null;
+    }
+  }
+
+  private safeArrayFromValues(target: Map<unknown, unknown>): unknown {
+    try {
+      return Array.from(target.values());
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Wrap recordStateRead so that any exception inside the recorder
+   * (cloneAndLimit on a hostile value, ALS misbehavior, etc.) never
+   * propagates out of the proxy trap. The host's read of the tracked
+   * container must succeed even if telemetry fails.
+   */
+  private safeRecordStateRead(
+    container: string,
+    operation: string,
+    key: unknown,
+    value: unknown
+  ): void {
+    try {
+      this.recordStateRead(container, operation, key, value);
+    } catch {
+      // Intentional swallow: telemetry failure must not affect host reads.
+    }
   }
 
   private recordStateRead(

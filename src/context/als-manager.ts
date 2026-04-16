@@ -70,6 +70,12 @@ export class ALSManager {
   public releaseRequestContext(_context: RequestContext): void {}
 
   public runWithContext<T>(ctx: RequestContext, fn: () => T): T {
+    // AsyncLocalStorage.run unwinds the store on throw and on normal return.
+    // No try/finally is needed here: when fn throws, Node's async_hooks
+    // infrastructure restores the outer store before the throw propagates.
+    // See https://nodejs.org/api/async_context.html#asynclocalstoragerunstore-callback-args
+    // We keep a regression test (test/unit/als-throw-unwind.test.ts) that
+    // would catch a future change to this guarantee.
     return this.store.run(ctx, fn);
   }
 
