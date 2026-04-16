@@ -220,6 +220,33 @@ describe('PackageAssemblyDispatcher', () => {
       expect(dispatcher.isAvailable()).toBe(false);
     });
 
+    it('rejects in-flight assemble promises when the worker exits cleanly during shutdown', async () => {
+      // Regression: the previous exit handler gated rejection on
+      // !shuttingDown && code !== 0. If shutdown began while an assemble
+      // was still in flight, and the worker exited with code 0, the
+      // assemble promise hung forever. The fix: always reject pending
+      // requests on exit.
+      const worker = new MockWorker();
+      const factory = createMockFactory(worker);
+      const config = resolveTestConfig();
+      const dispatcher = new PackageAssemblyDispatcher({ config, workerFactory: factory });
+
+      // Swallow the 'assemble' message so the promise stays pending.
+      worker.postMessage.mockImplementation((message: { id: number; type: string }) => {
+        if (message.type === 'shutdown') {
+          process.nextTick(() => {
+            worker.emit('message', { id: message.id });
+            worker.emit('exit', 0);
+          });
+        }
+      });
+
+      const inflight = dispatcher.assemble(createStubParts(), { timeoutMs: 10000 });
+      await dispatcher.shutdown();
+
+      await expect(inflight).rejects.toThrow(/Package assembly worker exited with code 0/);
+    });
+
     describe('shutdown', () => {
       it('sends a shutdown message to the worker', async () => {
         const worker = new MockWorker();

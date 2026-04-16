@@ -114,6 +114,21 @@ unsafe implicit behaviors removed.
   non-retryable. The previous logic treated any `error.code` as
   retryable except a small TLS blocklist, which meant local errors
   like `EACCES` and `ENOSPC` were retried pointlessly.
+- `PackageAssemblyDispatcher` request-id counter wraps at 2^31 and
+  skips ids still live in the pending Map. The previous counter grew
+  without bound.
+- `PackageAssemblyDispatcher` worker exit handler always rejects
+  in-flight assemble promises. The previous code gated rejection on
+  `!shuttingDown && code !== 0`, so assembles that were still in
+  flight when shutdown began hung forever on a clean worker exit.
+- `PackageAssemblyDispatcher` message handler validates the message
+  shape before touching the pending Map. Corrupted messages early
+  return instead of dropping an unrelated request silently.
+- `package-assembly-worker` error responses carry only
+  `${name}: ${message}` across the port boundary. Stack traces stayed
+  inside the worker process. Host file paths (and PII interpolated
+  into error messages by host code) no longer leak to the parent's
+  warning log.
 
 ### Security
 

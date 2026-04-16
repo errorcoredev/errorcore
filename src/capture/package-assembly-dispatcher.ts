@@ -63,6 +63,28 @@ export class PackageAssemblyDispatcher {
 
   private requestId = 0;
 
+  // Bound at 2**31 - 1 so the counter never collides with a 53-bit
+  // safe-integer edge. nextRequestId() wraps before issuing and skips
+  // any id still live in pending; under normal load pending holds at
+  // most a few dozen entries so the linear probe is O(1) in practice.
+  private static readonly REQUEST_ID_MAX = 0x7fffffff;
+
+  private nextRequestId(): number {
+    // Try up to pending.size + 1 candidates; that bounds the probe.
+    for (let probe = 0; probe <= this.pending.size; probe += 1) {
+      this.requestId += 1;
+      if (this.requestId > PackageAssemblyDispatcher.REQUEST_ID_MAX) {
+        this.requestId = 1;
+      }
+      if (!this.pending.has(this.requestId)) {
+        return this.requestId;
+      }
+    }
+    // Pathological: every probed id is live. Take a new slot at the
+    // top of the counter and accept the collision risk.
+    throw new Error('Package assembly worker has too many in-flight requests');
+  }
+
   private readonly pending = new Map<number, PendingRequest>();
 
   private available = false;
@@ -90,7 +112,7 @@ export class PackageAssemblyDispatcher {
     }
 
     const timeoutMs = options?.timeoutMs ?? 5000;
-    const id = ++this.requestId;
+    const id = this.nextRequestId();
 
     return new Promise<PackageAssemblyResult>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -116,7 +138,7 @@ export class PackageAssemblyDispatcher {
     }
 
     const timeoutMs = options?.timeoutMs ?? 5000;
-    const id = ++this.requestId;
+    const id = this.nextRequestId();
 
     await Promise.race([
       new Promise<void>((resolve, reject) => {
@@ -167,6 +189,16 @@ export class PackageAssemblyDispatcher {
       }
 
       this.worker.on('message', (message) => {
+        // Validate message shape before touching pending. A malformed
+        // message with missing/non-numeric id would otherwise call
+        // pending.get(undefined) and miss silently, hiding the bug.
+        if (
+          typeof message !== 'object' ||
+          message === null ||
+          typeof (message as { id?: unknown }).id !== 'number'
+        ) {
+          return;
+        }
         const pending = this.pending.get(message.id);
 
         if (pending === undefined) {
@@ -196,7 +228,11 @@ export class PackageAssemblyDispatcher {
       });
 
       this.worker.on('exit', (code) => {
-        if (!this.shuttingDown && code !== 0) {
+        // Always reject in-flight requests on exit. The previous code
+        // only rejected when !shuttingDown && code !== 0, which left
+        // pending promises hanging forever if the worker exited with
+        // code 0 during shutdown while requests were still in flight.
+        if (this.pending.size > 0) {
           this.failPending(new Error(`Package assembly worker exited with code ${code}`));
         }
 
