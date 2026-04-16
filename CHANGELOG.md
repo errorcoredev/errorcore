@@ -21,10 +21,18 @@ unsafe implicit behaviors removed.
 - The `errorcore` CLI (`validate`, `status`, `drain`, `ui`) refuses to load a
   config file located outside the current working directory unless the new
   `--allow-external-config` flag is passed.
+- `Encryption.prototype.getHmacKeyHex()` is removed. Consumers that signed
+  their own payloads by pulling the HMAC key out of the Encryption instance
+  now call `encryption.sign(serializedPayload)` instead. The HMAC key never
+  leaves the Encryption instance.
 
 ### Added
 
-(to be filled in as each commit lands)
+- `Encryption.sign(serializedPackage)` returns an HMAC-SHA256 signature of the
+  argument using the internally-derived HMAC key. Derivation parameters are
+  unchanged, so signatures remain bitwise identical to the previous external
+  `createHmac('sha256', getHmacKeyHex()).update(...).digest('base64')`
+  formulation. Existing signed dead-letter entries still verify.
 
 ### Fixed
 
@@ -37,6 +45,11 @@ unsafe implicit behaviors removed.
 - Hardened the CLI's config-path resolution: paths outside cwd are rejected by
   default, and non-regular-file paths (dangling symlinks, directories) are
   rejected explicitly.
+- The derived HMAC signing key is no longer exposed via a public method. The
+  signing operation now happens inside `Encryption` itself. Constant-time
+  comparison (`crypto.timingSafeEqual`) replaces `Buffer.equals` when
+  detecting whether a ciphertext uses the legacy per-message salt scheme; this
+  removes a salt-matching timing oracle on decrypt.
 
 ## 0.1.1
 

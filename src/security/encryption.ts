@@ -2,8 +2,10 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHmac,
   pbkdf2Sync,
-  randomBytes
+  randomBytes,
+  timingSafeEqual
 } from 'node:crypto';
 
 export interface EncryptedPayload {
@@ -14,7 +16,10 @@ export interface EncryptedPayload {
 }
 
 export class Encryption {
-  private readonly encryptionKey: string;
+  // Secret material used to re-derive AES keys for legacy per-message-salt
+  // payloads. Held as a Buffer (not a string) so it is a single allocation we
+  // control; strings are interned and cannot be overwritten.
+  private readonly derivationSecret: Buffer;
 
   private readonly derivedKey: Buffer;
 
@@ -27,7 +32,7 @@ export class Encryption {
       throw new Error('encryptionKey must not be empty');
     }
 
-    this.encryptionKey = encryptionKey;
+    this.derivationSecret = Buffer.from(encryptionKey, 'utf8');
 
     // Derive the AES key once at construction using a deterministic salt.
     // The encryption key is already a 32-byte hex secret, so a single PBKDF2
@@ -42,7 +47,7 @@ export class Encryption {
       this.derivedKey = options.derivedKey;
     } else {
       this.derivedKey = pbkdf2Sync(
-        this.encryptionKey,
+        this.derivationSecret,
         this.keySalt,
         100000,
         32,
@@ -53,7 +58,7 @@ export class Encryption {
     // Derive a separate HMAC key using a different salt to maintain
     // proper key separation between encryption and integrity signing.
     this.hmacKey = pbkdf2Sync(
-      this.encryptionKey,
+      this.derivationSecret,
       Buffer.from('errorcore-v1-hmac-key', 'utf8'),
       100000,
       32,
@@ -61,8 +66,12 @@ export class Encryption {
     );
   }
 
-  public getHmacKeyHex(): string {
-    return this.hmacKey.toString('hex');
+  /**
+   * Sign the serialized package with the derived HMAC key. The key never
+   * leaves this instance. Signature is base64-encoded HMAC-SHA256.
+   */
+  public sign(serializedPackage: string): string {
+    return createHmac('sha256', this.hmacKey).update(serializedPackage).digest('base64');
   }
 
   public encrypt(plaintext: string): EncryptedPayload {
@@ -89,10 +98,13 @@ export class Encryption {
     const authTag = Buffer.from(payload.authTag, 'base64');
 
     // Support decrypting payloads from both the old per-message salt scheme
-    // and the new static salt scheme.
-    const needsPerMessageDerivation = !salt.equals(this.keySalt);
+    // and the new static salt scheme. Comparison is constant-time so the
+    // scheme detection cannot be used as a timing oracle to distinguish keys.
+    const needsPerMessageDerivation =
+      salt.length !== this.keySalt.length ||
+      !timingSafeEqual(salt, this.keySalt);
     const derivedKey = needsPerMessageDerivation
-      ? pbkdf2Sync(this.encryptionKey, salt, 100000, 32, 'sha256')
+      ? pbkdf2Sync(this.derivationSecret, salt, 100000, 32, 'sha256')
       : this.derivedKey;
 
     const decipher = createDecipheriv('aes-256-gcm', derivedKey, iv);

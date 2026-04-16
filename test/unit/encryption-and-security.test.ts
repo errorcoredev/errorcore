@@ -73,6 +73,77 @@ describe('Encryption', () => {
     expect(encryption.decrypt(first)).toBe('identical plaintext');
     expect(encryption.decrypt(second)).toBe('identical plaintext');
   });
+
+  it('signs payloads deterministically and without exposing the HMAC key', () => {
+    const encryption = new Encryption('top-secret-key');
+
+    const first = encryption.sign('hello');
+    const second = encryption.sign('hello');
+    const different = encryption.sign('hello!');
+
+    expect(first).toMatch(BASE64_REGEX);
+    expect(first).toBe(second);
+    expect(first).not.toBe(different);
+
+    // The HMAC key must not be reachable from outside the class.
+    // getHmacKeyHex() was removed to close the public key exposure.
+    expect((encryption as unknown as { getHmacKeyHex?: unknown }).getHmacKeyHex)
+      .toBeUndefined();
+    expect((Encryption.prototype as unknown as { getHmacKeyHex?: unknown }).getHmacKeyHex)
+      .toBeUndefined();
+  });
+
+  it('verifies sign against Node createHmac using a key derived the same way', async () => {
+    // This test guarantees we did not accidentally change HMAC derivation.
+    // If it breaks, existing dead-letter signatures on disk will stop
+    // verifying.
+    const { createHmac, pbkdf2Sync } = await import('node:crypto');
+
+    const encryption = new Encryption('top-secret-key');
+    const expectedKey = pbkdf2Sync(
+      Buffer.from('top-secret-key', 'utf8'),
+      Buffer.from('errorcore-v1-hmac-key', 'utf8'),
+      100000,
+      32,
+      'sha256'
+    );
+    const expectedSig = createHmac('sha256', expectedKey)
+      .update('payload')
+      .digest('base64');
+
+    expect(encryption.sign('payload')).toBe(expectedSig);
+  });
+
+  it('decrypts legacy per-message-salt payloads without a salt timing oracle', () => {
+    // Old payload format used a random per-message salt; we must still
+    // decrypt those. Comparison between the embedded salt and the static
+    // keySalt is constant-time.
+    const { pbkdf2Sync, createCipheriv, randomBytes } = require('node:crypto') as typeof import('node:crypto');
+
+    const secret = 'legacy-key';
+    const legacySalt = randomBytes(16); // pre-static-salt scheme
+    const legacyDerivedKey = pbkdf2Sync(
+      Buffer.from(secret, 'utf8'),
+      legacySalt,
+      100000,
+      32,
+      'sha256'
+    );
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', legacyDerivedKey, iv);
+    const ciphertext = Buffer.concat([cipher.update('legacy', 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+
+    const legacyPayload = {
+      salt: legacySalt.toString('base64'),
+      iv: iv.toString('base64'),
+      ciphertext: ciphertext.toString('base64'),
+      authTag: authTag.toString('base64')
+    };
+
+    const encryption = new Encryption(secret);
+    expect(encryption.decrypt(legacyPayload)).toBe('legacy');
+  });
 });
 
 describe('RateLimiter', () => {

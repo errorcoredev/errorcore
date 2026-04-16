@@ -1,6 +1,4 @@
 
-import { createHmac } from 'node:crypto';
-
 import { Scrubber } from '../pii/scrubber';
 import { Encryption } from '../security/encryption';
 import type {
@@ -108,13 +106,13 @@ function estimateBodySize(body: unknown): number {
 
 function signSerializedPackage(
   serializedPackage: string,
-  hmacKey: string | undefined
+  encryption: Encryption | null | undefined
 ): string | null {
-  if (!hmacKey) {
+  if (!encryption) {
     return null;
   }
 
-  return createHmac('sha256', hmacKey).update(serializedPackage).digest('base64');
+  return encryption.sign(serializedPackage);
 }
 
 function findLargestBodyEvent(ioTimeline: IOEventSerialized[]): {
@@ -151,10 +149,9 @@ export function finalizePackageAssemblyResult(input: {
 }): PackageAssemblyResult {
   const { packageObject, config } = input;
   const serializedPackageForSignature = JSON.stringify(packageObject);
-  const hmacKey = input.encryption?.getHmacKeyHex() ?? undefined;
   const integritySignature = signSerializedPackage(
     serializedPackageForSignature,
-    hmacKey
+    input.encryption
   );
 
   if (integritySignature !== null) {
