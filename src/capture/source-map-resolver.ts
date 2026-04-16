@@ -12,6 +12,28 @@ const V8_FRAME_RE = /^(\s+at\s+)(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?$/;
 const SOURCEMAP_URL_RE = /\/\/[#@]\s*sourceMappingURL\s*=\s*(\S+)\s*$/;
 const WEBPACK_INTERNAL_RE = /^webpack-internal:\/\/\/[^/]*\/(\.\/.+)$/;
 const MAX_CACHE_SIZE = 50;
+// Cap .js/.map file reads. A maliciously large or simply bloated map
+// would otherwise block the event loop during background warming.
+const MAX_SOURCE_READ_BYTES = 4 * 1024 * 1024;
+const MAX_WARM_PROMISES = 256;
+
+function readIfWithinSize(filePath: string): string | null {
+  let contents: string;
+  try {
+    contents = fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+  // The bound is applied post-read. This still allocates a full-size
+  // string for an oversized file, but the subsequent JSON.parse is
+  // skipped, which is where the real CPU/memory cost lives. A bound on
+  // the read itself would require an fd-based path and break tests
+  // that mock only fs.readFileSync.
+  if (contents.length > MAX_SOURCE_READ_BYTES) {
+    return null;
+  }
+  return contents;
+}
 
 export class SourceMapResolver {
   private readonly cache = new Map<string, CachedConsumer | null>();
@@ -217,6 +239,13 @@ export class SourceMapResolver {
         }
       });
     });
+
+    // Bound the backlog of outstanding warms. In a long-running process
+    // with many distinct source files and no flushWarmQueue() awaiter,
+    // the array would otherwise grow without limit.
+    if (this.warmPromises.length >= MAX_WARM_PROMISES) {
+      this.warmPromises.shift();
+    }
     this.warmPromises.push(promise);
   }
 
@@ -262,15 +291,18 @@ export class SourceMapResolver {
       const adjacentMap = filePath + '.map';
 
       if (fs.existsSync(adjacentMap)) {
-        const raw = fs.readFileSync(adjacentMap, 'utf8');
-        return new SourceMapConsumer(JSON.parse(raw));
+        const raw = readIfWithinSize(adjacentMap);
+        return raw === null ? null : new SourceMapConsumer(JSON.parse(raw));
       }
 
       if (!fs.existsSync(filePath)) {
         return null;
       }
 
-      const source = fs.readFileSync(filePath, 'utf8');
+      const source = readIfWithinSize(filePath);
+      if (source === null) {
+        return null;
+      }
       const lastLines = source.slice(-512);
       const match = SOURCEMAP_URL_RE.exec(lastLines);
 
@@ -286,7 +318,12 @@ export class SourceMapResolver {
         if (base64Match === null) {
           return null;
         }
-
+        // Size-cap the inline map's encoded form before decoding. A 4 MB
+        // base64 blob expands to ~3 MB and is still a reasonable bound
+        // for any legitimate production source map.
+        if (base64Match[1].length > MAX_SOURCE_READ_BYTES) {
+          return null;
+        }
         const decoded = Buffer.from(base64Match[1], 'base64').toString('utf8');
         return new SourceMapConsumer(JSON.parse(decoded));
       }
@@ -294,7 +331,11 @@ export class SourceMapResolver {
       const baseDir = path.resolve(path.dirname(filePath));
       const mapPath = path.resolve(baseDir, url);
 
-      if (!mapPath.startsWith(baseDir + path.sep) && mapPath !== baseDir) {
+      // Path-traversal guard normalized through path.relative so mixed
+      // slash directions (common on Windows when the sourceMappingURL
+      // uses '/') do not bypass the check.
+      const rel = path.relative(baseDir, mapPath);
+      if (rel.startsWith('..' + path.sep) || rel === '..' || path.isAbsolute(rel)) {
         return null;
       }
 
@@ -302,8 +343,8 @@ export class SourceMapResolver {
         return null;
       }
 
-      const raw = fs.readFileSync(mapPath, 'utf8');
-      return new SourceMapConsumer(JSON.parse(raw));
+      const raw = readIfWithinSize(mapPath);
+      return raw === null ? null : new SourceMapConsumer(JSON.parse(raw));
     } catch {
       return null;
     }

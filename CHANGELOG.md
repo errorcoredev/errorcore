@@ -129,6 +129,26 @@ unsafe implicit behaviors removed.
   inside the worker process. Host file paths (and PII interpolated
   into error messages by host code) no longer leak to the parent's
   warning log.
+- `SourceMapResolver` caps .js/.map file reads at 4 MB. Oversized
+  files (by upstream bundler misconfiguration or a crafted payload)
+  are skipped. Base64 inline source maps are length-checked before
+  decode.
+- `SourceMapResolver` path-traversal guard normalized through
+  `path.relative` so a `sourceMappingURL` with forward slashes on
+  Windows cannot escape the containing directory.
+- `SourceMapResolver.warmPromises` is bounded at 256 entries; older
+  entries are dropped when the cap is reached. Previously this array
+  grew without limit in long-running processes that never awaited
+  `flushWarmQueue()`.
+- `ProcessMetadata.startEventLoopLagMeasurement` uses `setInterval`
+  instead of recursive `setTimeout`. Under a stalled event loop the
+  recursive form queued new timers inside delayed callbacks,
+  amplifying backlog. `shutdown()` sets a `lagStopped` flag so a
+  callback already queued by Node returns without writing state.
+- `ProcessMetadata.readContainerId` caps `/proc/self/cgroup` and
+  `/proc/self/mountinfo` reads at 64 KB using an fd-based bounded
+  read so unusually large container-stack hierarchies do not block
+  SDK init.
 
 ### Security
 

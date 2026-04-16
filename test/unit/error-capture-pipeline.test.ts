@@ -125,19 +125,23 @@ function createContext(als: ALSManager, requestId: string): RequestContext {
 }
 
 function createTimeoutStubs() {
+  // ProcessMetadata's event-loop-lag measurement now uses setInterval
+  // (previously setTimeout recursively rescheduled itself). The stub
+  // spies on both setInterval and clearInterval and exposes the
+  // captured callbacks via `timers`.
   const timers: Array<{ id: NodeJS.Timeout; fn: () => void; unref: ReturnType<typeof vi.fn> }> =
     [];
   const setTimeoutSpy = vi
-    .spyOn(globalThis, 'setTimeout')
+    .spyOn(globalThis, 'setInterval')
     .mockImplementation(((fn: TimerHandler) => {
       const unref = vi.fn();
       const timer = { unref } as unknown as NodeJS.Timeout;
 
       timers.push({ id: timer, fn: fn as () => void, unref });
       return timer;
-    }) as typeof setTimeout);
+    }) as typeof setInterval);
   const clearTimeoutSpy = vi
-    .spyOn(globalThis, 'clearTimeout')
+    .spyOn(globalThis, 'clearInterval')
     .mockImplementation(() => undefined as never);
 
   return { timers, setTimeoutSpy, clearTimeoutSpy };
