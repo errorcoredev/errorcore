@@ -68,6 +68,33 @@ describe('SDK composition', () => {
     }
   });
 
+  it('does not auto-load errorcore.config.js from the current working directory', async () => {
+    // Regression test: init() used to call tryLoadConfigFile() which did
+    // require(process.cwd() + '/errorcore.config.js'). That was an RCE surface
+    // for anything that initialized errorcore from an untrusted directory.
+    // After the fix, init() must never require the cwd config file.
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'errorcore-auto-config-'));
+    const configPath = path.join(tempDir, 'errorcore.config.js');
+    fs.writeFileSync(
+      configPath,
+      'throw new Error("errorcore.config.js was auto-loaded - this is the RCE we fixed");\n'
+    );
+
+    const origCwd = process.cwd();
+    process.chdir(tempDir);
+
+    try {
+      // With a config file on disk but no config argument, init() must not
+      // load it. We pass an explicit stdout config so activation succeeds.
+      const instance = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+      expect(instance.isActive()).toBe(true);
+    } finally {
+      process.chdir(origCwd);
+      await shutdownFacade();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not replay forged dead-letter entries on activate', async () => {
     const deadLetterPath = path.join(
       os.tmpdir(),

@@ -1,6 +1,5 @@
 // Copyright 2026 ErrorCore Dev — PolyForm Small Business 1.0.0 — see LICENSE.md
 
-import * as path from 'node:path';
 import type { SDKConfig } from './types';
 import { SDKInstance, createSDK } from './sdk';
 import { resetMiddlewareWarning } from './middleware/common';
@@ -37,40 +36,23 @@ function setCaptureWarningEmitted(value: boolean): void {
   (globalThis as Record<symbol, boolean>)[CAPTURE_WARNING_KEY] = value;
 }
 
-function tryLoadConfigFile(): Partial<SDKConfig> | undefined {
-  try {
-    const configPath = path.join(process.cwd(), 'errorcore.config.js');
-    return require(configPath) as Partial<SDKConfig>;
-  } catch (error: unknown) {
-    if (
-      error !== null &&
-      typeof error === 'object' &&
-      (error as { code?: string }).code === 'MODULE_NOT_FOUND'
-    ) {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
 /**
  * Initialize the errorcore SDK.
  *
- * When called without arguments, attempts to load `errorcore.config.js` from the
- * current working directory. If no config file is found, uses smart defaults:
- * - `transport: { type: 'stdout' }` in non-production environments
- * - `allowUnencrypted: true` in non-production environments
+ * The SDK no longer auto-loads `errorcore.config.js` from the current working
+ * directory. Pass config explicitly, for example:
  *
  * @example
- * // Minimal — zero config in development
- * require('errorcore').init();
- *
- * @example
- * // With explicit config
+ * // With an explicit config object
  * require('errorcore').init({
  *   transport: { type: 'http', url: 'https://collector.example.com/v1/errors' },
  *   encryptionKey: process.env.ERRORCORE_ENCRYPTION_KEY,
  * });
+ *
+ * @example
+ * // Loading a user-controlled config file
+ * const errorcore = require('errorcore');
+ * errorcore.init(require('./errorcore.config.js'));
  */
 export function init(config?: Partial<SDKConfig>): SDKInstance {
   if (initializing) {
@@ -93,7 +75,7 @@ export function init(config?: Partial<SDKConfig>): SDKInstance {
   initializing = true;
 
   try {
-    const resolvedConfig = config ?? tryLoadConfigFile() ?? {};
+    const resolvedConfig = config ?? {};
     const nextInstance = createSDK(resolvedConfig);
     setGlobalInstance(nextInstance);
 

@@ -38,8 +38,47 @@ function requireDist(modulePath) {
   }
 }
 
-function loadConfigFile(configPath) {
+function resolveConfigPath(configPath, { allowExternal }) {
   const abs = path.resolve(configPath);
+
+  // Reject paths outside the current working directory unless explicitly
+  // allowed. This blocks accidental or hostile CLI invocations from
+  // executing arbitrary JS (via require) located outside the project tree.
+  const cwd = path.resolve(process.cwd());
+  const rel = path.relative(cwd, abs);
+  const isOutsideCwd =
+    rel.length === 0 ? false : rel.startsWith('..') || path.isAbsolute(rel);
+
+  if (isOutsideCwd && !allowExternal) {
+    die(
+      `Refusing to load config outside the current directory: ${abs}\n` +
+      `Pass ${cyan('--allow-external-config')} to override.`
+    );
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(abs);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      die(
+        `Config file not found: ${abs}\n` +
+        `Run ${cyan('npx errorcore init')} to create one.`
+      );
+    }
+    throw err;
+  }
+  if (!stat.isFile()) {
+    die(`Config path is not a regular file: ${abs}`);
+  }
+
+  return abs;
+}
+
+function loadConfigFile(configPath, options = {}) {
+  const abs = resolveConfigPath(configPath, {
+    allowExternal: options.allowExternal === true,
+  });
   try {
     return require(abs);
   } catch (err) {
@@ -68,6 +107,8 @@ function parseArgs(argv) {
       flags.full = true;
     } else if (arg === '--quickstart') {
       flags.quickstart = true;
+    } else if (arg === '--allow-external-config') {
+      flags.allowExternalConfig = true;
     } else if (arg === '--port' && i + 1 < argv.length) {
       flags.port = parseInt(argv[++i], 10);
     } else if (!arg.startsWith('--')) {
@@ -115,6 +156,10 @@ ${bold('Commands:')}
   ${cyan('ui')}       [--config <path>]    Open the error dashboard
              [--port <number>]
   ${cyan('help')}                          Show this help message
+
+${bold('Global flags:')}
+  --config <path>             Path to errorcore.config.js (default: ./errorcore.config.js)
+  --allow-external-config     Permit config paths outside the current directory
 
 ${bold('Examples:')}
   errorcore init
@@ -191,7 +236,7 @@ function cmdInit(flags) {
 
 function cmdValidate(flags) {
   const configPath = flags.config || path.join(process.cwd(), 'errorcore.config.js');
-  const userConfig = loadConfigFile(configPath);
+  const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
   const { resolveConfig } = requireDist('config.js');
 
   let resolved;
@@ -256,7 +301,7 @@ function cmdStatus(flags) {
   let deadLetterPath;
 
   try {
-    const userConfig = loadConfigFile(configPath);
+    const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
     const { resolveConfig } = requireDist('config.js');
     const resolved = resolveConfig(userConfig);
     deadLetterPath = resolved.deadLetterPath;
@@ -309,7 +354,7 @@ function cmdStatus(flags) {
 
 async function cmdDrain(flags) {
   const configPath = flags.config || path.join(process.cwd(), 'errorcore.config.js');
-  const userConfig = loadConfigFile(configPath);
+  const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
   const { resolveConfig } = requireDist('config.js');
 
   let resolved;
@@ -463,7 +508,7 @@ function createTransportFromConfig(config, authorization) {
 function cmdUI(flags) {
   const configPath = path.resolve(flags.config || path.join(process.cwd(), 'errorcore.config.js'));
   const configDir = path.dirname(configPath);
-  const userConfig = loadConfigFile(configPath);
+  const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
   const { resolveConfig } = requireDist('config.js');
 
   let resolved;
