@@ -55,6 +55,12 @@ unsafe implicit behaviors removed.
 
 ### Fixed
 
+- `errorcore validate` no longer prints the configured `encryptionKey` to
+  stdout. The resolved-config dump now renders a `(set, hidden)` sentinel
+  for `encryptionKey`, `apiKey`, `token`, `dsn`, and `password` fields. The
+  previous output emitted the full hex key, which leaked into CI logs, copy-
+  pasted support threads, and shared screenshots.
+
 - StateTracker proxy traps no longer propagate exceptions from the internal
   recorder (cloneAndLimit of a hostile value, ALS misbehavior). Host reads
   of a tracked container always succeed; telemetry failures are silently

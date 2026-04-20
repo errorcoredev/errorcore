@@ -278,6 +278,14 @@ function cmdValidate(flags) {
     'captureDbBindParams',
   ]);
 
+  const secretFields = new Set([
+    'encryptionKey',
+    'apiKey',
+    'token',
+    'dsn',
+    'password',
+  ]);
+
   const keys = Object.keys(resolved);
   const maxKeyLen = Math.max(...keys.map((k) => k.length));
 
@@ -288,6 +296,11 @@ function cmdValidate(flags) {
     if (captureFlags.has(key)) {
       const flag = val ? green(bold('ON')) : dim('OFF');
       process.stdout.write(`  ${label}${flag}\n`);
+    } else if (secretFields.has(key)) {
+      const sentinel = val === undefined || val === null
+        ? dim('not set')
+        : dim('(set, hidden)');
+      process.stdout.write(`  ${label}${sentinel}\n`);
     } else {
       process.stdout.write(`  ${label}${formatValue(val)}\n`);
     }
