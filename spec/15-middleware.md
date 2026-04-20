@@ -35,6 +35,11 @@ Provide framework-specific middleware/plugin adapters that create the ALS `Reque
 
 Each adapter accepts an optional `SDKInstance` parameter for dependency injection (tests pass isolated instances; production uses the module-level instance).
 
+> **Next.js integration** — See [17-nextjs-integration](17-nextjs-integration.md)
+> for the `errorcore/nextjs` subpath, which provides `withErrorcore`
+> (route handlers), `withServerAction` (Server Actions), and an
+> Edge-runtime no-op stub.
+
 ---
 
 ## Non-Goals
