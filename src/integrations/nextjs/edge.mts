@@ -18,8 +18,8 @@
  * @dependencies none at runtime
  */
 
-import type { SDKConfig } from '../../types';
-import type { NextLikeRequest, WithServerActionOptions } from './types';
+import type { SDKConfig } from '../../types.js';
+import type { NextLikeRequest, WithServerActionOptions } from './types.js';
 
 export function init(_config?: Partial<SDKConfig>): void {
   // no-op under Edge runtime
@@ -67,5 +67,5 @@ export function withServerAction<TArgs extends unknown[], TResult>(
   return action;
 }
 
-export type { SDKConfig } from '../../types';
-export type { NextLikeRequest, WithServerActionOptions } from './types';
+export type { SDKConfig } from '../../types.js';
+export type { NextLikeRequest, WithServerActionOptions } from './types.js';

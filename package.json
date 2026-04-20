@@ -10,6 +10,15 @@
       "types": "./dist/index.d.ts",
       "require": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./nextjs": {
+      "types": "./dist/integrations/nextjs/index.d.ts",
+      "edge-light": "./dist/integrations/nextjs/edge.mjs",
+      "workerd": "./dist/integrations/nextjs/edge.mjs",
+      "browser": "./dist/integrations/nextjs/edge.mjs",
+      "require": "./dist/integrations/nextjs/index.js",
+      "import": "./dist/integrations/nextjs/index.js",
+      "default": "./dist/integrations/nextjs/index.js"
     }
   },
   "keywords": [
@@ -38,7 +47,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "prepublishOnly": "npm run build && npm run test"
+    "verify:edge-stub": "node scripts/verify-edge-stub.js",
+    "prepublishOnly": "npm run build && npm run verify:edge-stub && npm run test"
   },
   "dependencies": {
     "source-map-js": "1.2.1"
