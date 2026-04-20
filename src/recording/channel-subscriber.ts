@@ -6,6 +6,7 @@ interface DiagnosticsChannelModule {
 
 interface HttpServerRecorderLike {
   handleRequestStart(message: unknown): void;
+  handleResponseFinish(message: unknown): void;
 }
 
 interface HttpClientRecorderLike {
@@ -65,6 +66,18 @@ export class ChannelSubscriber {
         channelName: 'http.server.request.start',
         handler: (message) => {
           this.httpServer.handleRequestStart(message);
+        }
+      },
+      {
+        channelName: 'http.server.response.finish',
+        handler: (message) => {
+          this.httpServer.handleResponseFinish(message);
+        }
+      },
+      {
+        channelName: 'http.server.response.created',
+        handler: (message) => {
+          this.httpServer.handleResponseFinish(message);
         }
       },
       {

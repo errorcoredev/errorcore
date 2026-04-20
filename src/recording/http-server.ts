@@ -70,6 +70,8 @@ interface BindStoreChannel {
 
 const RESPONSE_FINALIZER = Symbol('errorcore.responseFinalizer');
 
+const FINALIZED_REQUESTS = new WeakSet<IncomingMessage>();
+
 type ResponseWithFinalizer = ServerResponse & {
   [RESPONSE_FINALIZER]?: RequestFinalizer;
   writableFinished?: boolean;
@@ -181,10 +183,12 @@ class RequestFinalizer {
 function handleResponseClose(this: ServerResponse): void {
   const response = this as ResponseWithFinalizer;
   const finalizer = response[RESPONSE_FINALIZER];
-
   if (finalizer === undefined) {
     return;
   }
+  const request = finalizer.request;
+  if (FINALIZED_REQUESTS.has(request)) return;
+  FINALIZED_REQUESTS.add(request);
 
   finalizer.finalize(
     !((response.writableFinished ?? false) || response.writableEnded)
@@ -321,6 +325,24 @@ export class HttpServerRecorder {
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       console.warn(`[ErrorCore] Failed to record inbound HTTP request: ${messageText}`);
+    }
+  }
+
+  public handleResponseFinish(message: unknown): void {
+    try {
+      const request = (message as { request?: IncomingMessage }).request;
+      const response = (message as { response?: ServerResponse }).response;
+      if (request === undefined || response === undefined) return;
+      if (FINALIZED_REQUESTS.has(request)) return;
+      FINALIZED_REQUESTS.add(request);
+
+      const finalizer = (response as ResponseWithFinalizer)[RESPONSE_FINALIZER];
+      if (finalizer === undefined) return;
+      // Channel-driven finalization is never "aborted" — response.finish/created fire on clean lifecycle.
+      finalizer.finalize(false);
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      console.warn(`[ErrorCore] Failed to finalize response via channel: ${messageText}`);
     }
   }
 
