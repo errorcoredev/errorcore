@@ -84,6 +84,8 @@ Generate a key: `node -e "console.log(require('crypto').randomBytes(32).toString
 
 Report vulnerabilities via issues or privately.
 
+Encryption key rotation support lands in 0.2. On 0.1.x, use a single stable `encryptionKey` — changing the key invalidates HMAC integrity checks on existing dead-letter entries.
+
 ## License
 
-[PolyForm Small Business 1.0.0](LICENSE) — free for individuals and companies under $1M revenue. Commercial license required above that threshold.
+[PolyForm Small Business 1.0.0](LICENSE.md) — free for individuals and companies under $1M revenue. Commercial license required above that threshold.

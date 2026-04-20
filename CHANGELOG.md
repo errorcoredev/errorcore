@@ -61,6 +61,7 @@ unsafe implicit behaviors removed.
   to stdout in development). An interim stricter policy defaulted
   `allowUnencrypted` to `false` unconditionally, which broke the documented
   getting-started flow.
+- README license link points to `LICENSE.md` (was `LICENSE`, a 404 on npm).
 
 - StateTracker proxy traps no longer propagate exceptions from the internal
   recorder (cloneAndLimit of a hostile value, ALS misbehavior). Host reads
