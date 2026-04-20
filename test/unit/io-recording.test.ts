@@ -986,6 +986,43 @@ describe('G2 — http-server shape: message.socket is optional', () => {
   });
 });
 
+describe('G2 — undici shape: RequestImpl, not ClientRequest', () => {
+  it('records outbound fetch when payload matches undici:request:create shape', () => {
+    const config = resolveConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const headerFilter = new HeaderFilter(config);
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter
+    });
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    // undici RequestImpl shape. Headers often arrive as a flat array; the
+    // recorder must not assume Node core ClientRequest APIs (getHeader,
+    // socket, setHeader) exist on this object.
+    const request = {
+      origin: 'https://api.example.com',
+      path: '/v1/x',
+      method: 'GET',
+      headers: ['host', 'api.example.com', 'user-agent', 'test'],
+      body: null,
+      addHeader: () => undefined
+    };
+    recorder.handleRequestCreate({ request } as never);
+
+    expect(pushSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'undici',
+        direction: 'outbound',
+        method: 'GET',
+        url: 'https://api.example.com/v1/x'
+      })
+    );
+  });
+});
+
 describe('G2 — http-client shape: { request } only', () => {
   it('records outbound request when payload contains only request', () => {
     const config = resolveConfig();
