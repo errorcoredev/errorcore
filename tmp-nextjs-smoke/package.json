@@ -1,0 +1,9 @@
+{
+  "name": "tmp-nextjs-smoke",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Smoke validation for the errorcore/nextjs subpath — not published.",
+  "dependencies": {
+    "errorcore": "file:.."
+  }
+}

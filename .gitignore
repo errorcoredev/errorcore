@@ -14,3 +14,7 @@ test/benchmark-profiles/
 tmp-review-*/
 tmp-pre-ship-*/
 tmp-errorcore-cli-*/
+
+# tmp-nextjs-smoke is tracked except for its install artifacts.
+tmp-nextjs-smoke/node_modules/
+tmp-nextjs-smoke/package-lock.json
