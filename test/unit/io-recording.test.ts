@@ -888,3 +888,100 @@ describe('Module 08 recorders', () => {
     }
   });
 });
+
+describe('G2 — http-server shape: message.socket is optional', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('records request when diagnostic-channel payload omits socket', () => {
+    const config = createConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const request = new MockIncomingRequest();
+    request.method = 'GET';
+    request.url = '/api/test';
+
+    const response = new MockServerResponse();
+    const server = new Server();
+
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    try {
+      // Payload without top-level socket — the real diagnostic-channel shape
+      recorder.handleRequestStart({
+        request: request as unknown as IncomingMessage,
+        response: response as unknown as ServerResponse,
+        server
+      } as never);
+
+      expect(pushSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'http-server',
+          direction: 'inbound',
+          method: 'GET',
+          url: '/api/test'
+        })
+      );
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
+    }
+  });
+
+  it('still records when socket is present (backward compat)', () => {
+    const config = createConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const request = new MockIncomingRequest();
+    const response = new MockServerResponse();
+    const server = new Server();
+
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    try {
+      // Payload with socket present — backward-compat path
+      recorder.handleRequestStart({
+        request: request as unknown as IncomingMessage,
+        response: response as unknown as ServerResponse,
+        socket: request.socket as never,
+        server
+      });
+
+      expect(pushSpy).toHaveBeenCalled();
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
+    }
+  });
+});

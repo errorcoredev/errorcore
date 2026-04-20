@@ -244,14 +244,13 @@ export class HttpServerRecorder {
   public handleRequestStart(message: {
     request: IncomingMessage;
     response: ServerResponse;
-    socket: Socket;
+    socket?: Socket;
     server: Server;
   }): void {
     try {
       if (
         message.request === undefined ||
-        message.response === undefined ||
-        message.socket === undefined
+        message.response === undefined
       ) {
         return;
       }
@@ -276,7 +275,7 @@ export class HttpServerRecorder {
       event.method = context.method;
       event.url = context.url;
       event.statusCode = null;
-      event.fd = extractFd(socket);
+      event.fd = socket === undefined ? null : extractFd(socket);
       event.requestHeaders = context.headers;
       event.responseHeaders = null;
       event.requestBody = null;
