@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { resolveConfig } from '../../src/config';
+import { resolveConfig, __resetLegacyInsecureTransportWarning } from '../../src/config';
 import type {
   ErrorInfo,
   ErrorPackage,
@@ -301,18 +301,6 @@ describe('resolveConfig', () => {
     });
   });
 
-  it('rejects the removed allowInsecureTransport alias with a clear error', () => {
-    expect(() =>
-      resolveConfig({
-        transport: { type: 'stdout' },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        allowInsecureTransport: true as unknown as never,
-        allowUnencrypted: true
-        // @ts-expect-error verifying rejected legacy field
-      } as Record<string, unknown>)
-    ).toThrow('allowInsecureTransport was removed');
-  });
-
   it('defaults allowUnencrypted to !isProduction() so zero-config dev works', () => {
     // Mirrors the transport default on the same code path: NODE_ENV !==
     // 'production' gets stdout + plaintext, NODE_ENV === 'production'
@@ -563,6 +551,63 @@ describe('0.2.0 config surface', () => {
       allowUnencrypted: true,
       captureMiddlewareStatusCodes: 401 as never
     })).toThrow(/captureMiddlewareStatusCodes/);
+  });
+});
+
+describe('G4 — allowInsecureTransport semantics', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Reset the module-scoped one-shot warn flag between tests
+    __resetLegacyInsecureTransportWarning();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('accepts allowInsecureTransport: false as a no-op with a one-shot warn', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: false
+    } as never)).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/allowInsecureTransport.*deprecated/i);
+
+    // Second call within the same process should not re-warn
+    resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: false
+    } as never);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects allowInsecureTransport: true with actionable error', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: true
+    } as never)).toThrow(/allowPlainHttpTransport/);
+  });
+
+  it('rejects allowInsecureTransport: true + allowPlainHttpTransport: false as contradiction', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: true,
+      allowPlainHttpTransport: false
+    } as never)).toThrow(/contradiction/i);
+  });
+
+  it('absence of allowInsecureTransport does not warn', () => {
+    resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 });
 

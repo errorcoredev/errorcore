@@ -9,6 +9,21 @@ import type {
   SerializationLimits
 } from './types';
 
+let legacyInsecureTransportWarned = false;
+function warnLegacyInsecureTransportOnce(): void {
+  if (legacyInsecureTransportWarned) return;
+  legacyInsecureTransportWarned = true;
+  console.warn(
+    '[ErrorCore] allowInsecureTransport is deprecated and ignored. ' +
+    'Remove it from your config. (Deprecated in 0.2.0, will be removed in 1.0.0.) ' +
+    'Use allowPlainHttpTransport to enable plain-http collector URLs.'
+  );
+}
+// Test-only reset for the one-shot flag.
+export function __resetLegacyInsecureTransportWarning(): void {
+  legacyInsecureTransportWarned = false;
+}
+
 const DEFAULT_SERIALIZATION: SerializationLimits = {
   maxDepth: 8,
   maxArrayItems: 20,
@@ -190,10 +205,22 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   const captureResponseBodies = explicitBodyControlsProvided
     ? userConfig.captureResponseBodies ?? false
     : userConfig.captureBody ?? false;
-  if ((userConfig as { allowInsecureTransport?: unknown }).allowInsecureTransport !== undefined) {
+  const legacyInsecureTransport = (userConfig as { allowInsecureTransport?: unknown })
+    .allowInsecureTransport;
+  if (legacyInsecureTransport === true) {
+    if (userConfig.allowPlainHttpTransport === false) {
+      throw new Error(
+        'Config contradiction: allowInsecureTransport: true and allowPlainHttpTransport: false cannot both be set. ' +
+        'Remove allowInsecureTransport (deprecated) and set allowPlainHttpTransport: true if you intend to allow plain HTTP.'
+      );
+    }
     throw new Error(
-      'allowInsecureTransport was removed. Use allowPlainHttpTransport to enable plain-http collector URLs.'
+      'allowInsecureTransport: true was renamed to allowPlainHttpTransport: true in 0.2.0. ' +
+      'Update your config. (Deprecated in 0.2.0, will be removed in 1.0.0.)'
     );
+  }
+  if (legacyInsecureTransport === false) {
+    warnLegacyInsecureTransportOnce();
   }
   const allowPlainHttpTransport = userConfig.allowPlainHttpTransport ?? false;
   const allowInvalidCollectorCertificates =
