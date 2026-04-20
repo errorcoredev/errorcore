@@ -105,7 +105,12 @@ describe('resolveConfig', () => {
       useWorkerAssembly: true,
       flushIntervalMs: 5000,
       resolveSourceMaps: true,
-      serverless: false
+      serverless: false,
+      onInternalWarning: undefined,
+      drivers: {},
+      silent: false,
+      sourceMapSyncThresholdBytes: 2 * 1024 * 1024,
+      captureMiddlewareStatusCodes: 'none'
     });
   });
 
@@ -497,5 +502,66 @@ describe('type exports', () => {
     expect(errorPackage.schemaVersion).toBe('1.0.0');
     expect(limits.maxPayloadSize).toBe(1024);
     expect(resolved.transport.type).toBe('stdout');
+  });
+});
+
+describe('0.2.0 config surface', () => {
+  it('accepts drivers with per-driver references', () => {
+    const fakePg = { Client: { prototype: {} } };
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      drivers: { pg: fakePg }
+    });
+    expect(resolved.drivers.pg).toBe(fakePg);
+    expect(resolved.drivers.mongodb).toBeUndefined();
+  });
+
+  it('defaults drivers to empty object when omitted', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(resolved.drivers).toEqual({});
+  });
+
+  it('defaults silent=false, sourceMapSyncThresholdBytes=2MB, captureMiddlewareStatusCodes=none', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(resolved.silent).toBe(false);
+    expect(resolved.sourceMapSyncThresholdBytes).toBe(2 * 1024 * 1024);
+    expect(resolved.captureMiddlewareStatusCodes).toBe('none');
+  });
+
+  it('accepts captureMiddlewareStatusCodes as all, none, or integer array', () => {
+    const all = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: 'all' });
+    const none = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: 'none' });
+    const arr = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: [401, 500] });
+    expect(all.captureMiddlewareStatusCodes).toBe('all');
+    expect(none.captureMiddlewareStatusCodes).toBe('none');
+    expect(arr.captureMiddlewareStatusCodes).toEqual([401, 500]);
+  });
+
+  it('rejects non-integer or out-of-range captureMiddlewareStatusCodes entries', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: [401, 99]
+    })).toThrow(/captureMiddlewareStatusCodes/);
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: [401, 600]
+    })).toThrow(/captureMiddlewareStatusCodes/);
+  });
+
+  it('rejects captureMiddlewareStatusCodes when not string-union or array', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: 401 as never
+    })).toThrow(/captureMiddlewareStatusCodes/);
   });
 });

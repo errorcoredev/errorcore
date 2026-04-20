@@ -374,6 +374,15 @@ export interface SDKConfig {
   resolveSourceMaps?: boolean;
   serverless?: boolean | 'auto';
   onInternalWarning?: (warning: { code: string; message: string; count: number }) => void;
+  drivers?: {
+    pg?: unknown;
+    mongodb?: unknown;
+    mysql2?: unknown;
+    ioredis?: unknown;
+  };
+  silent?: boolean;
+  sourceMapSyncThresholdBytes?: number;
+  captureMiddlewareStatusCodes?: number[] | 'none' | 'all';
 }
 
 export interface ResolvedConfig {
@@ -413,6 +422,15 @@ export interface ResolvedConfig {
   resolveSourceMaps: boolean;
   serverless: boolean;
   onInternalWarning: ((warning: { code: string; message: string; count: number }) => void) | undefined;
+  drivers: {
+    pg?: unknown;
+    mongodb?: unknown;
+    mysql2?: unknown;
+    ioredis?: unknown;
+  };
+  silent: boolean;
+  sourceMapSyncThresholdBytes: number;
+  captureMiddlewareStatusCodes: number[] | 'none' | 'all';
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {

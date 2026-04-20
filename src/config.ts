@@ -299,6 +299,45 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     throw new Error('onInternalWarning must be a function or undefined');
   }
 
+  const drivers = userConfig.drivers ?? {};
+  if (typeof drivers !== 'object' || drivers === null || Array.isArray(drivers)) {
+    throw new Error('drivers must be an object with pg/mongodb/mysql2/ioredis references');
+  }
+
+  const silent = userConfig.silent ?? false;
+  if (typeof silent !== 'boolean') {
+    throw new Error('silent must be a boolean');
+  }
+
+  const sourceMapSyncThresholdBytes =
+    userConfig.sourceMapSyncThresholdBytes ?? 2 * 1024 * 1024;
+  if (
+    !Number.isInteger(sourceMapSyncThresholdBytes) ||
+    sourceMapSyncThresholdBytes < 0
+  ) {
+    throw new Error('sourceMapSyncThresholdBytes must be a non-negative integer');
+  }
+
+  const captureMiddlewareStatusCodes = userConfig.captureMiddlewareStatusCodes ?? 'none';
+  if (
+    captureMiddlewareStatusCodes !== 'none' &&
+    captureMiddlewareStatusCodes !== 'all' &&
+    !Array.isArray(captureMiddlewareStatusCodes)
+  ) {
+    throw new Error(
+      `captureMiddlewareStatusCodes must be 'none', 'all', or integer[]`
+    );
+  }
+  if (Array.isArray(captureMiddlewareStatusCodes)) {
+    for (const code of captureMiddlewareStatusCodes) {
+      if (!Number.isInteger(code) || code < 100 || code > 599) {
+        throw new Error(
+          `captureMiddlewareStatusCodes entries must be integers 100-599; got ${String(code)}`
+        );
+      }
+    }
+  }
+
   for (const [fieldName, value] of [
     ['headerAllowlist', userConfig.headerAllowlist],
     ['envAllowlist', userConfig.envAllowlist],
@@ -437,7 +476,11 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     flushIntervalMs,
     resolveSourceMaps: userConfig.resolveSourceMaps ?? true,
     serverless,
-    onInternalWarning: userConfig.onInternalWarning
+    onInternalWarning: userConfig.onInternalWarning,
+    drivers,
+    silent,
+    sourceMapSyncThresholdBytes,
+    captureMiddlewareStatusCodes,
   };
 }
 
