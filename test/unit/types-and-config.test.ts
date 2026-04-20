@@ -565,3 +565,39 @@ describe('0.2.0 config surface', () => {
     })).toThrow(/captureMiddlewareStatusCodes/);
   });
 });
+
+describe('Completeness schema — 0.2.0 additions', () => {
+  it('Completeness accepts new optional fields without breaking existing consumers', () => {
+    const c: import('../../src/types').Completeness = {
+      requestCaptured: true,
+      requestBodyTruncated: false,
+      ioTimelineCaptured: true,
+      usedAmbientEvents: false,
+      ioEventsDropped: 0,
+      ioPayloadsTruncated: 0,
+      alsContextAvailable: true,
+      localVariablesCaptured: true,
+      localVariablesTruncated: false,
+      stateTrackingEnabled: false,
+      stateReadsCaptured: false,
+      concurrentRequestsCaptured: true,
+      piiScrubbed: true,
+      encrypted: false,
+      captureFailures: [],
+      localVariablesCaptureLayer: 'tag',
+      localVariablesDegradation: 'exact',
+      localVariablesFrameAlignment: 'full',
+      sourceMapResolution: {
+        framesResolved: 3,
+        framesUnresolved: 0,
+        cacheHits: 3,
+        cacheMisses: 0,
+        missing: 0,
+        corrupt: 0,
+        evictions: 0
+      }
+    };
+    expect(c.localVariablesCaptureLayer).toBe('tag');
+    expect(c.sourceMapResolution?.framesResolved).toBe(3);
+  });
+});

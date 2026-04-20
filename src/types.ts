@@ -135,6 +135,18 @@ export interface Completeness {
   encrypted: boolean;
   captureFailures: string[];
   rateLimiterDrops?: RateLimiterDropSummary;
+  localVariablesCaptureLayer?: 'tag' | 'identity';
+  localVariablesDegradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'background';
+  localVariablesFrameAlignment?: 'full' | 'prefix_only';
+  sourceMapResolution?: {
+    framesResolved: number;
+    framesUnresolved: number;
+    cacheHits: number;
+    cacheMisses: number;
+    missing: number;
+    corrupt: number;
+    evictions: number;
+  };
 }
 
 export interface ErrorInfo {
