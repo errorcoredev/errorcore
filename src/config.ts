@@ -406,11 +406,12 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     envAllowlist: [...(userConfig.envAllowlist ?? DEFAULT_ENV_ALLOWLIST)],
     envBlocklist: [...(userConfig.envBlocklist ?? DEFAULT_ENV_BLOCKLIST)],
     encryptionKey: userConfig.encryptionKey,
-    // allowUnencrypted defaults to false regardless of NODE_ENV so a
-    // misspelled environment variable (e.g. NODE_ENV=prod or Production)
-    // cannot silently disable encryption in production. Dev setups that
-    // want plaintext must opt in explicitly in their config.
-    allowUnencrypted: userConfig.allowUnencrypted ?? false,
+    // Default matches the transport default above (isProduction() gate): in
+    // development (NODE_ENV !== 'production') plaintext is allowed and the
+    // stdout transport is injected automatically; in production encryption
+    // is required. Keep both defaults tied to the same isProduction() check
+    // or the zero-config dev path breaks.
+    allowUnencrypted: userConfig.allowUnencrypted ?? !isProduction(),
     transport: resolvedTransport,
     captureLocalVariables: userConfig.captureLocalVariables ?? false,
     captureDbBindParams: userConfig.captureDbBindParams ?? false,

@@ -308,11 +308,19 @@ describe('resolveConfig', () => {
     ).toThrow('allowInsecureTransport was removed');
   });
 
-  it('defaults allowUnencrypted to false regardless of NODE_ENV', () => {
-    // Regression: previously allowUnencrypted defaulted to !isProduction,
-    // so NODE_ENV=prod (a typo) silently disabled encryption in real
-    // production.
-    for (const value of ['prod', 'PRODUCTION', 'development', undefined]) {
+  it('defaults allowUnencrypted to !isProduction() so zero-config dev works', () => {
+    // Mirrors the transport default on the same code path: NODE_ENV !==
+    // 'production' gets stdout + plaintext, NODE_ENV === 'production'
+    // requires an explicit encryptionKey. Any divergence from the transport
+    // default breaks the README's documented zero-config dev contract.
+    const cases: Array<[string | undefined, boolean]> = [
+      ['production', false],
+      ['prod', true],
+      ['PRODUCTION', true],
+      ['development', true],
+      [undefined, true],
+    ];
+    for (const [value, expected] of cases) {
       const prev = process.env.NODE_ENV;
       if (value === undefined) {
         delete process.env.NODE_ENV;
@@ -321,7 +329,7 @@ describe('resolveConfig', () => {
       }
       try {
         const resolved = resolveConfig({ transport: { type: 'stdout' } });
-        expect(resolved.allowUnencrypted).toBe(false);
+        expect(resolved.allowUnencrypted).toBe(expected);
       } finally {
         process.env.NODE_ENV = prev;
       }

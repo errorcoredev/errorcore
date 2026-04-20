@@ -25,12 +25,6 @@ unsafe implicit behaviors removed.
   their own payloads by pulling the HMAC key out of the Encryption instance
   now call `encryption.sign(serializedPayload)` instead. The HMAC key never
   leaves the Encryption instance.
-- `allowUnencrypted` no longer defaults based on `NODE_ENV`. The default is
-  now `false` unconditionally. Callers that previously relied on the dev
-  fallback (`NODE_ENV !== 'production'` implicitly enabling plaintext) must
-  set `allowUnencrypted: true` explicitly in their config. The previous
-  behavior silently disabled encryption when `NODE_ENV` was missing or
-  misspelled (for example `NODE_ENV=prod` or `NODE_ENV=Production`).
 - `allowInsecureTransport` is removed. It was a silent alias for
   `allowPlainHttpTransport`. `resolveConfig` throws a clear error if the
   removed name is passed. `ResolvedConfig.allowInsecureTransport` is no
@@ -60,6 +54,13 @@ unsafe implicit behaviors removed.
   for `encryptionKey`, `apiKey`, `token`, `dsn`, and `password` fields. The
   previous output emitted the full hex key, which leaked into CI logs, copy-
   pasted support threads, and shared screenshots.
+- `allowUnencrypted` default is tied to the existing transport default:
+  `!isProduction()` in development, `false` in production. The two defaults
+  now share the same `isProduction()` helper, restoring the README's zero-
+  config dev contract (`require('errorcore').init()` with no args captures
+  to stdout in development). An interim stricter policy defaulted
+  `allowUnencrypted` to `false` unconditionally, which broke the documented
+  getting-started flow.
 
 - StateTracker proxy traps no longer propagate exceptions from the internal
   recorder (cloneAndLimit of a hostile value, ALS misbehavior). Host reads
