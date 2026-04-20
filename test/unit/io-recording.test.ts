@@ -985,3 +985,42 @@ describe('G2 — http-server shape: message.socket is optional', () => {
     }
   });
 });
+
+describe('G2 — http-client shape: { request } only', () => {
+  it('records outbound request when payload contains only request', () => {
+    const config = resolveConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter
+    });
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    // Construct a minimal ClientRequest-like object. Node's real
+    // http.client.request.start payload is literally { request } only.
+    const request = Object.assign(new EventEmitter(), {
+      method: 'POST',
+      host: 'api.example.com',
+      path: '/v1/x',
+      protocol: 'https:',
+      getHeaders: () => ({ host: 'api.example.com' }),
+      getHeader: (_: string) => 'api.example.com',
+      setHeader: () => undefined,
+    });
+
+    recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+
+    expect(pushSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'http-client',
+        direction: 'outbound',
+        method: 'POST'
+      })
+    );
+  });
+});
