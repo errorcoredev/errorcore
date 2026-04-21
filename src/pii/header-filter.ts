@@ -98,12 +98,30 @@ export class HeaderFilter {
     headers: unknown
   ): void {
     if (Array.isArray(headers)) {
-      for (const entry of headers) {
-        if (Array.isArray(entry) && entry.length >= 2 && typeof entry[0] === 'string') {
-          this.appendFilteredHeader(filtered, entry[0], entry[1]);
+      if (headers.length === 0) return;
+      // Two shapes possible:
+      //   - Flat-pairs: ['name', 'value', 'name', 'value', ...] (undici native)
+      //   - Tuple-of-tuples: [['name', 'value'], ['name', 'value'], ...]
+      // Distinguish by the first entry: string → flat, array → tuples.
+      // Anything else we don't recognize; treat as empty.
+      if (typeof headers[0] === 'string') {
+        for (let i = 0; i + 1 < headers.length; i += 2) {
+          const key = headers[i];
+          const value = headers[i + 1];
+          if (typeof key === 'string') {
+            this.appendFilteredHeader(filtered, key, value);
+          }
         }
+        return;
       }
-
+      if (Array.isArray(headers[0])) {
+        for (const entry of headers) {
+          if (Array.isArray(entry) && entry.length >= 2 && typeof entry[0] === 'string') {
+            this.appendFilteredHeader(filtered, entry[0], entry[1]);
+          }
+        }
+        return;
+      }
       return;
     }
 
