@@ -34,6 +34,14 @@ export interface PatchInstallDeps {
   buffer: IOEventBufferLike;
   als: ALSManagerLike;
   config: ResolvedConfig;
+  /**
+   * When set, the installer MUST patch methods on this reference instead of
+   * resolving the driver via nodeRequire(). Used for webpack-bundled
+   * environments where the app's bundled copy of the driver is distinct from
+   * what nodeRequire() would return. Passed through from config.drivers by
+   * PatchManager.
+   */
+  explicitDriver?: unknown;
 }
 
 type OwnedWrapperFunction = Function & {
@@ -186,11 +194,12 @@ export class PatchManager {
   }
 
   public installAll(): void {
+    const { drivers } = this.deps.config;
     this.uninstallers = [
-      installPgPatch(this.deps),
-      installMysql2Patch(this.deps),
-      installIoredisPatch(this.deps),
-      installMongodbPatch(this.deps)
+      installPgPatch({ ...this.deps, explicitDriver: drivers.pg }),
+      installMysql2Patch({ ...this.deps, explicitDriver: drivers.mysql2 }),
+      installIoredisPatch({ ...this.deps, explicitDriver: drivers.ioredis }),
+      installMongodbPatch({ ...this.deps, explicitDriver: drivers.mongodb })
     ];
   }
 

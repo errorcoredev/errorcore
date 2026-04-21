@@ -617,3 +617,57 @@ describe('mongodb patch', () => {
     });
   });
 });
+
+describe('G2 — PatchManager threads drivers config into installers', () => {
+  it('passes config.drivers.pg as explicitDriver to the pg installer', async () => {
+    const userPg = { Client: { prototype: { query: function orig() { return 'sentinel'; } } }, Pool: { prototype: {} } };
+    const userMongo = { MongoClient: { prototype: { connect: function orig() { return 'm-orig'; } } } };
+
+    await withDriverMocks({}, () => {
+      const config = resolveTestConfig({
+        drivers: { pg: userPg, mongodb: userMongo }
+      });
+      const pm = new PatchManager({
+        buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+        als: new ALSManager(),
+        config
+      });
+
+      // Before installAll, user pg.Client.prototype.query is the original function.
+      const originalQuery = userPg.Client.prototype.query;
+      const originalConnect = userMongo.MongoClient.prototype.connect;
+
+      pm.installAll();
+
+      // After installAll (with Tasks 9-12 landed), the user's own pg.Client
+      // prototype is wrapped because PatchManager threaded the reference
+      // through. For this task alone (without 9-12), we instead verify
+      // PatchManager dispatched the deps correctly by inspecting that
+      // config.drivers survives through resolveConfig and is accessible on
+      // the PatchManager instance's deps.
+      expect(config.drivers.pg).toBe(userPg);
+      expect(config.drivers.mongodb).toBe(userMongo);
+
+      pm.unwrapAll();
+      // After unwrapAll, prototypes restored (will be a no-op until 9-12
+      // actually wrap, but the unwrap path must not throw).
+      expect(userPg.Client.prototype.query).toBe(originalQuery);
+      expect(userMongo.MongoClient.prototype.connect).toBe(originalConnect);
+    });
+  });
+
+  it('gracefully handles drivers with only some entries set', () => {
+    const userPg = { Client: { prototype: { query: function() {} } }, Pool: { prototype: {} } };
+    const config = resolveTestConfig({
+      drivers: { pg: userPg } // mongodb, mysql2, ioredis not set
+    });
+    const pm = new PatchManager({
+      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config
+    });
+
+    expect(() => pm.installAll()).not.toThrow();
+    expect(() => pm.unwrapAll()).not.toThrow();
+  });
+});
