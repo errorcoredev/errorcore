@@ -18,3 +18,16 @@ export interface NextLikeRequest {
 export interface WithServerActionOptions {
   name?: string;
 }
+
+export interface NextRequestLike {
+  method: string;
+  url: string;
+  headers: {
+    forEach(cb: (value: string, key: string) => void): void;
+    entries?(): IterableIterator<[string, string]>;
+  };
+}
+
+export interface ResponseLike {
+  status: number;
+}
