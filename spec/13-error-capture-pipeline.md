@@ -271,3 +271,65 @@ function serializeError(error: Error, depth: number = 0): ErrorInfo {
 - PII scrubbing applied to entire package.
 - Progressive shedding keeps package under size limit.
 - All unit tests pass.
+
+---
+
+## 0.2.0 Additions
+
+### Source-map resolve-path sync-on-miss contract (G3)
+
+**Root cause.** `SourceMapResolver.warmCache()` walks `require.cache` at init. In Next.js, app routes don't enter `require.cache` until their first request (lazy-load), so warm-at-init misses them entirely. On first-error, `resolveStack` hits a cache miss and schedules async warm via `setImmediate` — the stack returned by the *current* resolve call is still unresolved. Second error in same file: cache populated, resolved. This produced the observed behavior: first trace in `.next/server/…/route.js:1:2486`, later trace in `webpack://blubeez/app/…/route.ts:79:21`.
+
+**Fix — sync-on-miss with size gate.** In `resolveStack`, on cache miss, check the candidate map's file size first (a `stat` call):
+
+- If size ≤ `sourceMapSyncThresholdBytes` (default 2 MB) → synchronous `getConsumer(filePath)`. One-time disk read + `JSON.parse` + `new SourceMapConsumer` per new file.
+- If size > threshold (or size unknown) → do NOT block. Call `scheduleWarm(filePath)` as before, flag the frame with `locals: source_map_async_pending`, leave the frame in bundled form for this capture. Subsequent captures pick up the resolved consumer.
+
+`resolveStackCacheOnly` stays cache-only and is used on the three paths that genuinely cannot afford blocking:
+- `uncaughtException` (Node is about to terminate)
+- `SIGTERM` shutdown capture
+- `unhandledRejection`-at-exit
+
+The `MAX_CACHE_SIZE` constant is raised from 50 to 128. Rationale: a medium Next.js app has 100–300 compiled server chunks; 50 churns aggressively and undoes resolution gains. 256 is too generous because `SourceMapConsumer` holds 5–20 MB of parsed mappings per entry in the pathological case. 128 is the count-based proxy pending a byte-size budget (tracked in `followups.md`).
+
+### Three-state cache (G3)
+
+Replace `Map<string, CachedConsumer | null>` with an explicit three-state type:
+
+```ts
+type CacheEntry =
+  | { type: 'consumer'; consumer: SourceMapConsumer; usedAt: number }
+  | { type: 'missing'; cachedAt: number }
+  | { type: 'corrupt'; reason: string; cachedAt: number };
+```
+
+Semantics:
+- `consumer` — happy path
+- `missing` — no map file exists (adjacent `.map`, `sourceMappingURL`, nothing found). Prevents re-reading filesystem on every subsequent error for the same miss.
+- `corrupt` — map existed but `JSON.parse` or `new SourceMapConsumer` threw. Reason preserved for telemetry. Prevents per-error parse storm on the same broken map.
+
+**TTL for negative entries.** `missing` and `corrupt` entries expire after **1 hour** to survive re-deploys where the user pushed a fixed build without restarting the observer process. `consumer` entries do not expire by TTL; they are evicted by LRU when the cache reaches `MAX_CACHE_SIZE = 128`.
+
+### Source-map telemetry (G3)
+
+New field on `Completeness`:
+
+```ts
+sourceMapResolution?: {
+  framesResolved: number;       // count of frames that got source-mapped
+  framesUnresolved: number;     // count that stayed as bundled positions
+  cacheHits: number;
+  cacheMisses: number;          // misses that triggered a sync load
+  missing: number;              // entries where no map exists
+  corrupt: number;              // entries where parse failed
+  evictions: number;            // entries LRU-evicted during this capture
+};
+```
+
+### Sync-on-miss safety invariant
+
+`getConsumer(filePath)` on the sync path MUST NOT yield the event loop between read, parse, and cache-set. No `await`, no `.then()`, no Promise creation. Under single-threaded JS execution, a second caller with the same `filePath` during the sync call is impossible — there is no concurrency to dedup against. If a future refactor introduces any microtask boundary, replace with an in-flight `Map<string, Promise<CacheEntry>>` dedup table.
+
+### New config field
+
+`sourceMapSyncThresholdBytes: number` (default `2_097_152`, i.e., 2 MB). Setting to `0` forces fully async behavior (matches pre-0.2.0 semantics, for users who prefer the cascade-safe option unconditionally). Available as `config.sourceMapSyncThresholdBytes`; plumbed through `sdk.ts` to the resolver constructor.
