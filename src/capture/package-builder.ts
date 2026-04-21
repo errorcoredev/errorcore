@@ -384,7 +384,8 @@ export class PackageBuilder {
       piiScrubbed: true,
       encrypted,
       captureFailures: [...parts.captureFailures],
-      rateLimiterDrops: parts.rateLimiterDrops
+      rateLimiterDrops: parts.rateLimiterDrops,
+      sourceMapResolution: parts.sourceMapResolution
     };
   }
 

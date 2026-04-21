@@ -242,6 +242,7 @@ export class ErrorCapturer {
       const rateLimiterDrops = this.rateLimiter.getAndResetDropSummary() ?? undefined;
 
       const serializedError = serializeError(error, this.sourceMapResolver);
+      const sourceMapTelemetry = this.sourceMapResolver?.consumeTelemetry();
       const locals = this.safeGetLocals(error, captureFailures);
       const context = this.safeGetContext(captureFailures);
       const usedAmbientEvents = context === undefined;
@@ -297,7 +298,8 @@ export class ErrorCapturer {
           traceId: context.traceId,
           spanId: context.spanId,
           parentSpanId: context.parentSpanId
-        } : undefined
+        } : undefined,
+        sourceMapResolution: sourceMapTelemetry
       };
 
       this.watchdog?.notifyErrorCaptured(error);

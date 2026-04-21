@@ -312,6 +312,15 @@ export interface ErrorPackageParts {
     spanId: string;
     parentSpanId: string | null;
   };
+  sourceMapResolution?: {
+    framesResolved: number;
+    framesUnresolved: number;
+    cacheHits: number;
+    cacheMisses: number;
+    missing: number;
+    corrupt: number;
+    evictions: number;
+  };
 }
 
 export interface PackageAssemblyResult {

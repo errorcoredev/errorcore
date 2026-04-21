@@ -26,6 +26,7 @@ import type {
   PackageAssemblyWorkerResponse,
   RequestContext
 } from '../../src/types';
+import { SourceMapResolver } from '../../src/capture/source-map-resolver';
 import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 
 const require = createRequire(import.meta.url);
@@ -1766,5 +1767,55 @@ describe('ErrorCapturer', () => {
     const pkg = capturer.capture(new Error('miss'));
 
     expect(pkg?.completeness.captureFailures).toContain('locals: cache_miss (pauses=0)');
+  });
+});
+
+describe('G3 — sourceMapResolution telemetry in completeness', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('includes sourceMapResolution counts after a capture', () => {
+    const config = resolveConfig({});
+    const processMetadata = new ProcessMetadata(config);
+    const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const sourceMapResolver = new SourceMapResolver();
+    const capturer = new ErrorCapturer({
+      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker,
+      processMetadata,
+      packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
+      transport: { send: vi.fn() },
+      encryption: null,
+      bodyCapture: noopBodyCapture,
+      config,
+      sourceMapResolver
+    });
+
+    const error = new Error('src-map-telemetry-test');
+    // Stack referencing a path that won't have a source map — triggers
+    // a missing/not-found entry in the source map resolver.
+    error.stack = 'Error: src-map-telemetry-test\n    at foo (/nonexistent/telemetry.js:10:5)';
+
+    const pkg = capturer.capture(error);
+
+    expect(pkg?.completeness.sourceMapResolution).toBeDefined();
+    const sm = pkg!.completeness.sourceMapResolution!;
+    expect(typeof sm.framesResolved).toBe('number');
+    expect(typeof sm.framesUnresolved).toBe('number');
+    expect(typeof sm.cacheHits).toBe('number');
+    expect(typeof sm.cacheMisses).toBe('number');
+    expect(typeof sm.missing).toBe('number');
+    expect(typeof sm.corrupt).toBe('number');
+    expect(typeof sm.evictions).toBe('number');
+    // At least one field should be > 0 because the capture triggered resolution.
+    const totalActivity = sm.framesResolved + sm.framesUnresolved + sm.cacheHits + sm.cacheMisses + sm.missing + sm.corrupt;
+    expect(totalActivity).toBeGreaterThan(0);
+
+    requestTracker.shutdown();
+    processMetadata.shutdown();
   });
 });
