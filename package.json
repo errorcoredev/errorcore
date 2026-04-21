@@ -48,19 +48,24 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "verify:edge-stub": "node scripts/verify-edge-stub.js",
-    "prepublishOnly": "npm run build && npm run verify:edge-stub && npm run test"
+    "prepublishOnly": "npm run build && npm run verify:edge-stub && npm run test",
+    "smoke:nextjs": "cd tmp-nextjs-smoke && node run-smoke.mjs",
+    "smoke:nextjs:sourcemaps": "cross-env NODE_OPTIONS=--enable-source-maps npm run smoke:nextjs"
   },
   "dependencies": {
     "source-map-js": "1.2.1"
   },
   "devDependencies": {
+    "@hono/node-server": "^2.0.0",
     "@types/node": "^20.19.37",
+    "cross-env": "^7.0.3",
+    "hono": "^4.12.14",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
   },
   "peerDependencies": {
-    "hono": ">=4",
     "@hono/node-server": ">=1",
+    "hono": ">=4",
     "ioredis": ">=4",
     "mongodb": ">=5",
     "mysql2": ">=2",
