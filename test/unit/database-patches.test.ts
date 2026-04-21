@@ -732,3 +732,34 @@ describe('G2 — mongodb installer with explicit driver', () => {
     expect(() => installMongodbPatch(deps)).not.toThrow();
   });
 });
+
+describe('G2 — mysql2 installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalQuery = function originalQuery() { return 'mysql2-query-orig'; };
+    const originalExecute = function originalExecute() { return 'mysql2-execute-orig'; };
+    const fakeMysql2 = {
+      Connection: { prototype: { query: originalQuery, execute: originalExecute } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakeMysql2 };
+    const uninstall = installMysql2Patch(deps);
+
+    expect(fakeMysql2.Connection.prototype.query).not.toBe(originalQuery);
+    expect(fakeMysql2.Connection.prototype.execute).not.toBe(originalExecute);
+
+    uninstall();
+
+    expect(fakeMysql2.Connection.prototype.query).toBe(originalQuery);
+    expect(fakeMysql2.Connection.prototype.execute).toBe(originalExecute);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installMysql2Patch(deps)).not.toThrow();
+  });
+});

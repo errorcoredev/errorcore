@@ -201,7 +201,7 @@ function instrumentMethod(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const mysql2 = nodeRequire('mysql2') as {
+    const mysql2 = (deps.explicitDriver ?? nodeRequire('mysql2')) as {
       Connection?: { prototype?: object };
     };
 
