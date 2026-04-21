@@ -3,7 +3,11 @@ import path = require('node:path');
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { InspectorManager } from '../../src/capture/inspector-manager';
+import {
+  ERRORCORE_CAPTURE_ID_SYMBOL,
+  InspectorManager,
+  LocalsRingBuffer
+} from '../../src/capture/inspector-manager';
 import { resolveTestConfig } from '../helpers/test-config';
 
 const originalRequire = Module.prototype.require;
@@ -953,5 +957,38 @@ describe('InspectorManager', () => {
       expect(result.frames).toBeNull();
       expect(result.missReason).toBe('not_available');
     });
+  });
+});
+
+describe('G1 — ring buffer structure', () => {
+  it('ERRORCORE_CAPTURE_ID_SYMBOL is Symbol.for-keyed', () => {
+    expect(ERRORCORE_CAPTURE_ID_SYMBOL).toBe(Symbol.for('errorcore.v1.captureId'));
+  });
+
+  it('LocalsRingBuffer evicts oldest entry when capacity is reached', () => {
+    const rb = new LocalsRingBuffer(3);
+    rb.push({ id: 'a', requestId: 'r', errorName: 'E', errorMessage: 'm', frameCount: 1, structuralHash: 'h', frames: [], createdAt: Date.now() });
+    rb.push({ id: 'b', requestId: 'r', errorName: 'E', errorMessage: 'm', frameCount: 1, structuralHash: 'h', frames: [], createdAt: Date.now() });
+    rb.push({ id: 'c', requestId: 'r', errorName: 'E', errorMessage: 'm', frameCount: 1, structuralHash: 'h', frames: [], createdAt: Date.now() });
+    rb.push({ id: 'd', requestId: 'r', errorName: 'E', errorMessage: 'm', frameCount: 1, structuralHash: 'h', frames: [], createdAt: Date.now() });
+    expect(rb.getById('a')).toBeUndefined();
+    expect(rb.getById('d')).toBeDefined();
+  });
+
+  it('LocalsRingBuffer.findByIdentity returns LIFO-most-recent match', () => {
+    const rb = new LocalsRingBuffer(4);
+    rb.push({ id: '1', requestId: 'r1', errorName: 'E', errorMessage: 'm', frameCount: 2, structuralHash: 'h', frames: [], createdAt: Date.now() });
+    rb.push({ id: '2', requestId: 'r1', errorName: 'E', errorMessage: 'm', frameCount: 2, structuralHash: 'h', frames: [], createdAt: Date.now() });
+    const match = rb.findByIdentity({ requestId: 'r1', errorName: 'E', errorMessage: 'm', frameCount: 2, structuralHash: 'h' });
+    expect(match?.id).toBe('2');
+  });
+
+  it('allocateId returns monotonically increasing string ids', () => {
+    const rb = new LocalsRingBuffer(4);
+    const a = rb.allocateId();
+    const b = rb.allocateId();
+    expect(typeof a).toBe('string');
+    expect(a).not.toBe(b);
+    expect(Number(b)).toBeGreaterThan(Number(a));
   });
 });

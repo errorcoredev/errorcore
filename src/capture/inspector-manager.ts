@@ -4,6 +4,114 @@ import path = require('node:path');
 import type { CapturedFrame, ResolvedConfig } from '../types';
 import { looksLikeHighEntropySecret } from '../pii/scrubber';
 
+export const ERRORCORE_CAPTURE_ID_SYMBOL = Symbol.for('errorcore.v1.captureId');
+
+export interface LocalsRingBufferEntry {
+  id: string;
+  requestId: string | null;
+  errorName: string;
+  errorMessage: string;
+  frameCount: number;
+  structuralHash: string;
+  frames: CapturedFrame[];
+  createdAt: number;
+}
+
+export class LocalsRingBuffer {
+  private readonly capacity: number;
+  private readonly entries: LocalsRingBufferEntry[] = [];
+  private nextId = 0;
+
+  public constructor(capacity: number) {
+    this.capacity = capacity;
+  }
+
+  public allocateId(): string {
+    return String(++this.nextId);
+  }
+
+  public push(entry: LocalsRingBufferEntry): void {
+    this.entries.push(entry);
+    while (this.entries.length > this.capacity) this.entries.shift();
+  }
+
+  public getById(id: string): LocalsRingBufferEntry | undefined {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      if (this.entries[i].id === id) return this.entries[i];
+    }
+    return undefined;
+  }
+
+  public findByIdentity(key: {
+    requestId: string | null;
+    errorName: string;
+    errorMessage: string;
+    frameCount: number;
+    structuralHash: string;
+  }): LocalsRingBufferEntry | undefined {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const e = this.entries[i];
+      if (
+        e.requestId === key.requestId &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage &&
+        e.frameCount === key.frameCount &&
+        e.structuralHash === key.structuralHash
+      ) {
+        return e;
+      }
+    }
+    return undefined;
+  }
+
+  public findByDegradedKey(key: {
+    requestId: string | null;
+    errorName: string;
+    errorMessage: string;
+    frameCount: number;
+  }): LocalsRingBufferEntry[] {
+    const out: LocalsRingBufferEntry[] = [];
+    for (const e of this.entries) {
+      if (
+        e.requestId === key.requestId &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage &&
+        e.frameCount === key.frameCount
+      ) out.push(e);
+    }
+    return out;
+  }
+
+  public findByLooseKey(key: {
+    requestId: string | null;
+    errorName: string;
+    errorMessage: string;
+  }): LocalsRingBufferEntry[] {
+    return this.entries.filter(
+      (e) =>
+        e.requestId === key.requestId &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage
+    );
+  }
+
+  public findBackgroundMatches(key: {
+    errorName: string;
+    errorMessage: string;
+    frameCount: number;
+    structuralHash: string;
+  }): LocalsRingBufferEntry[] {
+    return this.entries.filter(
+      (e) =>
+        e.requestId === null &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage &&
+        e.frameCount === key.frameCount &&
+        e.structuralHash === key.structuralHash
+    );
+  }
+}
+
 const SENSITIVE_VAR_RE =
   /password|passwd|secret|token|key|auth|credential|ssn|social.*security|credit.*card|card.*number|cvv|cvc|expir/i;
 const STRING_LIMIT = 2048;
