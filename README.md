@@ -72,6 +72,62 @@ module.exports = {
 
 Generate a key: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
 
+## Database driver tiers
+
+Errorcore records DB query events differently depending on your runtime environment.
+
+**Tier 1 — Plain Node.js** (Express, Fastify, Koa, NestJS, raw `http`): automatic. No config needed. All recorders install against the same `require()` graph the app uses.
+
+**Tier 2 — Single-graph bundlers** (Vite SSR, esbuild, plain webpack): automatic if the driver is not tree-shaken, or pass explicit references:
+
+```ts
+errorcore.init({
+  drivers: { pg: require('pg'), mongodb: require('mongodb') },
+});
+```
+
+**Tier 3 — Next.js App Router**: externalize drivers from the webpack bundle:
+
+```js
+// next.config.js
+module.exports = {
+  serverExternalPackages: ['pg', 'mongodb', 'mysql2', 'ioredis'],
+};
+```
+
+Without this, the DB timeline will not populate — the startup diagnostic will report `warn(bundled-unpatched)`. HTTP inbound, HTTP outbound, and `fetch` (undici) recording work in all three tiers.
+
+## Startup diagnostic
+
+At startup, errorcore prints one line listing the state of each recorder:
+
+```
+[errorcore] 0.2.0 node=20.11.0 recorders: http-server=ok http-client=ok undici=ok net=ok dns=ok pg=skip(not-installed) mongodb=warn(bundled-unpatched) mysql2=skip(not-installed) ioredis=skip(not-installed)
+```
+
+Three states: `ok` (active), `skip(<reason>)` (intentionally inactive — no action needed), `warn(<reason>)` (wanted to install but couldn't — action required). When warns are present, the output grows to 3–6 lines with one actionable guidance line per warn state. Suppress the entire block with `config.silent: true`.
+
+## Next.js middleware capture
+
+To capture errors and optionally non-2xx responses from Clerk-style middleware rejections, wrap your middleware with `withNextMiddleware`:
+
+```ts
+import { withNextMiddleware } from 'errorcore/nextjs';
+import { clerkMiddleware } from '@clerk/nextjs/server';
+
+export default withNextMiddleware(clerkMiddleware());
+```
+
+Control which response status codes trigger a capture:
+
+```ts
+errorcore.init({
+  captureMiddlewareStatusCodes: [500, 502, 503, 504], // or 'all', or 'none' (default)
+});
+```
+
+`undefined` returns (pass-through middleware) are never captured regardless of this setting. The ALS context started by `withNextMiddleware` propagates automatically into the downstream route handler.
+
 ## Documentation
 
 - [SDK documentation](https://errorcore.dev/docs)
