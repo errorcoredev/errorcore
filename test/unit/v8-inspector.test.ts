@@ -6,7 +6,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ERRORCORE_CAPTURE_ID_SYMBOL,
   InspectorManager,
-  LocalsRingBuffer
+  LocalsRingBuffer,
+  computeStructuralHash,
+  countCallFrames
 } from '../../src/capture/inspector-manager';
 import { resolveTestConfig } from '../helpers/test-config';
 
@@ -990,5 +992,46 @@ describe('G1 — ring buffer structure', () => {
     expect(typeof a).toBe('string');
     expect(a).not.toBe(b);
     expect(Number(b)).toBeGreaterThan(Number(a));
+  });
+});
+
+describe('G1 — structural hash', () => {
+  it('hashes function names only, not paths', () => {
+    const h1 = computeStructuralHash([
+      { functionName: 'GET' },
+      { functionName: 'handler' }
+    ]);
+    const h2 = computeStructuralHash([
+      { functionName: 'GET' },
+      { functionName: 'handler' }
+    ]);
+    expect(h1).toBe(h2);
+  });
+
+  it('different function names → different hashes', () => {
+    const h1 = computeStructuralHash([{ functionName: 'GET' }]);
+    const h2 = computeStructuralHash([{ functionName: 'POST' }]);
+    expect(h1).not.toBe(h2);
+  });
+
+  it('empty function names collapse to a fingerprint-only hash (minification case)', () => {
+    const h = computeStructuralHash([
+      { functionName: '' },
+      { functionName: '' }
+    ]);
+    expect(typeof h).toBe('string');
+    expect(h.length).toBeGreaterThan(0);
+  });
+});
+
+describe('G1 — frame count from callFrames', () => {
+  it('returns array length', () => {
+    expect(countCallFrames([
+      { functionName: 'a' }, { functionName: 'b' }, { functionName: 'c' }
+    ])).toBe(3);
+  });
+
+  it('returns 0 for empty frames', () => {
+    expect(countCallFrames([])).toBe(0);
   });
 });

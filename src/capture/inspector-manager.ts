@@ -1,5 +1,6 @@
 
 import path = require('node:path');
+import { createHash } from 'node:crypto';
 
 import type { CapturedFrame, ResolvedConfig } from '../types';
 import { looksLikeHighEntropySecret } from '../pii/scrubber';
@@ -110,6 +111,19 @@ export class LocalsRingBuffer {
         e.structuralHash === key.structuralHash
     );
   }
+}
+
+export function computeStructuralHash(
+  frames: ReadonlyArray<{ functionName: string }>
+): string {
+  const joined = frames.map((f) => f.functionName || '<anonymous>').join('\u241F');
+  return createHash('sha1').update(joined).digest('hex');
+}
+
+export function countCallFrames(
+  frames: ReadonlyArray<{ functionName: string }>
+): number {
+  return frames.length;
 }
 
 const SENSITIVE_VAR_RE =
