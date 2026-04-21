@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { existsSync, readFileSync } = vi.hoisted(() => ({
@@ -83,10 +84,8 @@ describe('SourceMapResolver', () => {
       // Frame at line 10, col 5 => originalPositionFor({line:10, column:4})
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error: boom\n    at minified (/app/dist/bundle.js:10:5)';
-      // First call returns unresolved (cache miss triggers background warm)
+      // First call loads synchronously (cache miss triggers getConsumer inline)
       resolver.resolveStack(stack);
-      // Wait for background warm to complete
-      await new Promise(r => setImmediate(r));
       // Second call uses the now-populated cache
       const result = resolver.resolveStack(stack);
 
@@ -103,7 +102,6 @@ describe('SourceMapResolver', () => {
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error: test\n    at minifiedName (/app/dist/bundle.js:20:3)';
       resolver.resolveStack(stack);
-      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('myFunc (original.ts:5:11)');
@@ -118,7 +116,6 @@ describe('SourceMapResolver', () => {
       // => { source: 'original.ts', line: 5, column: 10, name: null }
       const stack = 'Error: test\n    at /app/dist/bundle.js:20:3';
       resolver.resolveStack(stack);
-      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       const resolvedLine = result.split('\n')[1];
@@ -146,9 +143,8 @@ describe('SourceMapResolver', () => {
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at fn (/app/dist/bundle.js:1:1)';
 
-      // First call triggers background warm
+      // First call loads synchronously
       resolver.resolveStack(stack);
-      await new Promise(r => setImmediate(r));
       const firstCallCount = readFileSync.mock.calls.length;
 
       // Second call should use cache, no new reads
@@ -162,12 +158,11 @@ describe('SourceMapResolver', () => {
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at fn (/app/dist/missing.js:1:1)';
 
-      // First call triggers background warm (which caches null)
+      // First call loads synchronously and caches missing entry
       resolver.resolveStack(stack);
-      await new Promise(r => setImmediate(r));
       const firstExistsCount = existsSync.mock.calls.length;
 
-      // Second call should use cached null, no new filesystem checks
+      // Second call should use cached missing entry, no new filesystem checks
       resolver.resolveStack(stack);
       expect(existsSync.mock.calls.length).toBe(firstExistsCount);
     });
@@ -182,7 +177,6 @@ describe('SourceMapResolver', () => {
       // line:10, col:5 in frame => resolver passes {line:10, column:4} to consumer
       const stack = 'Error\n    at func (/path/file.js:10:5)';
       resolver.resolveStack(stack);
-      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('myFunc (original.ts:5:11)');
@@ -195,7 +189,6 @@ describe('SourceMapResolver', () => {
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at /path/file.js:10:5';
       resolver.resolveStack(stack);
-      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       // name='myFunc' from the map
@@ -235,7 +228,6 @@ describe('SourceMapResolver', () => {
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error\n    at fn (/app/dist/bundle.js:1:1)';
       resolver.resolveStack(stack);
-      await new Promise(r => setImmediate(r));
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('original.ts:5:11');
@@ -294,44 +286,43 @@ describe('SourceMapResolver', () => {
   });
 
   describe('eviction', () => {
-    it('evicts the oldest entry after 50+ unique files are cached', async () => {
+    it('evicts the oldest consumer entry after 128+ unique files are cached', async () => {
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
       const resolver = new SourceMapResolver();
 
-      // Fill the cache with 51 unique file entries (max is 50)
-      for (let i = 0; i < 51; i++) {
+      // Fill the cache with 129 unique file entries (max is 128)
+      for (let i = 0; i < 129; i++) {
         resolver.resolveStack(`Error\n    at fn (/app/file${i}.js:1:1)`);
       }
 
-      // Wait for all background warms to populate the cache
+      // All loads are synchronous now.
       await resolver.flushWarmQueue();
 
       readFileSync.mockClear();
       existsSync.mockClear();
 
       // file0 was the first inserted and should have been evicted.
-      // This call triggers a new background warm for the evicted entry.
+      // This call triggers a synchronous reload for the evicted entry.
       resolver.resolveStack('Error\n    at fn (/app/file0.js:1:1)');
       await resolver.flushWarmQueue();
 
       expect(readFileSync).toHaveBeenCalled();
     });
 
-    it('preferentially evicts null cache entries', async () => {
+    it('does not evict missing/corrupt entries during LRU eviction', async () => {
       const resolver = new SourceMapResolver();
 
-      // Insert a null cache entry first
+      // Insert a missing cache entry first (no .map, no source file)
       existsSync.mockReturnValue(false);
-      resolver.resolveStack('Error\n    at fn (/app/null-entry.js:1:1)');
-      await resolver.flushWarmQueue();
+      resolver.resolveStack('Error\n    at fn (/app/missing-entry.js:1:1)');
 
-      // Now fill with valid entries up to the limit
+      // Now fill with valid consumer entries up to the limit
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
       readFileSync.mockReturnValue(NAMED_SOURCEMAP_JSON);
 
-      for (let i = 0; i < 50; i++) {
+      for (let i = 0; i < 128; i++) {
         resolver.resolveStack(`Error\n    at fn (/app/valid${i}.js:1:1)`);
       }
       await resolver.flushWarmQueue();
@@ -339,12 +330,65 @@ describe('SourceMapResolver', () => {
       readFileSync.mockClear();
       existsSync.mockClear();
 
-      // The null entry should have been evicted (not a valid entry).
-      // This call triggers a new background warm for the evicted entry.
-      resolver.resolveStack('Error\n    at fn (/app/null-entry.js:1:1)');
+      // The missing entry should NOT have been evicted by LRU.
+      // It must still be in cache (no disk read on second resolve).
+      resolver.resolveStack('Error\n    at fn (/app/missing-entry.js:1:1)');
       await resolver.flushWarmQueue();
 
-      expect(existsSync).toHaveBeenCalled();
+      // If the missing entry was preserved in cache, existsSync is NOT called again.
+      expect(existsSync).not.toHaveBeenCalledWith('/app/missing-entry.js.map');
+    });
+  });
+
+  describe('G3 — three-state cache', () => {
+    it('caches a missing result and does not re-hit disk on subsequent calls', () => {
+      const readSyncSpy = vi.spyOn(fs, 'readFileSync');
+      const existsSyncSpy = vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+      const resolver = new SourceMapResolver();
+      const stack = 'Error: x\n    at foo (/nonexistent/file.js:1:1)';
+      resolver.resolveStack(stack);
+      const callsAfterFirst = readSyncSpy.mock.calls.length + existsSyncSpy.mock.calls.length;
+      resolver.resolveStack(stack);
+      const callsAfterSecond = readSyncSpy.mock.calls.length + existsSyncSpy.mock.calls.length;
+      // Second call must not touch disk for the same missing path.
+      expect(callsAfterSecond).toBe(callsAfterFirst);
+      vi.restoreAllMocks();
+    });
+
+    it('caches a corrupt result with reason and does not re-parse on subsequent calls', () => {
+      const existsSyncSpy = vi.spyOn(fs, 'existsSync').mockImplementation((p) =>
+        String(p).endsWith('.map')
+      );
+      const readFileSyncSpy = vi.spyOn(fs, 'readFileSync').mockReturnValue('not valid json{{{');
+      const resolver = new SourceMapResolver();
+      const stack = 'Error: x\n    at foo (/fake/file.js:1:1)';
+      resolver.resolveStack(stack);
+      const firstReads = readFileSyncSpy.mock.calls.length;
+      resolver.resolveStack(stack);
+      expect(readFileSyncSpy.mock.calls.length).toBe(firstReads);
+      const telemetry = resolver.consumeTelemetry();
+      expect(telemetry.corrupt).toBeGreaterThanOrEqual(1);
+      void existsSyncSpy;
+      vi.restoreAllMocks();
+    });
+
+    it('consumeTelemetry returns a snapshot and resets counters', () => {
+      const resolver = new SourceMapResolver();
+      vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+      resolver.resolveStack('Error: x\n    at foo (/a.js:1:1)');
+      const first = resolver.consumeTelemetry();
+      expect(first.cacheMisses + first.missing).toBeGreaterThanOrEqual(1);
+      const second = resolver.consumeTelemetry();
+      expect(second).toEqual({
+        framesResolved: 0,
+        framesUnresolved: 0,
+        cacheHits: 0,
+        cacheMisses: 0,
+        missing: 0,
+        corrupt: 0,
+        evictions: 0
+      });
+      vi.restoreAllMocks();
     });
   });
 });
