@@ -763,3 +763,36 @@ describe('G2 — mysql2 installer with explicit driver', () => {
     expect(() => installMysql2Patch(deps)).not.toThrow();
   });
 });
+
+describe('G2 — ioredis installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalSendCommand = function originalSendCommand() { return Promise.resolve('ok'); };
+    // ioredis exports the constructor class directly; the installer does:
+    //   const Redis = (deps.explicitDriver ?? nodeRequire('ioredis')) as { prototype?: object }
+    // and then wraps Redis.prototype.sendCommand
+    class FakeRedis {
+      public sendCommand = originalSendCommand;
+    }
+    // The installer checks Redis.prototype, so attach there too
+    FakeRedis.prototype.sendCommand = originalSendCommand;
+
+    const deps = { ...createDeps(), explicitDriver: FakeRedis };
+    const uninstall = installIoredisPatch(deps);
+
+    expect(FakeRedis.prototype.sendCommand).not.toBe(originalSendCommand);
+
+    uninstall();
+
+    expect(FakeRedis.prototype.sendCommand).toBe(originalSendCommand);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installIoredisPatch(deps)).not.toThrow();
+  });
+});

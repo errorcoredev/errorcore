@@ -38,7 +38,7 @@ function pushEvent(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const Redis = nodeRequire('ioredis') as { prototype?: object };
+    const Redis = (deps.explicitDriver ?? nodeRequire('ioredis')) as { prototype?: object };
 
     if (Redis.prototype !== undefined) {
       wrapMethod(Redis.prototype, 'sendCommand', (original) => {
