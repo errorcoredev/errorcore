@@ -177,7 +177,7 @@ function instrumentMethod(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const mongodb = nodeRequire('mongodb') as {
+    const mongodb = (deps.explicitDriver ?? nodeRequire('mongodb')) as {
       Collection?: { prototype?: object };
     };
 

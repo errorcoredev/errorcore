@@ -703,3 +703,32 @@ describe('G2 — pg installer with explicit driver', () => {
     expect(() => installPgPatch(deps)).not.toThrow();
   });
 });
+
+describe('G2 — mongodb installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalFind = function originalFind() { return 'mongo-orig'; };
+    const fakeMongodb = {
+      Collection: { prototype: { find: originalFind } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakeMongodb };
+    const uninstall = installMongodbPatch(deps);
+
+    // The installer must have wrapped the user's own Collection.prototype.find
+    expect(fakeMongodb.Collection.prototype.find).not.toBe(originalFind);
+
+    uninstall();
+
+    expect(fakeMongodb.Collection.prototype.find).toBe(originalFind);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installMongodbPatch(deps)).not.toThrow();
+  });
+});
