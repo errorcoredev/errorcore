@@ -16,6 +16,13 @@ import {
 import { createSDK } from '../../src/sdk';
 import { Encryption } from '../../src/security/encryption';
 import { DeadLetterStore } from '../../src/transport/dead-letter-store';
+import {
+  detectBundler,
+  isNextJsNodeRuntime,
+  classifyRecorderStatus,
+  formatStartupLine,
+  formatWarnGuidance
+} from '../../src/sdk-diagnostics';
 
 function createTestSDK() {
   return createSDK({ transport: { type: 'stdout' }, allowUnencrypted: true });
@@ -523,5 +530,111 @@ describe('SDK composition', () => {
 
     expect(stdoutWrite).toHaveBeenCalled();
     expect(createSDKFacade).toBeDefined();
+  });
+});
+
+describe('G2 — bundler detection', () => {
+  it('detectBundler returns webpack when __webpack_require__ is defined', () => {
+    (globalThis as Record<string, unknown>).__webpack_require__ = () => undefined;
+    try {
+      expect(detectBundler()).toBe('webpack');
+    } finally {
+      delete (globalThis as Record<string, unknown>).__webpack_require__;
+    }
+  });
+
+  it('detectBundler returns unknown otherwise', () => {
+    expect(detectBundler()).toBe('unknown');
+  });
+
+  it('isNextJsNodeRuntime reads NEXT_RUNTIME === nodejs', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    process.env.NEXT_RUNTIME = 'nodejs';
+    try {
+      expect(isNextJsNodeRuntime()).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+
+  it('isNextJsNodeRuntime returns false when NEXT_RUNTIME is absent or edge', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    delete process.env.NEXT_RUNTIME;
+    try {
+      expect(isNextJsNodeRuntime()).toBe(false);
+      process.env.NEXT_RUNTIME = 'edge';
+      expect(isNextJsNodeRuntime()).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+});
+
+describe('G2 — recorder status assembly', () => {
+  it('classifyRecorderStatus emits ok / skip / warn correctly', () => {
+    expect(classifyRecorderStatus({ installed: true })).toEqual({ state: 'ok' });
+    expect(classifyRecorderStatus({ installed: false, reason: 'not-installed' })).toEqual({
+      state: 'skip',
+      reason: 'not-installed'
+    });
+    expect(classifyRecorderStatus({ installed: false, reason: 'bundled-unpatched' })).toEqual({
+      state: 'warn',
+      reason: 'bundled-unpatched'
+    });
+  });
+
+  it('classifyRecorderStatus defaults reason to unknown when omitted on installed=false', () => {
+    expect(classifyRecorderStatus({ installed: false })).toEqual({
+      state: 'skip',
+      reason: 'unknown'
+    });
+  });
+});
+
+describe('G2 — startup line formatting', () => {
+  it('formats a summary line with mixed ok/skip/warn states', () => {
+    const line = formatStartupLine({
+      version: '0.2.0',
+      nodeVersion: '20.11.0',
+      recorders: {
+        'http-server': { state: 'ok' },
+        'pg': { state: 'skip', reason: 'not-installed' },
+        'mongodb': { state: 'warn', reason: 'bundled-unpatched' }
+      }
+    });
+    expect(line).toBe(
+      '[errorcore] 0.2.0 node=20.11.0 recorders: http-server=ok pg=skip(not-installed) mongodb=warn(bundled-unpatched)'
+    );
+  });
+});
+
+describe('G2 — warn guidance formatting', () => {
+  it('returns null for non-warn states', () => {
+    expect(formatWarnGuidance('pg', { state: 'ok' }, { isNextJs: false })).toBeNull();
+    expect(
+      formatWarnGuidance('pg', { state: 'skip', reason: 'not-installed' }, { isNextJs: false })
+    ).toBeNull();
+  });
+
+  it('formats bundled-unpatched for Next.js recommending serverExternalPackages', () => {
+    const msg = formatWarnGuidance(
+      'pg',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: true }
+    );
+    expect(msg).toContain('serverExternalPackages');
+    expect(msg).toContain("'pg'");
+  });
+
+  it('formats bundled-unpatched for non-Next.js recommending drivers option', () => {
+    const msg = formatWarnGuidance(
+      'mongodb',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: false }
+    );
+    expect(msg).toContain("drivers:");
+    expect(msg).toContain("require('mongodb')");
   });
 });
