@@ -1069,6 +1069,289 @@ describe('InspectorManager', () => {
   });
 });
 
+describe('G1 — Layer 1 lookup by Symbol tag', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('resolves via tag even when ring buffer has multiple entries', () => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const mock = createInspectorMock({
+      postImplementation: ({ method, params, callback }) => {
+        if (method !== 'Runtime.getProperties') return false;
+        callback?.(null, {
+          result: [{ name: 'n', value: { type: 'number', value: params?.objectId === 'scope-a' ? 10 : 20 } }]
+        });
+        return true;
+      }
+    });
+
+    withInspectorMock(mock.inspectorModule, () => {
+      const manager = new InspectorManager(createInspectorConfig(), {
+        getRequestId: () => 'req-1'
+      });
+      manager.ensureDebuggerActive();
+
+      // First capture (captureId='1')
+      mock.emitPaused({
+        reason: 'exception',
+        data: { className: 'Error', description: 'Error: msg', objectId: 'exc-a' },
+        callFrames: [createCallFrame({ objectId: 'scope-a' })]
+      });
+
+      // Second capture (captureId='2')
+      mock.emitPaused({
+        reason: 'exception',
+        data: { className: 'Error', description: 'Error: msg', objectId: 'exc-b' },
+        callFrames: [createCallFrame({ objectId: 'scope-b' })]
+      });
+
+      // Tag error with first capture's id
+      const error = buildErrorAt('msg');
+      (error as unknown as Record<symbol, unknown>)[ERRORCORE_CAPTURE_ID_SYMBOL] = '1';
+
+      const result = manager.getLocalsWithDiagnostics(error);
+      expect(result.frames).not.toBeNull();
+      expect(result.frames![0].locals.n).toBe(10);
+      expect(result.captureLayer).toBe('tag');
+      expect(result.degradation).toBe('exact');
+      expect(result.missReason).toBeNull();
+      manager.shutdown();
+    });
+  });
+
+  it('falls through to Layer 2 when tag id is not in ring buffer (evicted)', () => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const mock = createInspectorMock({
+      postHandlers: {
+        'Runtime.getProperties': () => ({
+          result: [{ name: 'x', value: { type: 'number', value: 5 } }]
+        })
+      }
+    });
+
+    withInspectorMock(mock.inspectorModule, () => {
+      const manager = new InspectorManager(
+        createInspectorConfig({ maxCachedLocals: 2 }),
+        { getRequestId: () => 'req-1' }
+      ) as unknown as {
+        ringBuffer: LocalsRingBuffer;
+        ensureDebuggerActive(): void;
+        getLocalsWithDiagnostics(e: Error): { frames: unknown; missReason: string | null };
+        shutdown(): void;
+      };
+      manager.ensureDebuggerActive();
+
+      // Directly push two entries to fill the buffer (capacity=2), then push a third to evict the first
+      manager.ringBuffer.push({
+        id: '1',
+        requestId: 'req-1',
+        errorName: 'Error',
+        errorMessage: 'old',
+        frameCount: 1,
+        structuralHash: 'h1',
+        frames: [{ functionName: 'fn1', filePath: APP_FILE, lineNumber: 1, columnNumber: 1, locals: {} }],
+        createdAt: Date.now()
+      });
+      manager.ringBuffer.push({
+        id: '2',
+        requestId: 'req-1',
+        errorName: 'Error',
+        errorMessage: 'filler',
+        frameCount: 1,
+        structuralHash: 'h2',
+        frames: [],
+        createdAt: Date.now()
+      });
+      // Push third entry → evicts id='1' (oldest)
+      manager.ringBuffer.push({
+        id: '3',
+        requestId: 'req-1',
+        errorName: 'Error',
+        errorMessage: 'new',
+        frameCount: 1,
+        structuralHash: 'h3',
+        frames: [],
+        createdAt: Date.now()
+      });
+
+      // Tag error with evicted id='1': Layer 1 will miss
+      const error = buildErrorAt('old');
+      (error as unknown as Record<symbol, unknown>)[ERRORCORE_CAPTURE_ID_SYMBOL] = '1';
+
+      // Layer 2 lookup: requestId='req-1', errorMessage='old' → not in buffer (evicted)
+      const result = manager.getLocalsWithDiagnostics(error);
+      expect(result.missReason).toContain('cache_miss');
+      expect(result.frames).toBeNull();
+      manager.shutdown();
+    });
+  });
+});
+
+describe('G1 — Layer 2 identity-tuple lookup with degradation', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('matches via dropped_hash when structuralHash differs but frameCount matches', () => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const mock = createInspectorMock({
+      postHandlers: {
+        'Runtime.getProperties': () => ({
+          result: [{ name: 'y', value: { type: 'number', value: 77 } }]
+        })
+      }
+    });
+
+    withInspectorMock(mock.inspectorModule, () => {
+      const manager = new InspectorManager(createInspectorConfig(), {
+        getRequestId: () => 'req-hash'
+      });
+      manager.ensureDebuggerActive();
+
+      // Emit with functionName 'capturedFn' → structuralHash = hash('capturedFn')
+      mock.emitPaused({
+        reason: 'exception',
+        data: { className: 'RangeError', description: 'RangeError: too big' },
+        callFrames: [createCallFrame({ functionName: 'capturedFn', objectId: 'scope-h' })]
+      });
+
+      // Lookup error with different functionName → different structuralHash
+      // but same frameCount(1), same requestId/errorName/errorMessage → dropped_hash match
+      const error = new Error('too big');
+      error.name = 'RangeError';
+      // Stack with different function name gives different hash but same frame count
+      error.stack = 'RangeError: too big\n    at differentFn (/app/src/handler.js:10:5)';
+
+      const result = manager.getLocalsWithDiagnostics(error);
+      expect(result.frames).not.toBeNull();
+      expect(result.captureLayer).toBe('identity');
+      expect(result.degradation).toBe('dropped_hash');
+      manager.shutdown();
+    });
+  });
+
+  it('matches via dropped_count when frameCount differs', () => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const mock = createInspectorMock({
+      postHandlers: {
+        'Runtime.getProperties': () => ({
+          result: [{ name: 'z', value: { type: 'number', value: 88 } }]
+        })
+      }
+    });
+
+    withInspectorMock(mock.inspectorModule, () => {
+      const manager = new InspectorManager(createInspectorConfig(), {
+        getRequestId: () => 'req-cnt'
+      });
+      manager.ensureDebuggerActive();
+
+      // Emit with 2 call frames
+      mock.emitPaused({
+        reason: 'exception',
+        data: { className: 'Error', description: 'Error: count mismatch' },
+        callFrames: [
+          createCallFrame({ functionName: 'outer', objectId: 'scope-outer' }),
+          createCallFrame({ functionName: 'inner', objectId: 'scope-inner' })
+        ]
+      });
+
+      // Lookup error stack with 1 frame → frameCount=1, not matching captured frameCount=2
+      const error = new Error('count mismatch');
+      error.stack = 'Error: count mismatch\n    at onlyOne (/app/src/handler.js:10:5)';
+
+      const result = manager.getLocalsWithDiagnostics(error);
+      // Only 1 entry in buffer → unique dropped_count match
+      expect(result.frames).not.toBeNull();
+      expect(result.captureLayer).toBe('identity');
+      expect(result.degradation).toBe('dropped_count');
+      manager.shutdown();
+    });
+  });
+
+  it('matches via background when requestId is null at both capture and lookup', () => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const mock = createInspectorMock({
+      postHandlers: {
+        'Runtime.getProperties': () => ({
+          result: [{ name: 'bg', value: { type: 'number', value: 42 } }]
+        })
+      }
+    });
+
+    withInspectorMock(mock.inspectorModule, () => {
+      const manager = new InspectorManager(createInspectorConfig(), {
+        getRequestId: () => undefined  // no request context
+      });
+      manager.ensureDebuggerActive();
+
+      // Emit with no requestId → stored with requestId=null
+      mock.emitPaused({
+        reason: 'exception',
+        data: { className: 'Error', description: 'Error: bg error' },
+        callFrames: [createCallFrame({ functionName: 'bgFn', objectId: 'scope-bg' })]
+      });
+
+      // Lookup also has no requestId context
+      const error = new Error('bg error');
+      error.stack = 'Error: bg error\n    at bgFn (/app/src/handler.js:10:5)';
+
+      const result = manager.getLocalsWithDiagnostics(error);
+      expect(result.frames).not.toBeNull();
+      expect(result.captureLayer).toBe('identity');
+      expect(result.degradation).toBe('background');
+      manager.shutdown();
+    });
+  });
+
+  it('returns ambiguous_context_less_match when two background entries match', () => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const mock = createInspectorMock({
+      postHandlers: {
+        'Runtime.getProperties': () => ({
+          result: [{ name: 'bg', value: { type: 'number', value: 1 } }]
+        })
+      }
+    });
+
+    withInspectorMock(mock.inspectorModule, () => {
+      const manager = new InspectorManager(createInspectorConfig(), {
+        getRequestId: () => undefined
+      });
+      manager.ensureDebuggerActive();
+
+      // Two identical background captures
+      mock.emitPaused({
+        reason: 'exception',
+        data: { className: 'Error', description: 'Error: bg dup' },
+        callFrames: [createCallFrame({ functionName: 'bgFn', objectId: 'scope-1' })]
+      });
+      mock.emitPaused({
+        reason: 'exception',
+        data: { className: 'Error', description: 'Error: bg dup' },
+        callFrames: [createCallFrame({ functionName: 'bgFn', objectId: 'scope-2' })]
+      });
+
+      const error = new Error('bg dup');
+      error.stack = 'Error: bg dup\n    at bgFn (/app/src/handler.js:10:5)';
+
+      const result = manager.getLocalsWithDiagnostics(error);
+      expect(result.frames).toBeNull();
+      expect(result.missReason).toBe('ambiguous_context_less_match');
+      manager.shutdown();
+    });
+  });
+});
+
 describe('G1 — ring buffer structure', () => {
   it('ERRORCORE_CAPTURE_ID_SYMBOL is Symbol.for-keyed', () => {
     expect(ERRORCORE_CAPTURE_ID_SYMBOL).toBe(Symbol.for('errorcore.v1.captureId'));
