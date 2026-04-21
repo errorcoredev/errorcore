@@ -181,6 +181,16 @@ export class SDKInstance {
     this.patchManager.installAll();
     this.registerProcessHandlers();
 
+    // Eagerly warm the V8 inspector so the first error in the process
+    // actually triggers Debugger.paused. Without this, the inspector is
+    // lazily initialized on the first getLocals() call — by which time
+    // the exception has already propagated past any pause-on-exceptions
+    // handler, so Layer 1 tag installation never runs and the ring buffer
+    // stays empty for that first error.
+    if (this.config.captureLocalVariables) {
+      this.inspector.ensureDebuggerActive();
+    }
+
     if (!this.config.serverless) {
       this.processMetadata.startEventLoopLagMeasurement();
     }
