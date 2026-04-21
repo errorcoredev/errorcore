@@ -197,26 +197,17 @@ describe('Module 08 recorders', () => {
     res.setHeader('content-type', 'application/json');
     res.setHeader('set-cookie', 'hidden');
     recorder.install();
-    const fallbackEmitPatchInstalled = Server.prototype.emit !== originalEmit;
+
+    // Post-fix invariant: emit-patch is always installed, so emit('request')
+    // runs inside als.runWithContext() automatically.
+    expect(Server.prototype.emit).not.toBe(originalEmit);
 
     server.on('request', () => {
       observedRequestId = als.getRequestId();
     });
 
     try {
-      if (fallbackEmitPatchInstalled) {
-        server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
-      } else {
-        const context = (
-          recorder as unknown as {
-            getOrCreateContext(request: IncomingMessage): RequestContext;
-          }
-        ).getOrCreateContext(req as unknown as IncomingMessage);
-
-        als.runWithContext(context, () => {
-          server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
-        });
-      }
+      server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
 
       recorder.handleRequestStart({
         request: req as unknown as IncomingMessage,
@@ -280,13 +271,14 @@ describe('Module 08 recorders', () => {
     try {
       recorder.install();
 
-      const expectedPath =
-        Server.prototype.emit === originalEmit ? 'bindStore' : 'emit-patch';
+      // Post-fix: emit-patch is always installed, so Server.prototype.emit is
+      // always patched. getBindStorePath() reflects whether the bindStore
+      // subscription channel was available — not whether the emit-patch ran.
+      const bindStorePath = recorder.getBindStorePath();
 
-      expect(recorder.getBindStorePath()).toBe(expectedPath);
       expect(emitSpy).toHaveBeenCalledWith(
         'errorcore:init',
-        expect.objectContaining({ path: expectedPath })
+        expect.objectContaining({ path: bindStorePath })
       );
     } finally {
       recorder.shutdown();
@@ -1059,5 +1051,53 @@ describe('G2 — http-client shape: { request } only', () => {
         method: 'POST'
       })
     );
+  });
+});
+
+describe('G2 — ALS context propagation through server.emit', () => {
+  it('propagates ALS to handlers registered via server.on("request")', () => {
+    const config = resolveConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const server = new Server();
+    const originalEmit = Server.prototype.emit;
+    const req = new MockIncomingRequest();
+    const res = new MockServerResponse();
+
+    recorder.install();
+
+    // Invariant under the fix: install() ALWAYS patches Server.prototype.emit,
+    // regardless of bindStore availability. This is the mechanism that makes
+    // ALS available to framework request handlers.
+    expect(Server.prototype.emit).not.toBe(originalEmit);
+
+    let contextInHandler: string | undefined;
+    server.on('request', () => {
+      contextInHandler = als.getRequestId();
+    });
+
+    try {
+      server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
+      expect(contextInHandler).not.toBeUndefined();
+      expect(typeof contextInHandler).toBe('string');
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
+    }
   });
 });

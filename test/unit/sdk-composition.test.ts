@@ -292,17 +292,16 @@ describe('SDK composition', () => {
 
   it('does not patch Server.prototype.emit until activate and restores fallback patch on shutdown', async () => {
     const originalEmit = Server.prototype.emit;
-    const requestStartChannel = channel('http.server.request.start') as {
-      bindStore?: unknown;
-    };
-    const bindStoreAvailable = typeof requestStartChannel.bindStore === 'function';
     const sdk = createTestSDK();
 
     try {
       expect(Server.prototype.emit).toBe(originalEmit);
 
       sdk.activate();
-      expect(Server.prototype.emit === originalEmit).toBe(bindStoreAvailable);
+      // Post-fix (G2): emit-patch is always installed on activate, regardless
+      // of whether bindStore is available — it is the mechanism that propagates
+      // ALS to handlers registered via server.on('request', ...).
+      expect(Server.prototype.emit).not.toBe(originalEmit);
 
       await sdk.shutdown();
       expect(Server.prototype.emit).toBe(originalEmit);

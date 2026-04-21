@@ -240,9 +240,18 @@ export class HttpServerRecorder {
 
   public install(): void {
     this.tryBindStore();
-    if (!this.bindStoreSucceeded) {
-      this.installEmitPatch();
-    }
+    // Always install the emit-patch. bindStore wraps channel subscribers
+    // with store.run() during channel.publish(), but it does NOT set the
+    // ALS for the downstream server.emit('request', req, res) call. As a
+    // result, request handlers registered via server.on('request', ...)
+    // (Next.js, Fastify, any framework that uses the event) run outside
+    // our ALS scope when only bindStore is active. The emit-patch wraps
+    // Server.prototype.emit('request') in als.runWithContext(), which is
+    // the mechanism that makes the context available to those handlers.
+    // bindStore and emit-patch use the same WeakMap<IncomingMessage,
+    // RequestContext> backing store, so they return the same context for
+    // the same request — no double-registration.
+    this.installEmitPatch();
   }
 
   public handleRequestStart(message: {
