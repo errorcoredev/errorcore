@@ -1,13 +1,28 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { existsSync, readFileSync } = vi.hoisted(() => ({
-  existsSync: vi.fn<(p: string) => boolean>(),
-  readFileSync: vi.fn<(p: string, enc?: string) => string>()
-}));
+const {
+  existsSync,
+  readFileSync,
+  realExistsSyncHolder,
+  realReadFileSyncHolder
+} = vi.hoisted(() => {
+  const realExistsSyncHolder: { fn?: (typeof import('node:fs'))['existsSync'] } = {};
+  const realReadFileSyncHolder: { fn?: (typeof import('node:fs'))['readFileSync'] } = {};
+  return {
+    existsSync: vi.fn<(p: string) => boolean>(),
+    readFileSync: vi.fn<(p: string, enc?: string) => string>(),
+    realExistsSyncHolder,
+    realReadFileSyncHolder
+  };
+});
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
+  realExistsSyncHolder.fn = actual.existsSync;
+  realReadFileSyncHolder.fn = actual.readFileSync;
   return { ...actual, existsSync, readFileSync };
 });
 
@@ -84,9 +99,11 @@ describe('SourceMapResolver', () => {
       // Frame at line 10, col 5 => originalPositionFor({line:10, column:4})
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error: boom\n    at minified (/app/dist/bundle.js:10:5)';
-      // First call loads synchronously (cache miss triggers getConsumer inline)
+      // First call: cache miss. statSync fails (mock path) → schedules async warm.
       resolver.resolveStack(stack);
-      // Second call uses the now-populated cache
+      // Wait for background warm to complete.
+      await resolver.flushWarmQueue();
+      // Second call uses the now-populated cache.
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('original.ts:5:11');
@@ -102,6 +119,7 @@ describe('SourceMapResolver', () => {
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error: test\n    at minifiedName (/app/dist/bundle.js:20:3)';
       resolver.resolveStack(stack);
+      await resolver.flushWarmQueue();
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('myFunc (original.ts:5:11)');
@@ -116,6 +134,7 @@ describe('SourceMapResolver', () => {
       // => { source: 'original.ts', line: 5, column: 10, name: null }
       const stack = 'Error: test\n    at /app/dist/bundle.js:20:3';
       resolver.resolveStack(stack);
+      await resolver.flushWarmQueue();
       const result = resolver.resolveStack(stack);
 
       const resolvedLine = result.split('\n')[1];
@@ -143,8 +162,9 @@ describe('SourceMapResolver', () => {
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at fn (/app/dist/bundle.js:1:1)';
 
-      // First call loads synchronously
+      // First call: cache miss, statSync fails (mock path) → schedules async warm
       resolver.resolveStack(stack);
+      await resolver.flushWarmQueue();
       const firstCallCount = readFileSync.mock.calls.length;
 
       // Second call should use cache, no new reads
@@ -158,8 +178,9 @@ describe('SourceMapResolver', () => {
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at fn (/app/dist/missing.js:1:1)';
 
-      // First call loads synchronously and caches missing entry
+      // First call: cache miss → schedules async warm → warm caches missing entry
       resolver.resolveStack(stack);
+      await resolver.flushWarmQueue();
       const firstExistsCount = existsSync.mock.calls.length;
 
       // Second call should use cached missing entry, no new filesystem checks
@@ -177,6 +198,7 @@ describe('SourceMapResolver', () => {
       // line:10, col:5 in frame => resolver passes {line:10, column:4} to consumer
       const stack = 'Error\n    at func (/path/file.js:10:5)';
       resolver.resolveStack(stack);
+      await resolver.flushWarmQueue();
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('myFunc (original.ts:5:11)');
@@ -189,6 +211,7 @@ describe('SourceMapResolver', () => {
       const resolver = new SourceMapResolver();
       const stack = 'Error\n    at /path/file.js:10:5';
       resolver.resolveStack(stack);
+      await resolver.flushWarmQueue();
       const result = resolver.resolveStack(stack);
 
       // name='myFunc' from the map
@@ -228,6 +251,7 @@ describe('SourceMapResolver', () => {
       // => { source: 'original.ts', line: 5, column: 10, name: 'myFunc' }
       const stack = 'Error\n    at fn (/app/dist/bundle.js:1:1)';
       resolver.resolveStack(stack);
+      await resolver.flushWarmQueue();
       const result = resolver.resolveStack(stack);
 
       expect(result).toContain('original.ts:5:11');
@@ -314,9 +338,11 @@ describe('SourceMapResolver', () => {
     it('does not evict missing/corrupt entries during LRU eviction', async () => {
       const resolver = new SourceMapResolver();
 
-      // Insert a missing cache entry first (no .map, no source file)
+      // Insert a missing cache entry first (no .map, no source file).
+      // Await its warm before changing the mock, so it is stored as 'missing'.
       existsSync.mockReturnValue(false);
       resolver.resolveStack('Error\n    at fn (/app/missing-entry.js:1:1)');
+      await resolver.flushWarmQueue();
 
       // Now fill with valid consumer entries up to the limit
       existsSync.mockImplementation((p: string) => p.endsWith('.map'));
@@ -359,6 +385,8 @@ describe('SourceMapResolver', () => {
       const existsSyncSpy = vi.spyOn(fs, 'existsSync').mockImplementation((p) =>
         String(p).endsWith('.map')
       );
+      // statSync is used by fileSizeUnderThreshold; return a small size so we sync-load.
+      vi.spyOn(fs, 'statSync').mockReturnValue({ size: 100 } as ReturnType<typeof fs.statSync>);
       const readFileSyncSpy = vi.spyOn(fs, 'readFileSync').mockReturnValue('not valid json{{{');
       const resolver = new SourceMapResolver();
       const stack = 'Error: x\n    at foo (/fake/file.js:1:1)';
@@ -390,5 +418,96 @@ describe('SourceMapResolver', () => {
       });
       vi.restoreAllMocks();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 16 — Sync-on-miss with 2MB size gate helpers
+// ---------------------------------------------------------------------------
+
+function writeSmallValidSourceMap(): { filePath: string; mapPath: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ec-smap-'));
+  const filePath = path.join(dir, 'file.js');
+  const mapPath = filePath + '.map';
+  fs.writeFileSync(filePath, 'console.log("hi");\n//# sourceMappingURL=file.js.map\n');
+  // Minimal valid source map — maps column 0 line 1 of generated to line 10 col 0 of source.
+  const smap = {
+    version: 3,
+    file: 'file.js',
+    sources: ['webpack://my-app/src/file.ts'],
+    names: [],
+    mappings: 'AAAA'
+  };
+  fs.writeFileSync(mapPath, JSON.stringify(smap));
+  return { filePath, mapPath };
+}
+
+function writeLargeSourceMap(byteSize: number): { filePath: string; mapPath: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ec-smap-'));
+  const filePath = path.join(dir, 'file.js');
+  const mapPath = filePath + '.map';
+  fs.writeFileSync(filePath, 'console.log("hi");\n//# sourceMappingURL=file.js.map\n');
+  const padding = 'A'.repeat(byteSize - 200);
+  const smap = {
+    version: 3,
+    file: 'file.js',
+    sources: ['webpack://my-app/src/file.ts'],
+    names: [],
+    mappings: 'AAAA',
+    _padding: padding
+  };
+  fs.writeFileSync(mapPath, JSON.stringify(smap));
+  return { filePath, mapPath };
+}
+
+describe('G3 — sync-on-miss with size gate', () => {
+  // These tests write real files — forward existsSync/readFileSync to real impls.
+  beforeEach(() => {
+    existsSync.mockImplementation((p) => realExistsSyncHolder.fn!(p));
+    readFileSync.mockImplementation(((p: string, options?: BufferEncoding | null) =>
+      (realReadFileSyncHolder.fn as (p: string, o?: BufferEncoding | null) => string)(p, options)) as typeof readFileSync);
+  });
+
+  afterEach(() => {
+    existsSync.mockReset();
+    readFileSync.mockReset();
+  });
+
+  it('resolves a frame synchronously on the first call when map is under threshold', () => {
+    const { filePath } = writeSmallValidSourceMap();
+    // Use a large threshold so the small map is under it.
+    const resolver = new SourceMapResolver({ sourceMapSyncThresholdBytes: 2 * 1024 * 1024 });
+    const stack = `Error: x\n    at foo (${filePath}:1:1)`;
+    const result = resolver.resolveStack(stack);
+    // The frame should be resolved in the first call (sync-on-miss).
+    expect(result).toContain('webpack://my-app/src/file.ts');
+  });
+
+  it('does not resolve synchronously when map exceeds threshold (schedules async)', async () => {
+    // Create a large map (> 10 bytes threshold used in this test)
+    const { filePath } = writeLargeSourceMap(500);
+    // Tiny threshold so the map is always over it.
+    const resolver = new SourceMapResolver({ sourceMapSyncThresholdBytes: 10 });
+    const stack = `Error: x\n    at foo (${filePath}:1:1)`;
+    const result = resolver.resolveStack(stack);
+    // First call should NOT resolve synchronously (map is over threshold).
+    expect(result).not.toContain('webpack://my-app/src/file.ts');
+    // After flushing the warm queue, the cache is populated.
+    await resolver.flushWarmQueue();
+    const result2 = resolver.resolveStack(stack);
+    expect(result2).toContain('webpack://my-app/src/file.ts');
+  });
+
+  it('threshold 0 always schedules async (never sync-on-miss)', async () => {
+    const { filePath } = writeSmallValidSourceMap();
+    const resolver = new SourceMapResolver({ sourceMapSyncThresholdBytes: 0 });
+    const stack = `Error: x\n    at foo (${filePath}:1:1)`;
+    const result = resolver.resolveStack(stack);
+    // Threshold 0 = always async, first call is unresolved.
+    expect(result).not.toContain('webpack://my-app/src/file.ts');
+    // After flush, resolved.
+    await resolver.flushWarmQueue();
+    const result2 = resolver.resolveStack(stack);
+    expect(result2).toContain('webpack://my-app/src/file.ts');
   });
 });

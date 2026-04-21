@@ -639,7 +639,9 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     );
   }
   const sourceMapResolver = config.resolveSourceMaps
-    ? new SourceMapResolver()
+    ? new SourceMapResolver({
+        sourceMapSyncThresholdBytes: config.sourceMapSyncThresholdBytes
+      })
     : null;
 
   // Pre-populate the source map cache so the first error capture doesn't

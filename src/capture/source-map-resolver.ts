@@ -64,9 +64,9 @@ export class SourceMapResolver {
   }
 
   /**
-   * Resolve stack frames, loading source maps synchronously on cache miss.
-   * Schedules background warming only when fileSizeUnderThreshold is false
-   * (Task 16 hook — in Task 15 all misses are handled synchronously).
+   * Resolve stack frames using source maps. On cache miss, loads synchronously
+   * if the adjacent .map file is within the syncThresholdBytes limit; otherwise
+   * schedules a background warm for the next capture.
    */
   public resolveStack(stack: string): string {
     const lines = stack.split('\n');
@@ -91,17 +91,23 @@ export class SourceMapResolver {
       const effectivePath = this.normalizeWebpackPath(filePath);
 
       if (!this.cache.has(effectivePath)) {
-        // Cache miss: load synchronously, then resolve in this call.
+        // Cache miss: decide sync-on-miss vs async warm based on map file size.
         this.telemetry.cacheMisses++;
-        this.getConsumer(effectivePath);
+        if (this.fileSizeUnderThreshold(effectivePath)) {
+          // Map is small enough — load synchronously so this frame resolves now.
+          this.getConsumer(effectivePath);
+        } else {
+          // Map is large, size unknown, or threshold is 0 — schedule async warm.
+          this.scheduleWarm(effectivePath);
+        }
       }
 
-      // After potential load above, the entry is now in cache (or still absent
-      // for the scheduleWarm/async path introduced in Task 16).
+      // After potential sync load above, check cache.
+      // If we took the async path, the entry may not be here yet.
       const entry = this.cache.get(effectivePath);
 
       if (entry === undefined) {
-        // No entry yet (should not happen in Task 15 but guards Task 16 async path).
+        // Async warm scheduled; frame is unresolved for this capture.
         if (effectivePath !== filePath) {
           if (funcName) {
             resolved.push(`${indent}${funcName} (${effectivePath}:${lineStr}:${colStr})`);
