@@ -344,6 +344,19 @@ export class InspectorManager {
     return this._layer2Lookup(error);
   }
 
+  /**
+   * Layer 2 identity-tuple lookup with three-step degradation cascade.
+   *
+   * With requestId:
+   *   1. Exact match: requestId + errorName + errorMessage + frameCount + structuralHash
+   *   2. Dropped-hash: requestId + errorName + errorMessage + frameCount (if unique → dropped_hash)
+   *   3. Dropped-count: requestId + errorName + errorMessage (if unique → dropped_count)
+   *   Ambiguity at any step → returns missReason='ambiguous_correlation'.
+   *
+   * Without requestId (background errors):
+   *   - Background match: null requestId + errorName + errorMessage + frameCount + structuralHash
+   *   - Multiple matches → missReason='ambiguous_context_less_match' (refuse to guess).
+   */
   private _layer2Lookup(error: Error): LocalsWithDiagnostics {
     const requestId = this.getRequestId() ?? null;
 
