@@ -321,6 +321,11 @@ export interface ErrorPackageParts {
     corrupt: number;
     evictions: number;
   };
+  /** Layer 1/2 telemetry threaded from InspectorManager.getLocalsWithDiagnostics */
+  localVariablesCaptureLayer?: 'tag' | 'identity';
+  localVariablesDegradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'background';
+  /** Layer 3 alignment flag — set by PackageBuilder.build() */
+  localVariablesFrameAlignment?: 'full' | 'prefix_only';
 }
 
 export interface PackageAssemblyResult {

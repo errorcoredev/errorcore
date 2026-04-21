@@ -737,6 +737,86 @@ describe('PackageBuilder', () => {
     expect(pkg.completeness.localVariablesCaptured).toBe(true);
     expect(pkg.completeness.localVariablesTruncated).toBe(true);
   });
+
+  it('Layer 3: marks alignment=full when local frames ≤ rendered stack frames', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'boom',
+        stack: 'Error: boom\n    at handler (/app/src/handler.js:10:5)\n    at process (/app/src/server.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'handler', filePath: '/app/src/handler.js', lineNumber: 10, columnNumber: 5, locals: { x: 1 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 2 rendered frames, 1 local variable frame → no trimming
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+
+  it('Layer 3: trims locals to rendered frame count and marks alignment=prefix_only', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'clipped',
+        stack: 'Error: clipped\n    at outer (/app/src/handler.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'outer', filePath: '/app/src/handler.js', lineNumber: 1, columnNumber: 1, locals: { a: 1 } },
+        { functionName: 'inner', filePath: '/app/src/inner.js', lineNumber: 2, columnNumber: 1, locals: { b: 2 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 1 rendered frame, 2 local frames → trim to 1
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.localVariables?.[0]?.functionName).toBe('outer');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('prefix_only');
+  });
+
+  it('Layer 3: skips trimming when stack has no at-frames (zero rendered count)', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'minimal',
+        stack: 'Error: minimal',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'fn', filePath: '/app/src/fn.js', lineNumber: 1, columnNumber: 1, locals: { z: 1 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 0 rendered frames → no trimming (safe fallback)
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+});
+
+describe('G1 — Layer 3 alignment helpers', () => {
+  it('localVariablesFrameAlignment is undefined when no locals captured', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, { localVariables: null });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesFrameAlignment).toBeUndefined();
+  });
 });
 
 describe('ErrorCapturer', () => {

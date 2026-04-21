@@ -115,6 +115,42 @@ function signSerializedPackage(
   return encryption.sign(serializedPackage);
 }
 
+/**
+ * Count the number of rendered stack frames in an Error.stack string.
+ * Lines starting with "    at " (after trimming) are counted as frames.
+ */
+function countRenderedStackFrames(stack: string): number {
+  if (!stack) return 0;
+  let count = 0;
+  for (const line of stack.split('\n')) {
+    if (line.trim().startsWith('at ')) count++;
+  }
+  return count;
+}
+
+/**
+ * Apply Layer 3 frame-index alignment: if the number of captured local-variable
+ * frames exceeds the rendered stack frame count (e.g., due to custom
+ * prepareStackTrace or Error.captureStackTrace clipping), trim the locals array
+ * to the common prefix and return 'prefix_only'. Otherwise return 'full'.
+ *
+ * If renderedStackFrameCount is 0 (stack has no frame lines, which can happen
+ * with intentionally minimal stacks), we do NOT trim — skipping alignment is safer
+ * than discarding all locals.
+ */
+function alignLocalVariableFrames(
+  locals: import('../types').CapturedFrame[],
+  renderedStackFrameCount: number
+): { aligned: import('../types').CapturedFrame[]; alignment: 'full' | 'prefix_only' } {
+  if (renderedStackFrameCount > 0 && locals.length > renderedStackFrameCount) {
+    return {
+      aligned: locals.slice(0, renderedStackFrameCount),
+      alignment: 'prefix_only'
+    };
+  }
+  return { aligned: locals, alignment: 'full' };
+}
+
 function findLargestBodyEvent(ioTimeline: IOEventSerialized[]): {
   event: IOEventSerialized;
   estimatedBytes: number;
@@ -218,6 +254,19 @@ export class PackageBuilder {
     );
     const serializedEvictionLog = parts.evictionLog.map(serializeEvictionRecord);
 
+    // Layer 3: frame-index alignment between captured locals and rendered stack
+    let alignedLocalVariables = parts.localVariables;
+    let frameAlignment: 'full' | 'prefix_only' | undefined;
+    if (Array.isArray(parts.localVariables) && parts.localVariables.length > 0) {
+      const renderedFrameCount = countRenderedStackFrames(parts.error.stack);
+      const { aligned, alignment } = alignLocalVariableFrames(
+        parts.localVariables,
+        renderedFrameCount
+      );
+      alignedLocalVariables = aligned;
+      frameAlignment = alignment;
+    }
+
     const packageObject: ErrorPackage = {
       schemaVersion: '1.0.0',
       capturedAt: new Date().toISOString(),
@@ -225,7 +274,7 @@ export class PackageBuilder {
       error: {
         ...parts.error
       },
-      localVariables: parts.localVariables ?? undefined,
+      localVariables: alignedLocalVariables ?? undefined,
       request:
         parts.requestContext === undefined
           ? undefined
@@ -261,7 +310,7 @@ export class PackageBuilder {
         ioTimeline: serializedTimeline,
         stateReads: serializedStateReads,
         concurrentRequests: parts.concurrentRequests
-      })
+      }, frameAlignment)
     };
 
     // Early size estimate BEFORE scrubbing. If the raw package is far over
@@ -289,13 +338,13 @@ export class PackageBuilder {
       }).localVariables;
     }
 
-    scrubbedPackage.completeness = this.computeCompleteness(parts, false, scrubbedPackage);
-    this.shedIfNeeded(scrubbedPackage, parts);
+    scrubbedPackage.completeness = this.computeCompleteness(parts, false, scrubbedPackage, frameAlignment);
+    this.shedIfNeeded(scrubbedPackage, parts, frameAlignment);
 
     return scrubbedPackage;
   }
 
-  private shedIfNeeded(pkg: ErrorPackage, parts: ErrorPackageParts): void {
+  private shedIfNeeded(pkg: ErrorPackage, parts: ErrorPackageParts, frameAlignment?: 'full' | 'prefix_only'): void {
     const maxPackageSize = this.config.serialization.maxTotalPackageSize;
     let currentPackageSize = this.getPackageSize(pkg);
 
@@ -349,7 +398,8 @@ export class PackageBuilder {
     pkg.completeness = this.computeCompleteness(
       parts,
       pkg.completeness.encrypted,
-      pkg
+      pkg,
+      frameAlignment
     );
   }
 
@@ -359,7 +409,8 @@ export class PackageBuilder {
     pkg: Pick<
       ErrorPackage,
       'request' | 'ioTimeline' | 'stateReads' | 'localVariables' | 'concurrentRequests'
-    >
+    >,
+    frameAlignment?: 'full' | 'prefix_only'
   ): Completeness {
     const ioPayloadsTruncated = pkg.ioTimeline.reduce((count, event) => {
       return count + Number(event.requestBodyTruncated) + Number(event.responseBodyTruncated);
@@ -385,6 +436,9 @@ export class PackageBuilder {
       encrypted,
       captureFailures: [...parts.captureFailures],
       rateLimiterDrops: parts.rateLimiterDrops,
+      localVariablesCaptureLayer: parts.localVariablesCaptureLayer,
+      localVariablesDegradation: parts.localVariablesDegradation,
+      localVariablesFrameAlignment: frameAlignment ?? parts.localVariablesFrameAlignment,
       sourceMapResolution: parts.sourceMapResolution
     };
   }
