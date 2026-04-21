@@ -205,7 +205,7 @@ describe('pg patch', () => {
 
     await withDriverMocks({ pg: { Client: FakeClient, Pool: FakePool } }, async () => {
       const deps = createDeps();
-      const uninstall = installPgPatch(deps);
+      const { uninstall } = installPgPatch(deps);
       const client = new FakeClient();
       const pool = new FakePool();
       const context = createContext(deps.als, 'req-pg');
@@ -268,7 +268,7 @@ describe('pg patch', () => {
 
     await withDriverMocks({ pg: { Client: FakeClient } }, async () => {
       const deps = createDeps();
-      const uninstall = installPgPatch(deps);
+      const { uninstall } = installPgPatch(deps);
       const client = new FakeClient();
 
       try {
@@ -312,7 +312,7 @@ describe('mysql2 patch', () => {
 
     await withDriverMocks({ mysql2: { Connection: FakeConnection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMysql2Patch(deps);
+      const { uninstall } = installMysql2Patch(deps);
       const connection = new FakeConnection();
       const context = createContext(deps.als, 'req-mysql');
       let callbackRows = 0;
@@ -370,7 +370,7 @@ describe('mysql2 patch', () => {
 
     await withDriverMocks({ mysql2: { Connection: FakeConnection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMysql2Patch(deps);
+      const { uninstall } = installMysql2Patch(deps);
       const connection = new FakeConnection();
 
       try {
@@ -405,7 +405,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
       const context = createContext(deps.als, 'req-redis');
 
@@ -458,7 +458,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
       const context = createContext(deps.als, 'req-redis-auth');
 
@@ -495,7 +495,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
 
       try {
@@ -541,7 +541,7 @@ describe('mongodb patch', () => {
 
     await withDriverMocks({ mongodb: { Collection: FakeCollection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMongodbPatch(deps);
+      const { uninstall } = installMongodbPatch(deps);
       const collection = new FakeCollection();
       const context = createContext(deps.als, 'req-mongo');
 
@@ -594,7 +594,7 @@ describe('mongodb patch', () => {
 
     await withDriverMocks({ mongodb: { Collection: FakeCollection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMongodbPatch(deps);
+      const { uninstall } = installMongodbPatch(deps);
       const collection = new FakeCollection();
 
       try {
@@ -686,7 +686,7 @@ describe('G2 — pg installer with explicit driver', () => {
     };
 
     const deps = { ...createDeps(), explicitDriver: fakePg };
-    const uninstall = installPgPatch(deps);
+    const { uninstall } = installPgPatch(deps);
 
     // The installer must have wrapped the user's own prototype methods.
     expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
@@ -717,7 +717,7 @@ describe('G2 — mongodb installer with explicit driver', () => {
     };
 
     const deps = { ...createDeps(), explicitDriver: fakeMongodb };
-    const uninstall = installMongodbPatch(deps);
+    const { uninstall } = installMongodbPatch(deps);
 
     // The installer must have wrapped the user's own Collection.prototype.find
     expect(fakeMongodb.Collection.prototype.find).not.toBe(originalFind);
@@ -747,7 +747,7 @@ describe('G2 — mysql2 installer with explicit driver', () => {
     };
 
     const deps = { ...createDeps(), explicitDriver: fakeMysql2 };
-    const uninstall = installMysql2Patch(deps);
+    const { uninstall } = installMysql2Patch(deps);
 
     expect(fakeMysql2.Connection.prototype.query).not.toBe(originalQuery);
     expect(fakeMysql2.Connection.prototype.execute).not.toBe(originalExecute);
@@ -782,7 +782,7 @@ describe('G2 — ioredis installer with explicit driver', () => {
     FakeRedis.prototype.sendCommand = originalSendCommand;
 
     const deps = { ...createDeps(), explicitDriver: FakeRedis };
-    const uninstall = installIoredisPatch(deps);
+    const { uninstall } = installIoredisPatch(deps);
 
     expect(FakeRedis.prototype.sendCommand).not.toBe(originalSendCommand);
 

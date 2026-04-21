@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Server } from 'node:http';
 import { channel } from 'node:diagnostics_channel';
 import * as fs from 'node:fs';
@@ -636,5 +636,48 @@ describe('G2 — warn guidance formatting', () => {
     );
     expect(msg).toContain("drivers:");
     expect(msg).toContain("require('mongodb')");
+  });
+});
+
+describe('G2 — startup diagnostic emission', () => {
+  let origLog: typeof console.log;
+  let origWarn: typeof console.warn;
+  let logs: string[];
+
+  beforeEach(() => {
+    logs = [];
+    origLog = console.log;
+    origWarn = console.warn;
+    console.log = (msg: string) => { logs.push(String(msg)); };
+    console.warn = (msg: string) => { logs.push(String(msg)); };
+  });
+  afterEach(() => {
+    console.log = origLog;
+    console.warn = origWarn;
+  });
+
+  it('emits a single summary line when silent is false', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: false
+    });
+    sdk.activate();
+    const line = logs.find((l) => /^\[errorcore\] .* node=.* recorders: /.test(l));
+    expect(line).toBeDefined();
+    expect(line).toContain('http-server=ok');
+    await sdk.shutdown();
+  });
+
+  it('emits nothing matching [errorcore] <version> when silent is true', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true
+    });
+    sdk.activate();
+    const summaryLines = logs.filter((l) => /^\[errorcore\] \d+\.\d+\.\d+ node=/.test(l));
+    expect(summaryLines).toEqual([]);
+    await sdk.shutdown();
   });
 });

@@ -1,5 +1,12 @@
 
 import { resolveConfig } from './config';
+import {
+  detectBundler,
+  isNextJsNodeRuntime,
+  formatStartupLine,
+  formatWarnGuidance,
+  type RecorderState
+} from './sdk-diagnostics';
 import { IOEventBuffer } from './buffer/io-event-buffer';
 import { ALSManager } from './context/als-manager';
 import { RequestTracker } from './context/request-tracker';
@@ -192,6 +199,48 @@ export class SDKInstance {
     }
 
     this.state = 'active';
+
+    if (!this.config.silent) {
+      this.emitStartupDiagnostic();
+    }
+  }
+
+  private emitStartupDiagnostic(): void {
+    const recorders: Record<string, RecorderState> = {
+      'http-server': this.httpServerRecorder.getState(),
+      'http-client': this.httpClientRecorder.getState(),
+      'undici': this.undiciRecorder.getState(),
+      'net': this.netDnsRecorder.getState(),
+      'dns': this.netDnsRecorder.getState(),
+      ...this.patchManager.getRecorderStates(),
+    };
+    // Load version lazily; require('../package.json') depends on the dist layout
+    let version = 'unknown';
+    try {
+      version = (require('../package.json') as { version?: string }).version ?? 'unknown';
+    } catch {
+      // package.json may not be reachable from some bundlers; fall through
+    }
+    const line = formatStartupLine({
+      version,
+      nodeVersion: process.versions.node,
+      recorders,
+    });
+    console.log(line);
+    const isNextJs = isNextJsNodeRuntime();
+    for (const [name, state] of Object.entries(recorders)) {
+      const guidance = formatWarnGuidance(name, state, { isNextJs });
+      if (guidance !== null) console.log(guidance);
+    }
+    if (detectBundler() === 'unknown') {
+      const dbNames = ['pg', 'mongodb', 'mysql2', 'ioredis'];
+      const anyDbOk = dbNames.some((n) => recorders[n]?.state === 'ok');
+      if (anyDbOk) {
+        console.log(
+          "[errorcore]   info: Bundler auto-detection covers webpack only. If DB events don't appear, pass drivers: { pg: require('pg'), ... } to init()."
+        );
+      }
+    }
   }
 
   private drainDeadLetters(): void {

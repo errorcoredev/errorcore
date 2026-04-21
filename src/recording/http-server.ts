@@ -8,6 +8,7 @@ import type { Socket } from 'node:net';
 import type { IOEventSlot, RequestContext, ResolvedConfig } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
+import type { RecorderState } from '../sdk-diagnostics';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -358,6 +359,10 @@ export class HttpServerRecorder {
   public shutdown(): void {
     this.emitPatchRestore?.();
     this.emitPatchRestore = null;
+  }
+
+  public getState(): RecorderState {
+    return { state: 'ok' };
   }
 
   public getBindStorePath(): 'bindStore' | 'emit-patch' {
