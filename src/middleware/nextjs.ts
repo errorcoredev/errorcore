@@ -31,7 +31,33 @@ export function withErrorcore<
     }
 
     if (instance.als.getContext?.() !== undefined) {
-      return handler(req, routeContext);
+      // Nested context (e.g., HttpServerRecorder's emit-patch already set
+      // ALS for this request, or this wrapper is re-entered by a parent
+      // middleware). Do NOT create a sibling context — but DO still capture
+      // thrown errors and status-code rejections. Without this, every error
+      // from handlers running under an existing context would silently fall
+      // through without being captured. [G2]
+      try {
+        const result = await handler(req, routeContext);
+        if (
+          instance.captureError !== undefined &&
+          result != null &&
+          typeof (result as unknown as { status?: unknown }).status === 'number' &&
+          (result as unknown as { status: number }).status >= 500
+        ) {
+          try {
+            const err = new Error(`HTTP ${(result as unknown as { status: number }).status}`);
+            err.name = 'ServerError';
+            instance.captureError(err);
+          } catch {}
+        }
+        return result;
+      } catch (handlerError) {
+        if (instance.captureError !== undefined && handlerError instanceof Error) {
+          try { instance.captureError(handlerError); } catch {}
+        }
+        throw handlerError;
+      }
     }
 
     let context: import('../types').RequestContext;
