@@ -671,3 +671,35 @@ describe('G2 — PatchManager threads drivers config into installers', () => {
     expect(() => pm.unwrapAll()).not.toThrow();
   });
 });
+
+describe('G2 — pg installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalQuery = function originalQuery() { return 'pg-orig'; };
+    const fakePg = {
+      Client: { prototype: { query: originalQuery } },
+      Pool: { prototype: { query: originalQuery } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakePg };
+    const uninstall = installPgPatch(deps);
+
+    // The installer must have wrapped the user's own prototype methods.
+    expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
+    expect(fakePg.Pool.prototype.query).not.toBe(originalQuery);
+
+    uninstall();
+
+    expect(fakePg.Client.prototype.query).toBe(originalQuery);
+    expect(fakePg.Pool.prototype.query).toBe(originalQuery);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installPgPatch(deps)).not.toThrow();
+  });
+});

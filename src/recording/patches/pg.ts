@@ -248,7 +248,7 @@ function instrumentQuery(
 
 export function install(deps: PatchInstallDeps): () => void {
   try {
-    const pg = nodeRequire('pg') as {
+    const pg = (deps.explicitDriver ?? nodeRequire('pg')) as {
       Client?: { prototype?: object };
       Pool?: { prototype?: object };
     };
