@@ -7,7 +7,7 @@ import type { ALSManager } from '../context/als-manager';
 
 const debug = createDebug('capturer');
 import type { RequestTracker } from '../context/request-tracker';
-import type { InspectorManager } from './inspector-manager';
+import type { InspectorManager, LocalsWithDiagnostics } from './inspector-manager';
 import { finalizePackageAssemblyResult } from './package-builder';
 import type { PackageBuilder } from './package-builder';
 import type { ProcessMetadata } from './process-metadata';
@@ -243,7 +243,7 @@ export class ErrorCapturer {
 
       const serializedError = serializeError(error, this.sourceMapResolver);
       const sourceMapTelemetry = this.sourceMapResolver?.consumeTelemetry();
-      const locals = this.safeGetLocals(error, captureFailures);
+      const localsResult = this.safeGetLocals(error, captureFailures);
       const context = this.safeGetContext(captureFailures);
       const usedAmbientEvents = context === undefined;
 
@@ -277,7 +277,9 @@ export class ErrorCapturer {
           cause: serializedError.cause,
           properties: serializedError.properties
         },
-        localVariables: locals,
+        localVariables: localsResult.frames,
+        localVariablesCaptureLayer: localsResult.captureLayer,
+        localVariablesDegradation: localsResult.degradation,
         requestContext: this.toRequestContextData(context),
         ioTimeline,
         evictionLog: this.buffer.getEvictionLog(),
@@ -339,7 +341,10 @@ export class ErrorCapturer {
     }
   }
 
-  private safeGetLocals(error: Error, captureFailures: string[]) {
+  private safeGetLocals(
+    error: Error,
+    captureFailures: string[]
+  ): Pick<LocalsWithDiagnostics, 'frames' | 'captureLayer' | 'degradation'> {
     try {
       const result = this.inspector.getLocalsWithDiagnostics(error);
 
@@ -347,13 +352,17 @@ export class ErrorCapturer {
         captureFailures.push(`locals: ${result.missReason}`);
       }
 
-      return result.frames;
+      return {
+        frames: result.frames,
+        captureLayer: result.captureLayer,
+        degradation: result.degradation
+      };
     } catch (inspectorError) {
       const message =
         inspectorError instanceof Error ? inspectorError.message : String(inspectorError);
 
       captureFailures.push(`locals: ${message}`);
-      return null;
+      return { frames: null };
     }
   }
 

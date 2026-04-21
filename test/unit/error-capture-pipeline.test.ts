@@ -819,6 +819,48 @@ describe('G1 — Layer 3 alignment helpers', () => {
   });
 });
 
+describe('G1 — Layer 1/2/3 telemetry in completeness', () => {
+  it('threads captureLayer and degradation from parts into completeness', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'test',
+        stack: 'Error: test\n    at fn (/app/src/fn.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'fn', filePath: '/app/src/fn.js', lineNumber: 1, columnNumber: 1, locals: { x: 1 } }
+      ],
+      localVariablesCaptureLayer: 'tag',
+      localVariablesDegradation: 'exact'
+    });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesCaptureLayer).toBe('tag');
+    expect(pkg.completeness.localVariablesDegradation).toBe('exact');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+
+  it('threads identity+dropped_hash telemetry into completeness', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      localVariables: null,
+      localVariablesCaptureLayer: 'identity',
+      localVariablesDegradation: 'dropped_hash'
+    });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesCaptureLayer).toBe('identity');
+    expect(pkg.completeness.localVariablesDegradation).toBe('dropped_hash');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBeUndefined();
+  });
+});
+
 describe('ErrorCapturer', () => {
   afterEach(() => {
     vi.restoreAllMocks();
