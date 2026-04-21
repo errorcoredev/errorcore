@@ -967,6 +967,28 @@ describe('InspectorManager', () => {
       expect(result.missReason).toBe('not_available_in_worker');
     });
 
+    it('returns primitive_throw with value type when called with a non-object', () => {
+      const manager = new InspectorManager(createInspectorConfig());
+      // Cast needed since TS enforces Error type on the public API, but V8 can throw anything
+      const result = manager.getLocalsWithDiagnostics(42 as unknown as Error);
+      expect(result.frames).toBeNull();
+      expect(result.missReason).toBe('primitive_throw (value=number)');
+    });
+
+    it('returns primitive_throw for string throws', () => {
+      const manager = new InspectorManager(createInspectorConfig());
+      const result = manager.getLocalsWithDiagnostics('oops' as unknown as Error);
+      expect(result.frames).toBeNull();
+      expect(result.missReason).toBe('primitive_throw (value=string)');
+    });
+
+    it('returns primitive_throw for null throws', () => {
+      const manager = new InspectorManager(createInspectorConfig());
+      const result = manager.getLocalsWithDiagnostics(null as unknown as Error);
+      expect(result.frames).toBeNull();
+      expect(result.missReason).toContain('primitive_throw');
+    });
+
     it('returns Layer 2 identity lookup with captureLayer=identity and degradation=exact', () => {
       createTimerStubs();
       createTimeoutStubs();
