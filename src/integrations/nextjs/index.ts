@@ -27,6 +27,7 @@ export {
 } from '../../index';
 export { withErrorcore } from '../../middleware/nextjs';
 export { withServerAction } from './server-action';
+export { withNextMiddleware } from './middleware';
 
 export type { SDKConfig } from '../../types';
 export type { NextLikeRequest, WithServerActionOptions } from './types';
