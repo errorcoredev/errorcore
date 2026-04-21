@@ -612,6 +612,8 @@ export class InspectorManager {
           .slice(0, this.maxLocalsFrames);
 
         if (appFrames.length === 0) {
+          // Fallback 1: webpack-internal:// hints present but the top frames
+          // have empty URLs. Accept empty-URL frames that have local scope.
           const hasWebpackContext = params.callFrames.some(
             (frame) => frame.url !== undefined && frame.url.startsWith('webpack-internal://')
           );
@@ -623,6 +625,25 @@ export class InspectorManager {
                 (frame.url === '' && frame.scopeChain.some((s) => s.type === 'local'))
               )
               .slice(0, this.maxLocalsFrames);
+          }
+
+          // Fallback 2: in heavily-bundled production builds (Next.js
+          // production, Vite SSR), V8 often reports frame.url as '' for
+          // every frame — no webpack-internal URLs anywhere, no absolute
+          // paths. If at least one frame has a local scope, accept frames
+          // that have local scope as best-effort app frames. This is the
+          // key mechanism that makes Layer 1 Symbol-tagging fire in
+          // bundled environments. Without it, the ring buffer stays empty
+          // and Layer 2 identity fallback can't find a match either.
+          if (appFrames.length === 0) {
+            const hasAnyLocalScope = params.callFrames.some(
+              (frame) => frame.scopeChain.some((s) => s.type === 'local')
+            );
+            if (hasAnyLocalScope) {
+              appFrames = params.callFrames
+                .filter((frame) => frame.scopeChain.some((s) => s.type === 'local'))
+                .slice(0, this.maxLocalsFrames);
+            }
           }
 
           if (appFrames.length === 0) {
