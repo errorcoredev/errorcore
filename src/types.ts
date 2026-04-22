@@ -242,6 +242,7 @@ export interface ProcessMetadata {
 export interface ErrorPackage {
   schemaVersion: '1.0.0';
   capturedAt: string;
+  fingerprint?: string;
   timeAnchor: TimeAnchor;
   error: {
     type: string;
@@ -326,6 +327,7 @@ export interface ErrorPackageParts {
   localVariablesDegradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'background';
   /** Layer 3 alignment flag — set by PackageBuilder.build() */
   localVariablesFrameAlignment?: 'full' | 'prefix_only';
+  fingerprint?: string;
 }
 
 export interface PackageAssemblyResult {
@@ -363,6 +365,36 @@ export type PublicTransportConfig =
       maxBackups?: number;
     };
 
+/**
+ * Codes the SDK emits via `onInternalWarning` for individual backpressure
+ * or drop events. See docs/BACKPRESSURE.md for the full matrix — what each
+ * code means, what the SDK did, and whether data was lost.
+ */
+export type InternalWarningCode =
+  | 'rate_limited'
+  | 'capture_failed'
+  | 'dead_letter_write_failed'
+  | 'dead_letter_full'
+  | 'transport_failed'
+  | 'transport_timeout'
+  | 'disk_full'
+  | 'encryption_key_invalid';
+
+/**
+ * Codes the SDK emits via `onInternalWarning` as periodic aggregates
+ * summarising counts over a flush interval, rather than per-event.
+ */
+export type AggregateWarningCode =
+  | 'errorcore_payloads_dropped'
+  | 'errorcore_payloads_dead_lettered';
+
+export interface InternalWarning {
+  code: InternalWarningCode | AggregateWarningCode;
+  message: string;
+  cause?: unknown;
+  context?: Record<string, unknown>;
+}
+
 export interface SDKConfig {
   bufferSize?: number;
   bufferMaxBytes?: number;
@@ -399,7 +431,7 @@ export interface SDKConfig {
   flushIntervalMs?: number;
   resolveSourceMaps?: boolean;
   serverless?: boolean | 'auto';
-  onInternalWarning?: (warning: { code: string; message: string; count: number }) => void;
+  onInternalWarning?: (warning: InternalWarning) => void;
   drivers?: {
     pg?: unknown;
     mongodb?: unknown;
@@ -447,7 +479,7 @@ export interface ResolvedConfig {
   flushIntervalMs: number;
   resolveSourceMaps: boolean;
   serverless: boolean;
-  onInternalWarning: ((warning: { code: string; message: string; count: number }) => void) | undefined;
+  onInternalWarning: ((warning: InternalWarning) => void) | undefined;
   drivers: {
     pg?: unknown;
     mongodb?: unknown;

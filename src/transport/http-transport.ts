@@ -15,6 +15,13 @@ interface HttpTransportConfig {
 
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [200, 600, 1800];
+
+// Shared with error-capturer.ts so both sides agree on the exact string
+// used to distinguish a timeout from other transport failures. Exported
+// as a const so the dispatcher can classify the thrown error without a
+// magic-string duplication.
+export const HTTP_TRANSPORT_TIMEOUT_MESSAGE = 'HTTP transport timeout';
+
 const INVALID_CERTIFICATE_WARNING =
   '[ErrorCore] HTTPS collector certificate validation is disabled; use allowInvalidCollectorCertificates only for local development.';
 const INVALID_CERTIFICATE_WARNING_FLAG =
@@ -179,7 +186,7 @@ export class HttpTransport {
         });
 
         request.setTimeout(this.timeoutMs, () => {
-          request.destroy(new Error('HTTP transport timeout'));
+          request.destroy(new Error(HTTP_TRANSPORT_TIMEOUT_MESSAGE));
         });
 
         request.write(body);
@@ -200,7 +207,7 @@ export class HttpTransport {
       );
     }
 
-    if (error.message === 'HTTP transport timeout') {
+    if (error.message === HTTP_TRANSPORT_TIMEOUT_MESSAGE) {
       return true;
     }
 

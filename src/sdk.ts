@@ -469,7 +469,7 @@ export class SDKInstance {
         this.config.onInternalWarning({
           code: 'errorcore_payloads_dropped',
           message: `${diagnostics.dropped} error package(s) could not be delivered or dead-lettered`,
-          count: diagnostics.dropped
+          context: { count: diagnostics.dropped }
         });
       } catch {
         // onInternalWarning must never crash the host.
@@ -481,7 +481,7 @@ export class SDKInstance {
         this.config.onInternalWarning({
           code: 'errorcore_payloads_dead_lettered',
           message: `${diagnostics.deadLettered} error package(s) stored in dead-letter queue for retry`,
-          count: diagnostics.deadLettered
+          context: { count: diagnostics.deadLettered }
         });
       } catch {
         // onInternalWarning must never crash the host.
@@ -679,7 +679,16 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
         : new DeadLetterStore(config.deadLetterPath, {
             integrityKey: deadLetterIntegrityKey,
             maxPayloadBytes: config.serialization.maxTotalPackageSize + 16384,
-            requireEncryptedPayload: config.encryptionKey !== undefined
+            requireEncryptedPayload: config.encryptionKey !== undefined,
+            onInternalWarning: config.onInternalWarning === undefined
+              ? undefined
+              : (warning) => {
+                  try {
+                    config.onInternalWarning!(warning);
+                  } catch {
+                    // onInternalWarning must never crash the host.
+                  }
+                }
           })
       : null;
 

@@ -19,6 +19,9 @@ export const TIGHT_LIMITS: SerializationLimits = {
   maxTotalPackageSize: 5242880
 };
 
+const PRIMITIVE_COST = 8;
+const ENTRY_OVERHEAD = 4;
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && typeof error.message === 'string') {
     return error.message;
@@ -45,14 +48,20 @@ function cloneMap(
   currentDepth: number,
   visited: Set<object>,
   budget: CloneBudget
-): { _type: 'Map'; size: number; entries: unknown[][] } {
+): { _type: 'Map'; size: number; entries: unknown[][]; _truncated?: true } {
   const entries: unknown[][] = [];
   let index = 0;
+  let budgetTruncated = false;
 
   for (const [key, entryValue] of value.entries()) {
-    if (index >= limits.maxArrayItems || budget.remaining <= 0) {
+    if (index >= limits.maxArrayItems) {
       break;
     }
+    if (budget.remaining <= 0) {
+      budgetTruncated = true;
+      break;
+    }
+    budget.remaining -= ENTRY_OVERHEAD;
 
     entries.push([
       cloneAndLimitInternal(key, limits, currentDepth + 1, visited, budget),
@@ -61,11 +70,15 @@ function cloneMap(
     index += 1;
   }
 
-  return {
+  const result: { _type: 'Map'; size: number; entries: unknown[][]; _truncated?: true } = {
     _type: 'Map',
     size: value.size,
     entries
   };
+  if (budgetTruncated || value.size > entries.length) {
+    result._truncated = true;
+  }
+  return result;
 }
 
 function cloneSet(
@@ -74,24 +87,34 @@ function cloneSet(
   currentDepth: number,
   visited: Set<object>,
   budget: CloneBudget
-): { _type: 'Set'; size: number; values: unknown[] } {
+): { _type: 'Set'; size: number; values: unknown[]; _truncated?: true } {
   const values: unknown[] = [];
   let index = 0;
+  let budgetTruncated = false;
 
   for (const entryValue of value.values()) {
-    if (index >= limits.maxArrayItems || budget.remaining <= 0) {
+    if (index >= limits.maxArrayItems) {
       break;
     }
+    if (budget.remaining <= 0) {
+      budgetTruncated = true;
+      break;
+    }
+    budget.remaining -= ENTRY_OVERHEAD;
 
     values.push(cloneAndLimitInternal(entryValue, limits, currentDepth + 1, visited, budget));
     index += 1;
   }
 
-  return {
+  const result: { _type: 'Set'; size: number; values: unknown[]; _truncated?: true } = {
     _type: 'Set',
     size: value.size,
     values
   };
+  if (budgetTruncated || value.size > values.length) {
+    result._truncated = true;
+  }
+  return result;
 }
 
 function cloneTypedArray(
@@ -123,27 +146,25 @@ function cloneArray(
   budget: CloneBudget
 ): unknown {
   const itemCount = Math.min(value.length, limits.maxArrayItems);
-  const clonedItems = new Array<unknown>(itemCount);
+  const clonedItems: unknown[] = [];
+  let budgetTruncated = false;
 
   for (let index = 0; index < itemCount; index += 1) {
     if (budget.remaining <= 0) {
-      clonedItems[index] = '[Payload size limit]';
-      continue;
+      budgetTruncated = true;
+      break;
     }
+    budget.remaining -= ENTRY_OVERHEAD;
     try {
-      clonedItems[index] = cloneAndLimitInternal(
-        value[index],
-        limits,
-        currentDepth + 1,
-        visited,
-        budget
+      clonedItems.push(
+        cloneAndLimitInternal(value[index], limits, currentDepth + 1, visited, budget)
       );
     } catch (error) {
-      clonedItems[index] = `[Serialization error: ${getErrorMessage(error)}]`;
+      clonedItems.push(`[Serialization error: ${getErrorMessage(error)}]`);
     }
   }
 
-  if (value.length <= limits.maxArrayItems) {
+  if (value.length <= limits.maxArrayItems && !budgetTruncated) {
     return clonedItems;
   }
 
@@ -173,7 +194,7 @@ function cloneObject(
     }
 
     const key = keys[index];
-    budget.remaining -= key.length;
+    budget.remaining -= ENTRY_OVERHEAD + key.length;
 
     try {
       cloned[key] = cloneAndLimitInternal(
@@ -227,14 +248,17 @@ function cloneAndLimitInternal(
     }
 
     if (value === undefined || value === null) {
+      budget.remaining -= PRIMITIVE_COST;
       return null;
     }
 
     if (typeof value === 'boolean') {
+      budget.remaining -= PRIMITIVE_COST;
       return value;
     }
 
     if (typeof value === 'number') {
+      budget.remaining -= PRIMITIVE_COST;
       return Number.isFinite(value) ? value : null;
     }
 
@@ -248,7 +272,8 @@ function cloneAndLimitInternal(
     }
 
     if (typeof value === 'string') {
-      const result = truncateString(value, limits.maxStringLength);
+      const cap = Math.min(limits.maxStringLength, Math.max(0, budget.remaining));
+      const result = truncateString(value, cap);
       budget.remaining -= result.length;
       return result;
     }

@@ -25,23 +25,21 @@ const REDACTED = '[REDACTED]';
 const DEPTH_LIMIT = '[DEPTH_LIMIT]';
 const MULTIPART_REDACTED = '[MULTIPART BODY OMITTED]';
 
-function resetRegex(pattern: RegExp): RegExp {
-  pattern.lastIndex = 0;
-  return pattern;
-}
-
 function replacePattern(value: string, pattern: RegExp): string {
-  return value.replace(resetRegex(pattern), REDACTED);
+  // .replace() with a /g regex resets lastIndex internally per ECMAScript spec.
+  return value.replace(pattern, REDACTED);
 }
 
 function replaceCreditCards(value: string): string {
-  return value.replace(resetRegex(CREDIT_CARD_REGEX), (match) =>
+  return value.replace(CREDIT_CARD_REGEX, (match) =>
     isValidLuhn(match) ? REDACTED : match
   );
 }
 
 function matchesRegex(pattern: RegExp, value: string): boolean {
-  return resetRegex(pattern).test(value);
+  // Reset lastIndex: .test() on a /g regex uses and advances it. Caller must be synchronous.
+  pattern.lastIndex = 0;
+  return pattern.test(value);
 }
 
 function decodeQueryComponent(value: string): string {
@@ -563,7 +561,9 @@ export class Scrubber {
   }
 
   private scrubString(value: string): string {
-    resetRegex(COMBINED_QUICK_TEST_REGEX);
+    // Reset lastIndex before .test() on the global COMBINED_QUICK_TEST_REGEX.
+    // This function is synchronous end-to-end — do not introduce await between here and the .test() below.
+    COMBINED_QUICK_TEST_REGEX.lastIndex = 0;
     if (!COMBINED_QUICK_TEST_REGEX.test(value)) {
       return looksLikeHighEntropySecret(value) ? REDACTED : value;
     }

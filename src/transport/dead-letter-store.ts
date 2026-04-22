@@ -2,6 +2,20 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import fs = require('node:fs');
 import path = require('node:path');
 
+import { withLockSync } from './file-lock';
+import type { InternalWarning, InternalWarningCode } from '../types';
+
+const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
+
+function classifyDlqWriteErrno(
+  err: unknown
+): 'disk_full' | 'dead_letter_write_failed' {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code !== undefined && DISK_FULL_ERRNO_CODES.has(code)
+    ? 'disk_full'
+    : 'dead_letter_write_failed';
+}
+
 export interface DeadLetterDrainEntry {
   lineNumber: number;
   payload: string;
@@ -37,10 +51,12 @@ interface DeadLetterStoreOptions {
   maxSizeBytes?: number;
   maxPayloadBytes?: number;
   requireEncryptedPayload?: boolean;
-  // Optional callback invoked with a short diagnostic code when the
-  // store fails at a point that was previously swallowed silently.
-  // Intended to be wired into config.onInternalWarning by the SDK.
-  onInternalError?: (code: string, message: string) => void;
+  // Optional callback invoked when the store hits a documented
+  // backpressure condition (size cap, oversized payload, disk-full,
+  // other write errno). Shape matches config.onInternalWarning so the
+  // SDK can forward directly without translation — see
+  // docs/BACKPRESSURE.md for the emission matrix.
+  onInternalWarning?: (warning: InternalWarning) => void;
 }
 
 const DEFAULT_MAX_SIZE_BYTES = 50 * 1024 * 1024;
@@ -76,6 +92,8 @@ function isEncryptedPayloadFormat(payload: string): boolean {
 export class DeadLetterStore {
   private readonly filePath: string;
 
+  private readonly lockPath: string;
+
   private readonly integrityKey: string;
 
   private readonly maxSizeBytes: number;
@@ -84,14 +102,11 @@ export class DeadLetterStore {
 
   private readonly requireEncryptedPayload: boolean;
 
-  private readonly onInternalError?: (code: string, message: string) => void;
+  private readonly onInternalWarning?: (warning: InternalWarning) => void;
 
   // Serialize concurrent clearSent calls inside the same process. Each
-  // call takes the latest promise and chains its work. This removes the
-  // in-process portion of the rename/read/append race. Cross-process
-  // races (the CLI drain running while the SDK runtime appends) remain
-  // best-effort: operators should not run `errorcore drain` concurrently
-  // with a live SDK process against the same file.
+  // call takes the latest promise and chains its work. Cross-process
+  // serialization is handled by the sidecar lockfile (see file-lock.ts).
   private clearChain: Promise<void> = Promise.resolve();
 
   // In-memory pending-payload count. null means "not yet initialized" —
@@ -103,25 +118,41 @@ export class DeadLetterStore {
 
   public constructor(filePath: string, options: DeadLetterStoreOptions) {
     this.filePath = filePath;
+    this.lockPath = filePath + '.lock';
     this.integrityKey = options.integrityKey;
     this.maxSizeBytes = options.maxSizeBytes ?? DEFAULT_MAX_SIZE_BYTES;
     this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.requireEncryptedPayload = options.requireEncryptedPayload ?? false;
-    this.onInternalError = options.onInternalError;
+    this.onInternalWarning = options.onInternalWarning;
   }
 
-  private reportError(code: string, err: unknown): void {
-    const message = err instanceof Error ? err.message : String(err);
-    if (this.onInternalError !== undefined) {
-      try { this.onInternalError(code, message); } catch { /* never break on telemetry */ }
-    } else {
-      console.warn(`[ErrorCore] Dead-letter store ${code}: ${message}`);
+  private reportWarning(
+    warning: InternalWarning & { code: InternalWarningCode | string }
+  ): void {
+    if (this.onInternalWarning !== undefined) {
+      try {
+        this.onInternalWarning(warning as InternalWarning);
+      } catch { /* never break on telemetry */ }
     }
   }
 
+  // Legacy shape kept for non-backpressure diagnostic logs (clearSent
+  // recovery, restore failures). These are not in the backpressure
+  // matrix — they're ops-level hints.
+  private reportError(code: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[ErrorCore] Dead-letter store ${code}: ${message}`);
+  }
+
   public appendPayloadSync(payload: string): boolean {
-    if (getUtf8ByteLength(payload) > this.maxPayloadBytes) {
+    const payloadBytes = getUtf8ByteLength(payload);
+    if (payloadBytes > this.maxPayloadBytes) {
       console.warn('[ErrorCore] Dead-letter payload exceeds maximum size; dropping payload');
+      this.reportWarning({
+        code: 'dead_letter_full',
+        message: `Dead-letter payload exceeds maximum size (${payloadBytes} > ${this.maxPayloadBytes} bytes); dropping payload.`,
+        context: { payloadBytes, maxPayloadBytes: this.maxPayloadBytes, reason: 'oversized_payload' }
+      });
       return false;
     }
 
@@ -201,9 +232,11 @@ export class DeadLetterStore {
 
   public clear(): void {
     try {
-      if (fs.existsSync(this.filePath)) {
-        fs.unlinkSync(this.filePath);
-      }
+      withLockSync(this.lockPath, () => {
+        if (fs.existsSync(this.filePath)) {
+          fs.unlinkSync(this.filePath);
+        }
+      });
       this.pendingPayloadCount = 0;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -214,58 +247,60 @@ export class DeadLetterStore {
   public clearSent(sentLineCount: number): void {
     const tempPath = this.filePath + '.clearing';
 
-    try {
-      // Atomically rename the file so new appendPayloadSync calls create a
-      // fresh file instead of racing with our read-modify-write.
+    withLockSync(this.lockPath, () => {
       try {
-        fs.renameSync(this.filePath, tempPath);
-      } catch (renameError) {
-        // File gone (already cleared or never existed) — nothing to do.
-        if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
-          this.pendingPayloadCount = 0;
-          return;
+        // Atomically rename the file so new appendPayloadSync calls create a
+        // fresh file instead of racing with our read-modify-write.
+        try {
+          fs.renameSync(this.filePath, tempPath);
+        } catch (renameError) {
+          // File gone (already cleared or never existed) — nothing to do.
+          if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
+            this.pendingPayloadCount = 0;
+            return;
+          }
+          throw renameError;
         }
-        throw renameError;
-      }
 
-      const content = fs.readFileSync(tempPath, 'utf8');
-      const lines = content.split('\n').filter((line) => line.length > 0);
+        const content = fs.readFileSync(tempPath, 'utf8');
+        const lines = content.split('\n').filter((line) => line.length > 0);
 
-      if (lines.length > sentLineCount) {
-        const remaining = lines.slice(sentLineCount).join('\n') + '\n';
-        // Write remaining lines back. If a new file was created by
-        // appendPayloadSync in the meantime, append to it.
-        fs.appendFileSync(this.filePath, remaining, {
-          encoding: 'utf8',
-          mode: 0o600
-        });
-      }
-
-      // A successful clearSent invalidates our in-memory counter.
-      // Lazy recount on next getPendingCount() is O(lines) and only
-      // runs rarely (drain-after-failed-send).
-      this.pendingPayloadCount = null;
-
-      try {
-        fs.unlinkSync(tempPath);
-      } catch (unlinkError) {
-        const code = (unlinkError as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') {
-          this.reportError('clearSent_unlink_failed', unlinkError);
+        if (lines.length > sentLineCount) {
+          const remaining = lines.slice(sentLineCount).join('\n') + '\n';
+          // Write remaining lines back. If a new file was created by
+          // appendPayloadSync in the meantime, append to it.
+          fs.appendFileSync(this.filePath, remaining, {
+            encoding: 'utf8',
+            mode: 0o600
+          });
         }
-      }
-    } catch (error) {
-      // If we renamed but failed to process, try to restore the original.
-      try {
-        if (fs.existsSync(tempPath) && !fs.existsSync(this.filePath)) {
-          fs.renameSync(tempPath, this.filePath);
-        }
-      } catch (restoreError) {
-        this.reportError('clearSent_restore_failed', restoreError);
-      }
 
-      this.reportError('clearSent_failed', error);
-    }
+        // A successful clearSent invalidates our in-memory counter.
+        // Lazy recount on next getPendingCount() is O(lines) and only
+        // runs rarely (drain-after-failed-send).
+        this.pendingPayloadCount = null;
+
+        try {
+          fs.unlinkSync(tempPath);
+        } catch (unlinkError) {
+          const code = (unlinkError as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT') {
+            this.reportError('clearSent_unlink_failed', unlinkError);
+          }
+        }
+      } catch (error) {
+        // If we renamed but failed to process, try to restore the original.
+        try {
+          if (fs.existsSync(tempPath) && !fs.existsSync(this.filePath)) {
+            fs.renameSync(tempPath, this.filePath);
+          }
+        } catch (restoreError) {
+          this.reportError('clearSent_restore_failed', restoreError);
+        }
+
+        this.reportError('clearSent_failed', error);
+      }
+    });
   }
 
   public hasPending(): boolean {
@@ -321,30 +356,47 @@ export class DeadLetterStore {
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }
 
-      if (this.exceedsMaxSize()) {
-        console.warn('[ErrorCore] Dead-letter store at capacity; dropping payload');
-        return false;
-      }
+      return withLockSync(this.lockPath, () => {
+        if (this.exceedsMaxSize()) {
+          console.warn('[ErrorCore] Dead-letter store at capacity; dropping payload');
+          this.reportWarning({
+            code: 'dead_letter_full',
+            message: `Dead-letter store at capacity (>= ${this.maxSizeBytes} bytes); dropping payload.`,
+            context: { maxSizeBytes: this.maxSizeBytes, reason: 'size_cap' }
+          });
+          return false;
+        }
 
-      const envelope: DeadLetterEnvelope =
-        input.kind === 'payload'
-          ? {
-              ...input,
-              mac: this.signEnvelope(input)
-            }
-          : {
-              ...input,
-              mac: this.signEnvelope(input)
-            };
+        const envelope: DeadLetterEnvelope =
+          input.kind === 'payload'
+            ? {
+                ...input,
+                mac: this.signEnvelope(input)
+              }
+            : {
+                ...input,
+                mac: this.signEnvelope(input)
+              };
 
-      fs.appendFileSync(this.filePath, JSON.stringify(envelope) + '\n', {
-        encoding: 'utf8',
-        mode: 0o600
+        fs.appendFileSync(this.filePath, JSON.stringify(envelope) + '\n', {
+          encoding: 'utf8',
+          mode: 0o600
+        });
+        return true;
       });
-      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ErrorCore] Dead-letter store append failed: ${message}`);
+      const code = classifyDlqWriteErrno(error);
+      this.reportWarning({
+        code,
+        message:
+          code === 'disk_full'
+            ? `Dead-letter store append failed: out of disk space. Check disk capacity at the dead-letter path.`
+            : `Dead-letter store append failed: ${message}. Check permissions and path at deadLetterPath.`,
+        cause: error,
+        context: { errno: (error as NodeJS.ErrnoException | null)?.code }
+      });
       return false;
     }
   }

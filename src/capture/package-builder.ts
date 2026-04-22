@@ -270,6 +270,7 @@ export class PackageBuilder {
     const packageObject: ErrorPackage = {
       schemaVersion: '1.0.0',
       capturedAt: new Date().toISOString(),
+      fingerprint: parts.fingerprint,
       timeAnchor: { ...parts.timeAnchor },
       error: {
         ...parts.error

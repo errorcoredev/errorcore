@@ -5,11 +5,13 @@ import type { Encryption } from '../security/encryption';
 import type { RateLimiter } from '../security/rate-limiter';
 import type { ALSManager } from '../context/als-manager';
 import type { HealthMetrics } from '../health/health-metrics';
+import { HTTP_TRANSPORT_TIMEOUT_MESSAGE } from '../transport/http-transport';
 
 const debug = createDebug('capturer');
 import type { RequestTracker } from '../context/request-tracker';
 import type { InspectorManager, LocalsWithDiagnostics } from './inspector-manager';
 import { finalizePackageAssemblyResult } from './package-builder';
+import { computeFingerprint } from './fingerprint';
 import type { PackageBuilder } from './package-builder';
 import type { ProcessMetadata } from './process-metadata';
 import type { DeadLetterStore } from '../transport/dead-letter-store';
@@ -21,6 +23,8 @@ import type {
   ErrorPackage,
   ErrorPackageParts,
   ErrorPackageRequestContextData,
+  InternalWarning,
+  InternalWarningCode,
   IOEventSlot,
   PackageAssemblyResult,
   RequestContext,
@@ -64,27 +68,32 @@ export interface CaptureDeliveryDiagnostics {
   dropped: number;
 }
 
-type ErrorCapturerWarningCode =
-  | 'capture_failed'
-  | 'capture_fallback_failed'
-  | 'transport_dispatch_failed'
-  | 'dead_letter_write_failed';
+// Matches Node's ErrnoException codes that indicate the disk refused to
+// accept the write. Used to split generic write failures from
+// out-of-space conditions so operators can route them differently.
+const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
 
-function emitSafeWarning(code: ErrorCapturerWarningCode, detail?: string): void {
-  const suffix = detail ? `: ${detail}` : '';
-  switch (code) {
-    case 'capture_failed':
-      console.warn(`[ErrorCore] Error capture failed${suffix} [code=errorcore_capture_failed]. If this recurs, check onInternalWarning for details.`);
-      return;
-    case 'capture_fallback_failed':
-      console.warn(`[ErrorCore] Error capture fallback failed${suffix} [code=errorcore_capture_fallback_failed]. Both the worker and inline capture paths failed.`);
-      return;
-    case 'transport_dispatch_failed':
-      console.warn(`[ErrorCore] Transport dispatch failed${suffix} [code=errorcore_transport_dispatch_failed]. Payload dead-lettered (if configured). Check collector connectivity.`);
-      return;
-    case 'dead_letter_write_failed':
-      console.warn(`[ErrorCore] Dead-letter store write failed${suffix} [code=errorcore_dead_letter_write_failed]. Check disk space and permissions at deadLetterPath.`);
-      return;
+function classifyDlqWriteErrno(err: unknown): 'disk_full' | 'dead_letter_write_failed' {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code !== undefined && DISK_FULL_ERRNO_CODES.has(code)
+    ? 'disk_full'
+    : 'dead_letter_write_failed';
+}
+
+function emitSafeWarning(
+  config: ResolvedConfig,
+  warning: InternalWarning & { code: InternalWarningCode }
+): void {
+  // Preserve the human-readable console output so existing log-scraping
+  // and tests don't regress. The structured callback is the new channel.
+  console.warn(`[ErrorCore] ${warning.message}`);
+
+  if (config.onInternalWarning !== undefined) {
+    try {
+      config.onInternalWarning(warning);
+    } catch {
+      // onInternalWarning must never crash the host.
+    }
   }
 }
 
@@ -242,6 +251,10 @@ export class ErrorCapturer {
       if (!this.rateLimiter.tryAcquire()) {
         debug('capture() rate-limited, dropping');
         this.healthMetrics?.recordDroppedRateLimited();
+        emitSafeWarning(this.config, {
+          code: 'rate_limited',
+          message: `Rate limit exceeded (${this.config.rateLimitPerMinute} per ${this.config.rateLimitWindowMs}ms); error dropped.`
+        });
         return null;
       }
 
@@ -274,6 +287,7 @@ export class ErrorCapturer {
       const concurrentRequests = this.requestTracker.getSummaries();
       const stateTrackingEnabled =
         stateReads.length > 0 || this.stateTrackerStatus?.isTrackingEnabled() === true;
+      const fingerprint = computeFingerprint(error, localsResult.frames ?? []);
       const parts: ErrorPackageParts = {
         error: {
           type: serializedError.type,
@@ -286,6 +300,7 @@ export class ErrorCapturer {
         localVariables: localsResult.frames,
         localVariablesCaptureLayer: localsResult.captureLayer,
         localVariablesDegradation: localsResult.degradation,
+        fingerprint,
         requestContext: this.toRequestContextData(context),
         ioTimeline,
         evictionLog: this.buffer.getEvictionLog(),
@@ -334,7 +349,12 @@ export class ErrorCapturer {
         captureError instanceof Error
           ? `${captureError.name}: ${captureError.message.slice(0, 200)}`
           : 'unknown';
-      emitSafeWarning('capture_failed', detail);
+      emitSafeWarning(this.config, {
+        code: 'capture_failed',
+        message: `Error capture failed: ${detail} [code=errorcore_capture_failed]. If this recurs, check onInternalWarning for details.`,
+        cause: captureError,
+        context: { stage: 'primary', detail }
+      });
       this.healthMetrics?.recordDroppedCaptureFailed();
 
       if (this.deadLetterStore !== null) {
@@ -456,8 +476,12 @@ export class ErrorCapturer {
       try {
         this.captureInline(parts);
       } catch (fallbackError) {
-        void fallbackError;
-        emitSafeWarning('capture_fallback_failed');
+        emitSafeWarning(this.config, {
+          code: 'capture_failed',
+          message: 'Error capture fallback failed [code=errorcore_capture_fallback_failed]. Both the worker and inline capture paths failed.',
+          cause: fallbackError,
+          context: { stage: 'fallback' }
+        });
       }
     }
   }
@@ -478,7 +502,23 @@ export class ErrorCapturer {
             ? transportError.message
             : String(transportError);
 
-        emitSafeWarning('transport_dispatch_failed');
+        const isTimeout =
+          transportError instanceof Error &&
+          transportError.message === HTTP_TRANSPORT_TIMEOUT_MESSAGE;
+        // Console-safe message — do NOT interpolate the transport error
+        // text here because it can legitimately contain authorization
+        // fragments or user-supplied URLs (see
+        // test/unit/error-capture-pipeline "emits sanitized warning
+        // codes"). The raw reason is still delivered to
+        // onInternalWarning via `context.reason` and `cause`.
+        emitSafeWarning(this.config, {
+          code: isTimeout ? 'transport_timeout' : 'transport_failed',
+          message: isTimeout
+            ? 'Transport timeout [code=errorcore_transport_timeout]. Payload dead-lettered (if configured). Check collector connectivity.'
+            : 'Transport dispatch failed [code=errorcore_transport_dispatch_failed]. Payload dead-lettered (if configured). Check collector connectivity.',
+          cause: transportError,
+          context: { reason }
+        });
         this.healthMetrics?.recordFlushLatency(Date.now() - start);
         this.healthMetrics?.recordTransportFailure(reason, Date.now());
 
@@ -488,12 +528,28 @@ export class ErrorCapturer {
             if (stored) {
               this.deliveryDiagnostics.deadLettered += 1;
             } else {
+              // DLQ declined the write (size cap / oversized payload).
+              // The store has already emitted its own `dead_letter_full`
+              // warning via the onInternalWarning hook wired at SDK
+              // construction — don't double-emit here.
               this.deliveryDiagnostics.dropped += 1;
               this.healthMetrics?.recordDroppedDlqWriteFailed();
             }
           } catch (dlError) {
-            void dlError;
-            emitSafeWarning('dead_letter_write_failed');
+            const code = classifyDlqWriteErrno(dlError);
+            emitSafeWarning(this.config, {
+              code,
+              // Console message is sanitized (errno only; no raw
+              // exception text). Structured details on the callback.
+              message:
+                code === 'disk_full'
+                  ? 'Dead-letter store write failed: out of disk space [code=errorcore_disk_full]. Check disk capacity at deadLetterPath.'
+                  : 'Dead-letter store write failed [code=errorcore_dead_letter_write_failed]. Check disk space and permissions at deadLetterPath.',
+              cause: dlError,
+              context: {
+                errno: (dlError as NodeJS.ErrnoException | null)?.code
+              }
+            });
             this.deliveryDiagnostics.dropped += 1;
             this.healthMetrics?.recordDroppedDlqWriteFailed();
           }

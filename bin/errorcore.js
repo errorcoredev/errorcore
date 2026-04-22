@@ -396,6 +396,8 @@ async function cmdDrain(flags) {
   }
 
   const { DeadLetterStore } = requireDist(path.join('transport', 'dead-letter-store.js'));
+  const { withLockSync } = requireDist(path.join('transport', 'file-lock.js'));
+  const lockPath = deadLetterPath + '.lock';
   const store = new DeadLetterStore(deadLetterPath, { integrityKey });
   const { entries, lineCount: snapshotLineCount } = store.drain();
 
@@ -458,33 +460,41 @@ async function cmdDrain(flags) {
     }
   }
 
-  if (failures === 0) {
-    const currentContent = fs.readFileSync(deadLetterPath, 'utf8');
-    const currentLines = currentContent.split('\n').filter((l) => l.length > 0);
-    if (currentLines.length <= snapshotLineCount) {
-      fs.unlinkSync(deadLetterPath);
+  withLockSync(lockPath, () => {
+    if (failures === 0) {
+      const currentContent = fs.readFileSync(deadLetterPath, 'utf8');
+      const currentLines = currentContent.split('\n').filter((l) => l.length > 0);
+      if (currentLines.length <= snapshotLineCount) {
+        fs.unlinkSync(deadLetterPath);
+      } else {
+        const remaining = currentLines.slice(snapshotLineCount).join('\n') + '\n';
+        fs.writeFileSync(deadLetterPath, remaining, { encoding: 'utf8', mode: 0o600 });
+      }
     } else {
-      const remaining = currentLines.slice(snapshotLineCount).join('\n') + '\n';
-      fs.writeFileSync(deadLetterPath, remaining, { encoding: 'utf8', mode: 0o600 });
-    }
-    process.stdout.write('\n' + green(`All ${payloads.length} payload(s) sent. Dead-letter store cleared.`) + '\n');
-  } else {
-    const currentContent = fs.readFileSync(deadLetterPath, 'utf8');
-    const currentLines = currentContent.split('\n').filter((l) => l.length > 0);
-    const kept = [];
-    for (let i = 0; i < snapshotLineCount && i < currentLines.length; i++) {
-      if (failedLineIndices.has(i)) {
+      const currentContent = fs.readFileSync(deadLetterPath, 'utf8');
+      const currentLines = currentContent.split('\n').filter((l) => l.length > 0);
+      const kept = [];
+      for (let i = 0; i < snapshotLineCount && i < currentLines.length; i++) {
+        if (failedLineIndices.has(i)) {
+          kept.push(currentLines[i]);
+        }
+      }
+      for (let i = snapshotLineCount; i < currentLines.length; i++) {
         kept.push(currentLines[i]);
       }
+      if (kept.length === 0) {
+        if (fs.existsSync(deadLetterPath)) fs.unlinkSync(deadLetterPath);
+      } else {
+        fs.writeFileSync(deadLetterPath, kept.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+      }
     }
-    for (let i = snapshotLineCount; i < currentLines.length; i++) {
-      kept.push(currentLines[i]);
-    }
-    if (kept.length === 0) {
-      if (fs.existsSync(deadLetterPath)) fs.unlinkSync(deadLetterPath);
-    } else {
-      fs.writeFileSync(deadLetterPath, kept.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
-    }
+  });
+
+  if (failures === 0) {
+    process.stdout.write('\n' + green(`All ${payloads.length} payload(s) sent. Dead-letter store cleared.`) + '\n');
+  } else {
+    // process.exit() skips finally blocks; emit message and exit AFTER the
+    // lock has been released by withLockSync above.
     process.stdout.write('\n' + red(`${failures} payload(s) failed. Sent payloads removed from store; failed entries retained.`) + '\n');
     process.exit(1);
   }
