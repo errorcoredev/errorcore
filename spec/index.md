@@ -61,6 +61,7 @@ Modules MUST be implemented in this exact order. Each module depends only on mod
 | 14 | [14-transport](14-transport.md) | `src/transport/transport.ts`, `src/transport/http-transport.ts`, `src/transport/file-transport.ts`, `src/transport/stdout-transport.ts` | 01, 05 |
 | 15 | [15-middleware](15-middleware.md) | `src/middleware/express.ts`, `src/middleware/fastify.ts`, `src/middleware/koa.ts`, `src/middleware/hapi.ts`, `src/middleware/raw-http.ts` | 01, 06 |
 | 16 | [16-sdk-composition](16-sdk-composition.md) | `src/sdk.ts`, `src/index.ts` | ALL prior modules |
+| 18 | [18-health-metrics](18-health-metrics.md) | `src/health/health-metrics.ts`, `src/health/types.ts` | 13, 14, 16 |
 
 ---
 
@@ -127,6 +128,10 @@ src/
     koa.ts
     hapi.ts
     raw-http.ts
+
+  health/
+    health-metrics.ts         — Cumulative counters + latency ring for getHealth()
+    types.ts                  — HealthSnapshot public interface
 ```
 
 ---

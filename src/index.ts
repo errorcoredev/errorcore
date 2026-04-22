@@ -1,6 +1,7 @@
 // Copyright 2026 ErrorCore Dev — PolyForm Small Business 1.0.0 — see LICENSE.md
 
 import type { SDKConfig } from './types';
+import type { HealthSnapshot } from './health/types';
 import { SDKInstance, createSDK } from './sdk';
 import { resetMiddlewareWarning } from './middleware/common';
 
@@ -167,6 +168,21 @@ export async function shutdown(): Promise<void> {
   resetMiddlewareWarning();
 }
 
+/**
+ * Returns a point-in-time snapshot of SDK self-observability state, or
+ * `null` when the SDK has not been initialized. Intended for /healthz
+ * endpoints.
+ *
+ * @example
+ * app.get('/healthz', (_, res) => {
+ *   res.json(errorcore.getHealth() ?? { initialized: false });
+ * });
+ */
+export function getHealth(): HealthSnapshot | null {
+  const instance = getGlobalInstance();
+  return instance === null ? null : instance.getHealth();
+}
+
 export { createSDK };
 export { expressMiddleware } from './middleware/express';
 export { fastifyPlugin } from './middleware/fastify';
@@ -179,6 +195,7 @@ export { wrapLambda, wrapServerless } from './middleware/lambda';
 export type { SDKConfig, ErrorPackage, Completeness, ResolvedConfig } from './types';
 export type { SDKInstance } from './sdk';
 export type { LambdaContext } from './middleware/lambda';
+export type { HealthSnapshot } from './health/types';
 
 /**
  * @internal

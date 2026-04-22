@@ -4,6 +4,7 @@ import { createDebug } from '../debug';
 import type { Encryption } from '../security/encryption';
 import type { RateLimiter } from '../security/rate-limiter';
 import type { ALSManager } from '../context/als-manager';
+import type { HealthMetrics } from '../health/health-metrics';
 
 const debug = createDebug('capturer');
 import type { RequestTracker } from '../context/request-tracker';
@@ -185,6 +186,8 @@ export class ErrorCapturer {
 
   private readonly watchdog: { notifyErrorCaptured(error: Error): void } | null;
 
+  private readonly healthMetrics: HealthMetrics | null;
+
   private readonly pendingTransportDispatches = new Set<Promise<void>>();
 
   private readonly deliveryDiagnostics: CaptureDeliveryDiagnostics = {
@@ -210,6 +213,7 @@ export class ErrorCapturer {
     deadLetterStore?: DeadLetterStore | null;
     sourceMapResolver?: SourceMapResolver | null;
     watchdog?: { notifyErrorCaptured(error: Error): void } | null;
+    healthMetrics?: HealthMetrics | null;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
@@ -227,6 +231,7 @@ export class ErrorCapturer {
     this.deadLetterStore = deps.deadLetterStore ?? null;
     this.sourceMapResolver = deps.sourceMapResolver ?? null;
     this.watchdog = deps.watchdog ?? null;
+    this.healthMetrics = deps.healthMetrics ?? null;
   }
 
   public capture(error: Error, _options?: { isUncaught?: boolean }): ErrorPackage | null {
@@ -236,6 +241,7 @@ export class ErrorCapturer {
       debug(`capture() called for ${error.name}: ${error.message}`);
       if (!this.rateLimiter.tryAcquire()) {
         debug('capture() rate-limited, dropping');
+        this.healthMetrics?.recordDroppedRateLimited();
         return null;
       }
 
@@ -329,6 +335,7 @@ export class ErrorCapturer {
           ? `${captureError.name}: ${captureError.message.slice(0, 200)}`
           : 'unknown';
       emitSafeWarning('capture_failed', detail);
+      this.healthMetrics?.recordDroppedCaptureFailed();
 
       if (this.deadLetterStore !== null) {
         try {
@@ -401,6 +408,10 @@ export class ErrorCapturer {
     return snapshot;
   }
 
+  public getPendingTransportCount(): number {
+    return this.pendingTransportDispatches.size;
+  }
+
   private toRequestContextData(
     context: RequestContext | undefined
   ): ErrorPackageRequestContextData | undefined {
@@ -452,14 +463,24 @@ export class ErrorCapturer {
   }
 
   private dispatchTransport(payload: string): void {
+    this.healthMetrics?.recordCaptured();
+    const start = Date.now();
+
     let sendPromise = Promise.resolve()
       .then(() => this.transport.send(payload))
       .then(() => {
         this.deliveryDiagnostics.sent += 1;
+        this.healthMetrics?.recordFlushLatency(Date.now() - start);
       })
       .catch((transportError) => {
-        void transportError;
+        const reason =
+          transportError instanceof Error
+            ? transportError.message
+            : String(transportError);
+
         emitSafeWarning('transport_dispatch_failed');
+        this.healthMetrics?.recordFlushLatency(Date.now() - start);
+        this.healthMetrics?.recordTransportFailure(reason, Date.now());
 
         if (this.deadLetterStore !== null) {
           try {
@@ -468,14 +489,20 @@ export class ErrorCapturer {
               this.deliveryDiagnostics.deadLettered += 1;
             } else {
               this.deliveryDiagnostics.dropped += 1;
+              this.healthMetrics?.recordDroppedDlqWriteFailed();
             }
           } catch (dlError) {
             void dlError;
             emitSafeWarning('dead_letter_write_failed');
             this.deliveryDiagnostics.dropped += 1;
+            this.healthMetrics?.recordDroppedDlqWriteFailed();
           }
         } else {
+          // No DLQ configured — the payload is gone. Same health bucket
+          // as a DLQ write failure because both mean "no durable place
+          // to park this for retry."
           this.deliveryDiagnostics.dropped += 1;
+          this.healthMetrics?.recordDroppedDlqWriteFailed();
         }
       })
       .finally(() => {

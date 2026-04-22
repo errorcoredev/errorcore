@@ -1,7 +1,7 @@
 {
   "name": "errorcore",
   "version": "0.2.0",
-  "description": "Lightweight error monitoring SDK for Node.js — captures errors with full I/O context, local variables, and request replay data",
+  "description": "Lightweight error monitoring SDK for Node.js. Captures errors with full I/O context, local variables, and request replay data",
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

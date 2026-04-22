@@ -1151,4 +1151,82 @@ describe('DeadLetterStore', async () => {
 
     writer.clear();
   });
+
+  describe('getPendingCount', () => {
+    it('returns 0 on a fresh store with no backing file', () => {
+      const store = new DeadLetterStore(tmpPath(), { integrityKey: 'test-secret' });
+
+      expect(store.getPendingCount()).toBe(0);
+    });
+
+    it('increments on successful appendPayloadSync', () => {
+      const filePath = tmpPath();
+      const store = new DeadLetterStore(filePath, { integrityKey: 'test-secret' });
+
+      store.appendPayloadSync('{"a":1}');
+      store.appendPayloadSync('{"a":2}');
+      store.appendPayloadSync('{"a":3}');
+
+      expect(store.getPendingCount()).toBe(3);
+
+      store.clear();
+    });
+
+    it('does not count failure markers as pending payloads', () => {
+      const filePath = tmpPath();
+      const store = new DeadLetterStore(filePath, { integrityKey: 'test-secret' });
+
+      store.appendPayloadSync('{"p":1}');
+      store.appendFailureMarkerSync('capture_failed');
+      store.appendFailureMarkerSync('capture_failed');
+
+      expect(store.getPendingCount()).toBe(1);
+
+      store.clear();
+    });
+
+    it('returns 0 after clear()', () => {
+      const filePath = tmpPath();
+      const store = new DeadLetterStore(filePath, { integrityKey: 'test-secret' });
+
+      store.appendPayloadSync('{"p":1}');
+      store.appendPayloadSync('{"p":2}');
+
+      expect(store.getPendingCount()).toBe(2);
+
+      store.clear();
+
+      expect(store.getPendingCount()).toBe(0);
+    });
+
+    it('reflects the surviving line count after clearSent drains a prefix', () => {
+      const filePath = tmpPath();
+      const store = new DeadLetterStore(filePath, { integrityKey: 'test-secret' });
+
+      store.appendPayloadSync('{"p":1}');
+      store.appendPayloadSync('{"p":2}');
+      store.appendPayloadSync('{"p":3}');
+
+      expect(store.getPendingCount()).toBe(3);
+
+      store.clearSent(2);
+
+      expect(store.getPendingCount()).toBe(1);
+
+      store.clear();
+    });
+
+    it('lazy-initializes by scanning an existing file from a previous process', () => {
+      const filePath = tmpPath();
+      const writer = new DeadLetterStore(filePath, { integrityKey: 'test-secret' });
+      writer.appendPayloadSync('{"a":1}');
+      writer.appendPayloadSync('{"a":2}');
+
+      const reader = new DeadLetterStore(filePath, { integrityKey: 'test-secret' });
+
+      expect(reader.getPendingCount()).toBe(2);
+
+      reader.clear();
+    });
+  });
 });

@@ -1,6 +1,6 @@
 # Errorcore
 
-![errorcore](banner.png)
+![errorcore](https://raw.githubusercontent.com/errorcoredev/errorcore/main/banner.png)
 
 Error monitoring with execution context for Node.js.
 
@@ -76,9 +76,9 @@ Generate a key: `node -e "console.log(require('crypto').randomBytes(32).toString
 
 Errorcore records DB query events differently depending on your runtime environment.
 
-**Tier 1 — Plain Node.js** (Express, Fastify, Koa, NestJS, raw `http`): automatic. No config needed. All recorders install against the same `require()` graph the app uses.
+**Tier 1: Plain Node.js** (Express, Fastify, Koa, NestJS, raw `http`): automatic. No config needed. All recorders install against the same `require()` graph the app uses.
 
-**Tier 2 — Single-graph bundlers** (Vite SSR, esbuild, plain webpack): automatic if the driver is not tree-shaken, or pass explicit references:
+**Tier 2: Single-graph bundlers** (Vite SSR, esbuild, plain webpack): automatic if the driver is not tree-shaken, or pass explicit references:
 
 ```ts
 errorcore.init({
@@ -86,7 +86,7 @@ errorcore.init({
 });
 ```
 
-**Tier 3 — Next.js App Router**: externalize drivers from the webpack bundle:
+**Tier 3: Next.js App Router**: externalize drivers from the webpack bundle:
 
 ```js
 // next.config.js
@@ -95,7 +95,7 @@ module.exports = {
 };
 ```
 
-Without this, the DB timeline will not populate — the startup diagnostic will report `warn(bundled-unpatched)`. HTTP inbound, HTTP outbound, and `fetch` (undici) recording work in all three tiers.
+Without this, the DB timeline will not populate. The startup diagnostic will report `warn(bundled-unpatched)`. HTTP inbound, HTTP outbound, and `fetch` (undici) recording work in all three tiers.
 
 ## Startup diagnostic
 
@@ -105,7 +105,7 @@ At startup, errorcore prints one line listing the state of each recorder:
 [errorcore] 0.2.0 node=20.11.0 recorders: http-server=ok http-client=ok undici=ok net=ok dns=ok pg=skip(not-installed) mongodb=warn(bundled-unpatched) mysql2=skip(not-installed) ioredis=skip(not-installed)
 ```
 
-Three states: `ok` (active), `skip(<reason>)` (intentionally inactive — no action needed), `warn(<reason>)` (wanted to install but couldn't — action required). When warns are present, the output grows to 3–6 lines with one actionable guidance line per warn state. Suppress the entire block with `config.silent: true`.
+Three states: `ok` (active), `skip(<reason>)` (intentionally inactive, no action needed), `warn(<reason>)` (wanted to install but couldn't, action required). When warns are present, the output grows to 3–6 lines with one actionable guidance line per warn state. Suppress the entire block with `config.silent: true`.
 
 ## Next.js middleware capture
 
@@ -140,8 +140,8 @@ errorcore.init({
 
 Report vulnerabilities via issues or privately.
 
-Encryption key rotation support lands in 0.2. On 0.1.x, use a single stable `encryptionKey` — changing the key invalidates HMAC integrity checks on existing dead-letter entries.
+Encryption key rotation is not yet supported in 0.2.x. Use a single stable `encryptionKey`. Changing the key invalidates HMAC integrity checks on existing dead-letter entries. Rotation is tracked for a later release.
 
 ## License
 
-[PolyForm Small Business 1.0.0](LICENSE.md) — free for individuals and companies under $1M revenue. Commercial license required above that threshold.
+[PolyForm Small Business 1.0.0](LICENSE.md). Free for individuals and companies under $1M revenue. Commercial license required above that threshold.

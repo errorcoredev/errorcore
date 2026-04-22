@@ -425,7 +425,7 @@ async function cmdDrain(flags) {
   if (transportType === 'stdout') {
     process.stdout.write(
       yellow('WARNING: ') +
-      'Transport is stdout \u2014 payloads will be printed to terminal, not re-delivered to a collector. ' +
+      'Transport is stdout. Payloads will be printed to terminal, not re-delivered to a collector. ' +
       'Switch to file or http transport to re-send to your collector.\n'
     );
   }

@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format is based on
 to Semantic Versioning once it reaches 1.0.0; until then, breaking changes may
 ship in any minor release and are called out under the BREAKING heading.
 
+## Unreleased
+
+### Added
+
+- `errorcore.getHealth()` and `SDKInstance.getHealth()` return a
+  `HealthSnapshot` POJO for `/healthz`-style endpoints. The snapshot
+  reports monotonic counters (`captured`, `dropped` with a per-bucket
+  `droppedBreakdown`, `transportFailures`), current gauges
+  (`transportQueueDepth`, `deadLetterDepth`, `ioBufferDepth`), rolling
+  P50/P99 of per-payload transport latency, and the most recent
+  transport-failure reason with its timestamp. Counters are cumulative
+  since `init()` and never reset by `getHealth()` — operators scrape on
+  an interval and compute rates by differencing, matching the
+  Prometheus counter convention. Dead-lettered payloads are not
+  counted as dropped; only errors that will never reach a collector
+  (rate-limited, capture-failed, dead-letter write failed) increment
+  `dropped`.
+
 ## 0.2.0 (2026-04-21)
 
 Coordinated P0+P1+P2 production readiness pass. Several defaults tightened,

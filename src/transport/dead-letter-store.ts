@@ -94,6 +94,13 @@ export class DeadLetterStore {
   // with a live SDK process against the same file.
   private clearChain: Promise<void> = Promise.resolve();
 
+  // In-memory pending-payload count. null means "not yet initialized" —
+  // the first getPendingCount() / hasPending() call after construction
+  // lazily scans the backing file. Writers then maintain it in-place.
+  // Markers are not counted here: they're diagnostics, not payloads to
+  // retry.
+  private pendingPayloadCount: number | null = null;
+
   public constructor(filePath: string, options: DeadLetterStoreOptions) {
     this.filePath = filePath;
     this.integrityKey = options.integrityKey;
@@ -118,12 +125,23 @@ export class DeadLetterStore {
       return false;
     }
 
-    return this.appendEnvelopeSync({
+    // Initialize the in-memory count before writing so the lazy scan
+    // doesn't read the newly-appended line as if it were pre-existing
+    // state. Order matters: init, then append, then increment.
+    this.ensurePendingCountInitialized();
+
+    const ok = this.appendEnvelopeSync({
       version: 1,
       kind: 'payload',
       storedAt: new Date().toISOString(),
       payload
     });
+
+    if (ok) {
+      this.pendingPayloadCount = (this.pendingPayloadCount ?? 0) + 1;
+    }
+
+    return ok;
   }
 
   public appendFailureMarkerSync(code: string): boolean {
@@ -186,6 +204,7 @@ export class DeadLetterStore {
       if (fs.existsSync(this.filePath)) {
         fs.unlinkSync(this.filePath);
       }
+      this.pendingPayloadCount = 0;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ErrorCore] Dead-letter store clear failed: ${message}`);
@@ -203,6 +222,7 @@ export class DeadLetterStore {
       } catch (renameError) {
         // File gone (already cleared or never existed) — nothing to do.
         if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
+          this.pendingPayloadCount = 0;
           return;
         }
         throw renameError;
@@ -220,6 +240,11 @@ export class DeadLetterStore {
           mode: 0o600
         });
       }
+
+      // A successful clearSent invalidates our in-memory counter.
+      // Lazy recount on next getPendingCount() is O(lines) and only
+      // runs rarely (drain-after-failed-send).
+      this.pendingPayloadCount = null;
 
       try {
         fs.unlinkSync(tempPath);
@@ -249,6 +274,39 @@ export class DeadLetterStore {
       return stats.size > 0;
     } catch {
       return false;
+    }
+  }
+
+  public getPendingCount(): number {
+    this.ensurePendingCountInitialized();
+    return this.pendingPayloadCount ?? 0;
+  }
+
+  private ensurePendingCountInitialized(): void {
+    if (this.pendingPayloadCount !== null) {
+      return;
+    }
+
+    try {
+      if (!fs.existsSync(this.filePath)) {
+        this.pendingPayloadCount = 0;
+        return;
+      }
+
+      const content = fs.readFileSync(this.filePath, 'utf8');
+      const lines = content.split('\n').filter((line) => line.length > 0);
+
+      let payloadCount = 0;
+      for (const line of lines) {
+        const envelope = this.parseEnvelope(line);
+        if (envelope !== null && envelope.kind === 'payload') {
+          payloadCount += 1;
+        }
+      }
+
+      this.pendingPayloadCount = payloadCount;
+    } catch {
+      this.pendingPayloadCount = 0;
     }
   }
 

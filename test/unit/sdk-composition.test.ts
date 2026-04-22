@@ -681,3 +681,228 @@ describe('G2 — startup diagnostic emission', () => {
     await sdk.shutdown();
   });
 });
+
+describe('SDKInstance.getHealth', () => {
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+
+  beforeEach(() => {
+    // Silence the stdout transport so test output stays readable.
+    // Must preserve the callback contract — StdoutTransport awaits it.
+    process.stdout.write = ((
+      _chunk: unknown,
+      arg2?: unknown,
+      arg3?: unknown
+    ): boolean => {
+      const cb = typeof arg2 === 'function' ? arg2 : arg3;
+      if (typeof cb === 'function') {
+        (cb as (err?: Error | null) => void)();
+      }
+      return true;
+    }) as typeof process.stdout.write;
+  });
+
+  afterEach(async () => {
+    process.stdout.write = originalStdoutWrite;
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  function makeSDK(overrides: Record<string, unknown> = {}) {
+    return createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      useWorkerAssembly: false,
+      serverless: true, // skip event-loop-lag timer
+      ...overrides
+    });
+  }
+
+  it('returns zeros and nulls on a fresh SDK with no captures', () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(0);
+      expect(health.dropped).toBe(0);
+      expect(health.droppedBreakdown).toEqual({
+        rateLimited: 0,
+        captureFailed: 0,
+        deadLetterWriteFailed: 0
+      });
+      expect(health.transportFailures).toBe(0);
+      expect(health.transportQueueDepth).toBe(0);
+      expect(health.deadLetterDepth).toBe(0);
+      expect(health.ioBufferDepth).toBe(0);
+      expect(health.flushLatencyP50).toBe(0);
+      expect(health.flushLatencyP99).toBe(0);
+      expect(health.lastFailureReason).toBeNull();
+      expect(health.lastFailureAt).toBeNull();
+    } finally {
+      void sdk.shutdown();
+    }
+  });
+
+  it('counts each successful capture and records a flush latency sample', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('boom-1'));
+      sdk.captureError(new Error('boom-2'));
+      sdk.captureError(new Error('boom-3'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(3);
+      expect(health.dropped).toBe(0);
+      expect(health.transportFailures).toBe(0);
+      expect(health.lastFailureReason).toBeNull();
+      expect(health.flushLatencyP50).toBeGreaterThanOrEqual(0);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('monotonicity: repeated reads return equal counter values when nothing changes', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('one'));
+      await sdk.flush();
+
+      const first = sdk.getHealth();
+      const second = sdk.getHealth();
+
+      expect(second.captured).toBe(first.captured);
+      expect(second.dropped).toBe(first.dropped);
+      expect(second.transportFailures).toBe(first.transportFailures);
+      expect(second.droppedBreakdown).toEqual(first.droppedBreakdown);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('invariant: dropped === sum of the three droppedBreakdown buckets', async () => {
+    const sdk = makeSDK({ rateLimitPerMinute: 1 });
+    sdk.activate();
+    try {
+      // One acquires, one is rate-limited.
+      sdk.captureError(new Error('a'));
+      sdk.captureError(new Error('b'));
+      sdk.captureError(new Error('c'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+      const sum =
+        health.droppedBreakdown.rateLimited +
+        health.droppedBreakdown.captureFailed +
+        health.droppedBreakdown.deadLetterWriteFailed;
+
+      expect(health.dropped).toBe(sum);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('rate-limit overflow increments droppedBreakdown.rateLimited, not captured', async () => {
+    const sdk = makeSDK({ rateLimitPerMinute: 1 });
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('first'));
+      sdk.captureError(new Error('limited-1'));
+      sdk.captureError(new Error('limited-2'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(1);
+      expect(health.droppedBreakdown.rateLimited).toBe(2);
+      expect(health.dropped).toBe(2);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('records transport rejections as transportFailures and surfaces the last reason', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    vi.spyOn(sdk.transport, 'send').mockRejectedValue(new Error('collector offline'));
+    try {
+      sdk.captureError(new Error('boom'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(1);
+      expect(health.transportFailures).toBe(1);
+      expect(health.lastFailureReason).toContain('collector offline');
+      expect(health.lastFailureAt).toBeTypeOf('number');
+      // No DLQ configured -> the payload is genuinely lost.
+      expect(health.dropped).toBe(1);
+      expect(health.droppedBreakdown.deadLetterWriteFailed).toBe(1);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('dead-letters transport failures when a dead-letter store is configured, without counting them as dropped', async () => {
+    const dlqPath = path.join(
+      os.tmpdir(),
+      `errorcore-health-dlq-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    // 64 hex chars = 32 bytes, matches crypto.randomBytes(32).toString('hex').
+    // Using a fixed, high-entropy key keeps the test deterministic and passes
+    // the Shannon entropy gate in resolveConfig.
+    const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const sdk = makeSDK({
+      encryptionKey: hexKey,
+      deadLetterPath: dlqPath,
+      allowUnencrypted: false
+    });
+    sdk.activate();
+    vi.spyOn(sdk.transport, 'send').mockRejectedValue(new Error('collector offline'));
+    try {
+      sdk.captureError(new Error('boom'));
+      sdk.captureError(new Error('boom-2'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(2);
+      expect(health.transportFailures).toBe(2);
+      expect(health.deadLetterDepth).toBe(2);
+      expect(health.dropped).toBe(0);
+    } finally {
+      await sdk.shutdown();
+      try { fs.unlinkSync(dlqPath); } catch { /* best-effort */ }
+    }
+  });
+});
+
+describe('module-level getHealth()', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  it('returns null before init()', async () => {
+    const mod = await import('../../src/index');
+    expect(mod.getHealth()).toBeNull();
+  });
+
+  it('returns a HealthSnapshot after init()', async () => {
+    init({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      useWorkerAssembly: false,
+      serverless: true
+    });
+    const mod = await import('../../src/index');
+    const health = mod.getHealth();
+    expect(health).not.toBeNull();
+    expect(health!.captured).toBe(0);
+  });
+});

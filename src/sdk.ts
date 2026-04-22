@@ -31,6 +31,8 @@ import { ErrorCapturer } from './capture/error-capturer';
 import { PackageAssemblyDispatcher } from './capture/package-assembly-dispatcher';
 import { SourceMapResolver } from './capture/source-map-resolver';
 import { WatchdogManager } from './middleware/watchdog';
+import { HealthMetrics } from './health/health-metrics';
+import type { HealthSnapshot } from './health/types';
 import type { RequestContext, ResolvedConfig, SDKConfig, TransportConfig } from './types';
 
 type SDKState = 'created' | 'active' | 'shutting_down' | 'shutdown';
@@ -121,6 +123,8 @@ export class SDKInstance {
 
   private readonly watchdog: WatchdogManager | null;
 
+  private readonly healthMetrics: HealthMetrics;
+
   public constructor(input: {
     config: ResolvedConfig;
     buffer: IOEventBuffer;
@@ -140,6 +144,7 @@ export class SDKInstance {
     netDnsRecorder: NetDnsRecorder;
     deadLetterStore: DeadLetterStore | null;
     watchdog: WatchdogManager | null;
+    healthMetrics: HealthMetrics;
   }) {
     this.config = input.config;
     this.buffer = input.buffer;
@@ -159,6 +164,7 @@ export class SDKInstance {
     this.netDnsRecorder = input.netDnsRecorder;
     this.deadLetterStore = input.deadLetterStore;
     this.watchdog = input.watchdog;
+    this.healthMetrics = input.healthMetrics;
   }
 
   public activate(): void {
@@ -367,6 +373,42 @@ export class SDKInstance {
 
   public getWatchdog(): WatchdogManager | null {
     return this.watchdog;
+  }
+
+  /**
+   * Returns a point-in-time snapshot of the SDK's self-observability
+   * state. Safe to call from any SDK state, including before activate()
+   * and after shutdown(). Never throws.
+   *
+   * Counters (captured, dropped, droppedBreakdown.*, transportFailures)
+   * are monotonic since init(). Operators scrape this on an interval
+   * and compute rates by differencing — matching the Prometheus counter
+   * convention.
+   *
+   * Typical use:
+   *   app.get('/healthz', (_, res) => res.json(errorcore.getHealth()));
+   */
+  public getHealth(): HealthSnapshot {
+    const breakdown = this.healthMetrics.getDroppedBreakdown();
+    const lastFailure = this.healthMetrics.getLastFailure();
+    const bufferStats = this.buffer.getStats();
+
+    return {
+      captured: this.healthMetrics.getCaptured(),
+      dropped:
+        breakdown.rateLimited +
+        breakdown.captureFailed +
+        breakdown.deadLetterWriteFailed,
+      droppedBreakdown: breakdown,
+      transportFailures: this.healthMetrics.getTransportFailures(),
+      transportQueueDepth: this.errorCapturer.getPendingTransportCount(),
+      deadLetterDepth: this.deadLetterStore?.getPendingCount() ?? 0,
+      ioBufferDepth: bufferStats.slotCount,
+      flushLatencyP50: this.healthMetrics.getLatencyPercentile(0.5),
+      flushLatencyP99: this.healthMetrics.getLatencyPercentile(0.99),
+      lastFailureReason: lastFailure.reason,
+      lastFailureAt: lastFailure.at
+    };
   }
 
   public async shutdown(): Promise<void> {
@@ -668,6 +710,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     watchdog.start();
   }
 
+  const healthMetrics = new HealthMetrics();
+
   const errorCapturer = new ErrorCapturer({
     buffer,
     als,
@@ -684,7 +728,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     stateTrackerStatus: stateTracker,
     deadLetterStore,
     sourceMapResolver,
-    watchdog
+    watchdog,
+    healthMetrics
   });
 
   return new SDKInstance({
@@ -705,6 +750,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     undiciRecorder,
     netDnsRecorder,
     deadLetterStore,
-    watchdog
+    watchdog,
+    healthMetrics
   });
 }
