@@ -69,4 +69,11 @@ describe('errorcore/nextjs edge stub', () => {
     const wrapped = m.withServerAction(action);
     expect(await wrapped(41)).toBe(42);
   });
+
+  it('withNextMiddleware is passthrough in Edge stub', async () => {
+    const inner = async (req: { ok: boolean }) => req.ok;
+    const { withNextMiddleware } = await import(EDGE_MODULE);
+    const wrapped = withNextMiddleware(inner);
+    await expect(wrapped({ ok: true })).resolves.toBe(true);
+  });
 });

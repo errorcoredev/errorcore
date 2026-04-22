@@ -5,13 +5,22 @@ All notable changes to this project are documented here. The format is based on
 to Semantic Versioning once it reaches 1.0.0; until then, breaking changes may
 ship in any minor release and are called out under the BREAKING heading.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-04-21)
 
-Coordinated P0+P1 production readiness pass. Several defaults tightened and
-unsafe implicit behaviors removed.
+Coordinated P0+P1+P2 production readiness pass. Several defaults tightened,
+unsafe implicit behaviors removed, and three previously-dark features restored
+(local variables capture, IO timeline recording, source-map resolution).
 
-### BREAKING
+### Breaking (pre-1.0 semver window)
 
+- **Config**: `allowInsecureTransport: true` is rejected with an error pointing
+  at `allowPlainHttpTransport: true`. `allowInsecureTransport: false` is
+  accepted as a silent no-op with a one-time deprecation warning.
+  `allowInsecureTransport: true` combined with `allowPlainHttpTransport: false`
+  is rejected as a contradiction. Deprecated in 0.2.0, will be removed in
+  1.0.0. [G4]
+- **Startup output**: a single diagnostic line is printed at `activate()`
+  listing recorder states. Suppress with `config.silent: true`.
 - `init()` no longer auto-loads `./errorcore.config.js` from the current
   working directory. Callers must pass configuration explicitly, for example
   `errorcore.init(require('./errorcore.config.js'))`. The previous behavior
@@ -25,10 +34,6 @@ unsafe implicit behaviors removed.
   their own payloads by pulling the HMAC key out of the Encryption instance
   now call `encryption.sign(serializedPayload)` instead. The HMAC key never
   leaves the Encryption instance.
-- `allowInsecureTransport` is removed. It was a silent alias for
-  `allowPlainHttpTransport`. `resolveConfig` throws a clear error if the
-  removed name is passed. `ResolvedConfig.allowInsecureTransport` is no
-  longer emitted.
 - `encryptionKey` validation raises the minimum character-diversity (Shannon
   entropy) from 2.0 to 3.5 bits per character. A uniformly random 32-byte
   hex key scores ~3.93 so `crypto.randomBytes(32).toString('hex')` still
@@ -46,9 +51,38 @@ unsafe implicit behaviors removed.
   unchanged, so signatures remain bitwise identical to the previous external
   `createHmac('sha256', getHmacKeyHex()).update(...).digest('base64')`
   formulation. Existing signed dead-letter entries still verify.
+- `withNextMiddleware(middleware)` — wrap a Next.js middleware handler to start
+  an ALS context, capture thrown errors, and optionally capture non-2xx
+  responses. Propagates context into the wrapped route handler. `undefined`
+  returns are always pass-through. [C1]
+- `captureMiddlewareStatusCodes: number[] | 'none' | 'all'` config — control
+  which middleware-returned status codes are captured. Default `'none'`. [C1]
+- `drivers: { pg?, mongodb?, mysql2?, ioredis? }` config — explicit driver
+  references for bundled environments where `require()` does not reach the
+  same module instance the app uses. [G2]
+- `silent: boolean` config — suppress the startup diagnostic block.
+- `sourceMapSyncThresholdBytes: number` config (default 2 MB) — maps larger
+  than this threshold resolve asynchronously to avoid cold-cascade event-loop
+  blocking. Setting to `0` restores pre-0.2.0 fully-async behavior. [G3]
+- Three-state recorder telemetry in the startup block: `ok`, `skip(<reason>)`,
+  `warn(<reason>)`, with per-warn actionable guidance lines.
+- `completeness.localVariablesCaptureLayer`, `completeness.localVariablesDegradation`,
+  `completeness.localVariablesFrameAlignment`, and `completeness.sourceMapResolution`
+  fields for production dashboard visibility into capture path and degradation.
 
 ### Fixed
 
+- Local variables now capture correctly in bundled environments (Next.js,
+  Vite SSR, webpack). Inspector locals are correlated via a non-enumerable
+  Symbol tag on the exception object (Layer 1), with identity-tuple fallback
+  (Layer 2) and frame-index alignment (Layer 3). [G1]
+- HTTP inbound and outbound recorders no longer early-return on missing
+  `socket` in diagnostic-channel payloads. HTTP server, HTTP client, and
+  undici now subscribe against real Node channel shapes per supported version.
+  [G2 shape audit]
+- Source-map resolution is consistent from the first capture. Cache misses
+  load synchronously on the normal capture path (up to the 2 MB size gate);
+  `uncaughtException`/`SIGTERM` paths remain cache-only. [G3]
 - `errorcore validate` no longer prints the configured `encryptionKey` to
   stdout. The resolved-config dump now renders a `(set, hidden)` sentinel
   for `encryptionKey`, `apiKey`, `token`, `dsn`, and `password` fields. The
@@ -157,6 +191,23 @@ unsafe implicit behaviors removed.
   `/proc/self/mountinfo` reads at 64 KB using an fd-based bounded
   read so unusually large container-stack hierarchies do not block
   SDK init.
+
+### Docs
+
+- `spec/17-nextjs-integration.md` expanded with Tier 1/2/3 guidance,
+  `serverExternalPackages` recommendation, Edge capture pattern, and
+  `withNextMiddleware` reference.
+- README mirrors the three-tier block and documents the 3–6-line verbose
+  startup output and Next.js middleware usage.
+
+### Deferred (tracked in followups.md)
+
+- Byte-size budget for source-map cache (secondary eviction criterion beyond
+  count-of-128).
+- Per-`activate()` lifetime sync-parse budget with fallback-to-async after
+  exhaustion.
+- `parseTimeoutMs` for source-map parse abort.
+- 1.0.0 release concurrent with ingestion-backend commercial availability.
 
 ### Security (additional)
 

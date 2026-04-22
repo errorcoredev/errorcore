@@ -49,6 +49,7 @@ module.exports = {
   // before deploying to production.
   allowUnencrypted: true,
 
+  // allowInsecureTransport: removed in 0.2.0, see CHANGELOG — use allowPlainHttpTransport
   allowPlainHttpTransport: false,
 
   // Local-development only. This disables TLS certificate validation for HTTPS collectors.

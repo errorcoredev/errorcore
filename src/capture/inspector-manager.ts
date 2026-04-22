@@ -1,13 +1,134 @@
 
 import path = require('node:path');
+import { createHash } from 'node:crypto';
 
 import type { CapturedFrame, ResolvedConfig } from '../types';
 import { looksLikeHighEntropySecret } from '../pii/scrubber';
 
+export const ERRORCORE_CAPTURE_ID_SYMBOL = Symbol.for('errorcore.v1.captureId');
+
+export interface LocalsRingBufferEntry {
+  id: string;
+  requestId: string | null;
+  errorName: string;
+  errorMessage: string;
+  frameCount: number;
+  structuralHash: string;
+  frames: CapturedFrame[];
+  createdAt: number;
+}
+
+export class LocalsRingBuffer {
+  private readonly capacity: number;
+  private readonly entries: LocalsRingBufferEntry[] = [];
+  private nextId = 0;
+
+  public constructor(capacity: number) {
+    this.capacity = capacity;
+  }
+
+  public allocateId(): string {
+    return String(++this.nextId);
+  }
+
+  public push(entry: LocalsRingBufferEntry): void {
+    this.entries.push(entry);
+    while (this.entries.length > this.capacity) this.entries.shift();
+  }
+
+  public getById(id: string): LocalsRingBufferEntry | undefined {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      if (this.entries[i].id === id) return this.entries[i];
+    }
+    return undefined;
+  }
+
+  public findByIdentity(key: {
+    requestId: string | null;
+    errorName: string;
+    errorMessage: string;
+    frameCount: number;
+    structuralHash: string;
+  }): LocalsRingBufferEntry | undefined {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const e = this.entries[i];
+      if (
+        e.requestId === key.requestId &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage &&
+        e.frameCount === key.frameCount &&
+        e.structuralHash === key.structuralHash
+      ) {
+        return e;
+      }
+    }
+    return undefined;
+  }
+
+  public findByDegradedKey(key: {
+    requestId: string | null;
+    errorName: string;
+    errorMessage: string;
+    frameCount: number;
+  }): LocalsRingBufferEntry[] {
+    const out: LocalsRingBufferEntry[] = [];
+    for (const e of this.entries) {
+      if (
+        e.requestId === key.requestId &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage &&
+        e.frameCount === key.frameCount
+      ) out.push(e);
+    }
+    return out;
+  }
+
+  public findByLooseKey(key: {
+    requestId: string | null;
+    errorName: string;
+    errorMessage: string;
+  }): LocalsRingBufferEntry[] {
+    return this.entries.filter(
+      (e) =>
+        e.requestId === key.requestId &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage
+    );
+  }
+
+  public findBackgroundMatches(key: {
+    errorName: string;
+    errorMessage: string;
+    frameCount: number;
+    structuralHash: string;
+  }): LocalsRingBufferEntry[] {
+    return this.entries.filter(
+      (e) =>
+        e.requestId === null &&
+        e.errorName === key.errorName &&
+        e.errorMessage === key.errorMessage &&
+        e.frameCount === key.frameCount &&
+        e.structuralHash === key.structuralHash
+    );
+  }
+}
+
+export function computeStructuralHash(
+  frames: ReadonlyArray<{ functionName: string }>
+): string {
+  const joined = frames.map((f) => f.functionName || '<anonymous>').join('\u241F');
+  return createHash('sha1').update(joined).digest('hex');
+}
+
+export function countCallFrames(
+  frames: ReadonlyArray<{ functionName: string }>
+): number {
+  return frames.length;
+}
+
 const SENSITIVE_VAR_RE =
   /password|passwd|secret|token|key|auth|credential|ssn|social.*security|credit.*card|card.*number|cvv|cvc|expir/i;
 const STRING_LIMIT = 2048;
-const CACHE_TTL_MS = 30000;
 const DEBUGGER_IDLE_TIMEOUT_MS = 30000;
 const SDK_ROOT = path.resolve(__dirname, '..').replace(/\\/g, '/');
 
@@ -66,18 +187,6 @@ interface PausedEventParams {
   callFrames: CallFrame[];
 }
 
-interface AppFrameLocation {
-  filePath: string;
-  lineNumber: number;
-  columnNumber: number;
-}
-
-interface CachedLocalsEntry {
-  frames: CapturedFrame[] | null;
-  timestamp: number;
-  ambiguous: boolean;
-}
-
 interface InspectorManagerDeps {
   getRequestId?: () => string | undefined;
 }
@@ -92,6 +201,13 @@ interface MissedCollection {
 }
 
 const MAX_MISSED_COLLECTION_LOG = 20;
+
+export interface LocalsWithDiagnostics {
+  frames: CapturedFrame[] | null;
+  missReason: string | null;
+  captureLayer?: 'tag' | 'identity';
+  degradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'background';
+}
 
 export class InspectorManager {
   private readonly maxCollectionsPerSecond: number;
@@ -110,13 +226,11 @@ export class InspectorManager {
 
   private session: InspectorSession | null = null;
 
-  private readonly cache = new Map<string, CachedLocalsEntry>();
+  private readonly ringBuffer: LocalsRingBuffer;
 
   private collectionCountThisSecond = 0;
 
   private rateLimitTimer: NodeJS.Timeout | null = null;
-
-  private cacheSweepTimer: NodeJS.Timeout | null = null;
 
   private debuggerIdleTimer: NodeJS.Timeout | null = null;
 
@@ -132,6 +246,7 @@ export class InspectorManager {
     this.maxLocalsFrames = config.maxLocalsFrames;
     this.captureLocalVariables = config.captureLocalVariables;
     this.getRequestId = deps.getRequestId ?? (() => undefined);
+    this.ringBuffer = new LocalsRingBuffer(config.maxCachedLocals);
 
     if (this.captureLocalVariables) {
       this.available = true;
@@ -171,10 +286,6 @@ export class InspectorManager {
         this.collectionCountThisSecond = 0;
       }, 1000);
       this.rateLimitTimer.unref();
-      this.cacheSweepTimer = setInterval(() => {
-        this._sweepCache();
-      }, 10000);
-      this.cacheSweepTimer.unref();
       return true;
     } catch {
       this.available = false;
@@ -189,7 +300,7 @@ export class InspectorManager {
 
   public getLocalsWithDiagnostics(
     error: Error
-  ): { frames: CapturedFrame[] | null; missReason: string | null } {
+  ): LocalsWithDiagnostics {
     if (!this.captureLocalVariables) {
       return { frames: null, missReason: null };
     }
@@ -198,37 +309,139 @@ export class InspectorManager {
       return { frames: null, missReason: 'not_available' };
     }
 
+    if (!this.isMainThread()) {
+      return { frames: null, missReason: 'not_available_in_worker' };
+    }
+
+    if (error == null || typeof error !== 'object') {
+      return {
+        frames: null,
+        missReason: `primitive_throw (value=${typeof error})`
+      };
+    }
+
     this.ensureDebuggerActive();
 
     if (!this.initialized) {
       return { frames: null, missReason: 'not_initialized' };
     }
 
-    const requestId = this.getRequestId() ?? '__no_context__';
-
-    const appFrame = this._extractFirstAppFrameFromStack(error.stack);
-
-    if (appFrame === null) {
-      return { frames: null, missReason: 'no_app_frame_key' };
+    // Layer 1: Symbol tag lookup
+    const taggedId = (error as unknown as Record<symbol, unknown>)[ERRORCORE_CAPTURE_ID_SYMBOL];
+    if (typeof taggedId === 'string') {
+      const entry = this.ringBuffer.getById(taggedId);
+      if (entry !== undefined) {
+        return {
+          frames: entry.frames,
+          missReason: null,
+          captureLayer: 'tag',
+          degradation: 'exact'
+        };
+      }
     }
 
-    const key = this._buildCorrelationKey(requestId, appFrame);
-    const entry = this.cache.get(key);
+    // Layer 2: identity-tuple lookup
+    return this._layer2Lookup(error);
+  }
 
-    if (entry !== undefined) {
-      this.cache.delete(key);
+  /**
+   * Layer 2 identity-tuple lookup with three-step degradation cascade.
+   *
+   * With requestId:
+   *   1. Exact match: requestId + errorName + errorMessage + frameCount + structuralHash
+   *   2. Dropped-hash: requestId + errorName + errorMessage + frameCount (if unique → dropped_hash)
+   *   3. Dropped-count: requestId + errorName + errorMessage (if unique → dropped_count)
+   *   Ambiguity at any step → returns missReason='ambiguous_correlation'.
+   *
+   * Without requestId (background errors):
+   *   - Background match: null requestId + errorName + errorMessage + frameCount + structuralHash
+   *   - Multiple matches → missReason='ambiguous_context_less_match' (refuse to guess).
+   */
+  private _layer2Lookup(error: Error): LocalsWithDiagnostics {
+    const requestId = this.getRequestId() ?? null;
 
-      if (entry.ambiguous) {
+    const errorName = error.name || 'Error';
+    const errorMessage = error.message || '';
+    const stackFunctions = parseStackForFunctionNames(error.stack);
+    const frameCount = stackFunctions.length;
+    const structuralHash = computeStructuralHash(stackFunctions);
+
+    if (requestId !== null) {
+      // Exact key
+      const exact = this.ringBuffer.findByIdentity({
+        requestId,
+        errorName,
+        errorMessage,
+        frameCount,
+        structuralHash
+      });
+      if (exact !== undefined) {
+        return {
+          frames: exact.frames,
+          missReason: null,
+          captureLayer: 'identity',
+          degradation: 'exact'
+        };
+      }
+
+      // Dropped-hash: match without structuralHash
+      const degradedMatches = this.ringBuffer.findByDegradedKey({
+        requestId,
+        errorName,
+        errorMessage,
+        frameCount
+      });
+      if (degradedMatches.length === 1) {
+        return {
+          frames: degradedMatches[0].frames,
+          missReason: null,
+          captureLayer: 'identity',
+          degradation: 'dropped_hash'
+        };
+      }
+      if (degradedMatches.length > 1) {
         return { frames: null, missReason: 'ambiguous_correlation' };
       }
 
-      if (entry.frames !== null) {
-        return { frames: entry.frames, missReason: null };
+      // Dropped-count: match without frameCount or structuralHash
+      const looseMatches = this.ringBuffer.findByLooseKey({
+        requestId,
+        errorName,
+        errorMessage
+      });
+      if (looseMatches.length === 1) {
+        return {
+          frames: looseMatches[0].frames,
+          missReason: null,
+          captureLayer: 'identity',
+          degradation: 'dropped_count'
+        };
+      }
+      if (looseMatches.length > 1) {
+        return { frames: null, missReason: 'ambiguous_correlation' };
+      }
+    } else {
+      // Background match (no request context)
+      const bgMatches = this.ringBuffer.findBackgroundMatches({
+        errorName,
+        errorMessage,
+        frameCount,
+        structuralHash
+      });
+      if (bgMatches.length === 1) {
+        return {
+          frames: bgMatches[0].frames,
+          missReason: null,
+          captureLayer: 'identity',
+          degradation: 'background'
+        };
+      }
+      if (bgMatches.length > 1) {
+        return { frames: null, missReason: 'ambiguous_context_less_match' };
       }
     }
 
     const recentMissSummary = this.buildMissSummary();
-
     return {
       frames: null,
       missReason: `cache_miss (pauses=${this.pauseEventsReceived}${recentMissSummary})`
@@ -270,17 +483,10 @@ export class InspectorManager {
       this.rateLimitTimer = null;
     }
 
-    if (this.cacheSweepTimer !== null) {
-      clearInterval(this.cacheSweepTimer);
-      this.cacheSweepTimer = null;
-    }
-
     if (this.debuggerIdleTimer !== null) {
       clearTimeout(this.debuggerIdleTimer);
       this.debuggerIdleTimer = null;
     }
-
-    this.cache.clear();
 
     if (this.session !== null) {
       try {
@@ -336,6 +542,47 @@ export class InspectorManager {
     return `, skipped: ${parts.join(', ')}`;
   }
 
+  private installCaptureTag(
+    exceptionObjectId: string,
+    captureId: string
+  ): void {
+    if (this.session === null) return;
+    const functionDeclaration = `
+      function(symbolKeyName, captureId) {
+        const sym = Symbol.for(symbolKeyName);
+        if (this == null) return undefined;
+        const existing = this[sym];
+        if (typeof existing === 'string') return existing;
+        if (Object.isFrozen(this)) return undefined;
+        try {
+          Object.defineProperty(this, sym, {
+            value: captureId,
+            enumerable: false,
+            configurable: false,
+            writable: false
+          });
+          return captureId;
+        } catch {
+          return undefined;
+        }
+      }
+    `;
+    this.session.post(
+      'Runtime.callFunctionOn' as never,
+      {
+        functionDeclaration,
+        objectId: exceptionObjectId,
+        arguments: [
+          { value: 'errorcore.v1.captureId' },
+          { value: captureId }
+        ],
+        returnByValue: true,
+        silent: true
+      } as never,
+      () => undefined
+    );
+  }
+
   private _onPaused(params: PausedEventParams): void {
     try {
       this.deactivateAfterIdle();
@@ -355,7 +602,7 @@ export class InspectorManager {
           return;
         }
 
-        if (this._cacheEntryCount() >= this.maxCachedLocals) {
+        if (this.ringBuffer['entries'].length >= this.maxCachedLocals) {
           this.recordMiss('cache_full');
           return;
         }
@@ -365,6 +612,8 @@ export class InspectorManager {
           .slice(0, this.maxLocalsFrames);
 
         if (appFrames.length === 0) {
+          // Fallback 1: webpack-internal:// hints present but the top frames
+          // have empty URLs. Accept empty-URL frames that have local scope.
           const hasWebpackContext = params.callFrames.some(
             (frame) => frame.url !== undefined && frame.url.startsWith('webpack-internal://')
           );
@@ -378,31 +627,47 @@ export class InspectorManager {
               .slice(0, this.maxLocalsFrames);
           }
 
+          // Fallback 2: in heavily-bundled production builds (Next.js
+          // production, Vite SSR), V8 often reports frame.url as '' for
+          // every frame — no webpack-internal URLs anywhere, no absolute
+          // paths. If at least one frame has a local scope, accept frames
+          // that have local scope as best-effort app frames. This is the
+          // key mechanism that makes Layer 1 Symbol-tagging fire in
+          // bundled environments. Without it, the ring buffer stays empty
+          // and Layer 2 identity fallback can't find a match either.
+          if (appFrames.length === 0) {
+            const hasAnyLocalScope = params.callFrames.some(
+              (frame) => frame.scopeChain.some((s) => s.type === 'local')
+            );
+            if (hasAnyLocalScope) {
+              appFrames = params.callFrames
+                .filter((frame) => frame.scopeChain.some((s) => s.type === 'local'))
+                .slice(0, this.maxLocalsFrames);
+            }
+          }
+
           if (appFrames.length === 0) {
             this.recordMiss('no_app_frames');
             return;
           }
         }
 
-        const requestId = this.getRequestId() ?? '__no_context__';
-
-        const webpackFallbackUrl = appFrames[0]?.url === ''
-          ? params.callFrames.find((f) => f.url?.startsWith('webpack-internal://'))?.url
-          : undefined;
-
-        const firstAppFrame = this._toAppFrameLocation(appFrames[0], webpackFallbackUrl);
-
-        if (firstAppFrame === null) {
-          this.recordMiss('no_app_frame_key');
-          return;
+        // Parse error name and message from params.data
+        const errorName = params.data?.className ?? 'Error';
+        const description = params.data?.description ?? '';
+        // description is like "TypeError: Cannot read..." or just the message
+        let errorMessage: string;
+        if (description.startsWith(`${errorName}: `)) {
+          errorMessage = description.slice(errorName.length + 2);
+        } else {
+          errorMessage = description;
         }
 
-        const key = this._buildCorrelationKey(requestId, firstAppFrame);
+        const requestId = this.getRequestId() ?? null;
+        const captureId = this.ringBuffer.allocateId();
 
-        if (this.cache.get(key)?.ambiguous === true) {
-          this.recordMiss('ambiguous_correlation');
-          return;
-        }
+        const frameCount = params.callFrames.length;
+        const structuralHash = computeStructuralHash(params.callFrames);
 
         const collected: CapturedFrame[] = [];
         let pendingCollections = 0;
@@ -415,28 +680,22 @@ export class InspectorManager {
 
           if (collected.length === 0) {
             this.recordMiss('empty_locals');
-            return;
-          }
-
-          const existing = this.cache.get(key);
-
-          if (existing !== undefined) {
-            this.cache.set(key, {
-              frames: null,
-              timestamp: Date.now(),
-              ambiguous: true
-            });
-            this.recordMiss('ambiguous_correlation');
             stored = true;
             return;
           }
 
-          this.cache.set(key, {
+          const entry: LocalsRingBufferEntry = {
+            id: captureId,
+            requestId,
+            errorName,
+            errorMessage,
+            frameCount,
+            structuralHash,
             frames: collected,
-            timestamp: Date.now(),
-            ambiguous: false
-          });
+            createdAt: Date.now()
+          };
 
+          this.ringBuffer.push(entry);
           this.collectionCountThisSecond += 1;
           stored = true;
         };
@@ -481,6 +740,11 @@ export class InspectorManager {
               storeCollectedFrames();
             }
           );
+        }
+
+        // Tag the exception object with the capture ID (Layer 1)
+        if (params.data?.objectId !== undefined) {
+          this.installCaptureTag(params.data.objectId, captureId);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -575,95 +839,6 @@ export class InspectorManager {
     return `[${object.className ?? 'Object'}]`;
   }
 
-  private _buildCorrelationKey(
-    requestId: string,
-    frame: AppFrameLocation
-  ): string {
-    return `${requestId}:${frame.filePath}:${frame.lineNumber}:${frame.columnNumber}`;
-  }
-
-  private _toAppFrameLocation(frame: CallFrame | undefined, fallbackUrl?: string): AppFrameLocation | null {
-    const url = frame?.url || fallbackUrl;
-    if (url === undefined || url === '') {
-      return null;
-    }
-
-    return {
-      filePath: this._normalizeFramePath(url),
-      lineNumber: frame!.location.lineNumber + 1,
-      columnNumber: frame!.location.columnNumber + 1
-    };
-  }
-
-  private _extractFirstAppFrameFromStack(stack: string | undefined): AppFrameLocation | null {
-    if (stack === undefined || stack === '') {
-      return null;
-    }
-
-    const lines = stack.split('\n').slice(1);
-
-    for (const line of lines) {
-      const parsed = this._parseStackFrameLine(line);
-
-      if (parsed === null || !this._isAppFrame(parsed.filePath)) {
-        continue;
-      }
-
-      return parsed;
-    }
-
-    return null;
-  }
-
-  private _parseStackFrameLine(line: string): AppFrameLocation | null {
-    const trimmed = line.trim();
-    let location = trimmed.startsWith('at ') ? trimmed.slice(3).trim() : trimmed;
-
-    if (location.endsWith(')')) {
-      let openParenIndex = -1;
-
-      for (let i = location.length - 1; i >= 0; i--) {
-        if (location[i] === '(' && (i === 0 || location[i - 1] === ' ')) {
-          openParenIndex = i;
-          break;
-        }
-      }
-
-      if (openParenIndex !== -1) {
-        location = location.slice(openParenIndex + 1, -1);
-      }
-    }
-
-    const match = location.match(/^(.*):(\d+):(\d+)$/);
-
-    if (match === null) {
-      return null;
-    }
-
-    const filePath = match[1];
-
-    if (filePath === undefined || filePath === '') {
-      return null;
-    }
-
-    return {
-      filePath: this._normalizeFramePath(filePath),
-      lineNumber: Number(match[2]),
-      columnNumber: Number(match[3])
-    };
-  }
-
-  private _normalizeFramePath(filePath: string): string {
-    let normalized = filePath.replace(/^file:\/\//, '').replace(/\\/g, '/');
-
-    const webpackMatch = normalized.match(/^webpack-internal:\/\/\/[^/]*\/(\.\/.+)$/);
-    if (webpackMatch !== null) {
-      normalized = webpackMatch[1];
-    }
-
-    return normalized;
-  }
-
   private _isAppFrame(url: string | undefined): boolean {
     if (url === undefined || url === '') {
       return false;
@@ -677,6 +852,15 @@ export class InspectorManager {
       normalizedUrl.includes('node:internal') ||
       normalizedUrl.startsWith(`${SDK_ROOT}/`)
     );
+  }
+
+  private isMainThread(): boolean {
+    try {
+      const { isMainThread } = require('node:worker_threads') as { isMainThread: boolean };
+      return isMainThread;
+    } catch {
+      return true;
+    }
   }
 
   private deactivateAfterIdle(): void {
@@ -704,18 +888,49 @@ export class InspectorManager {
     }, DEBUGGER_IDLE_TIMEOUT_MS);
     this.debuggerIdleTimer.unref();
   }
+}
 
-  private _cacheEntryCount(): number {
-    return this.cache.size;
+/**
+ * Parses an Error.stack string and returns an array of { functionName } objects
+ * for use in structural hash / frame count computation.
+ * Lines like "    at functionName (path:1:2)" → functionName
+ * Lines like "    at /path/file:1:2" (no function) → empty string
+ * Non-frame lines are skipped.
+ */
+export function parseStackForFunctionNames(
+  stack: string | undefined
+): Array<{ functionName: string }> {
+  if (stack === undefined || stack === '') {
+    return [];
   }
 
-  private _sweepCache(): void {
-    const cutoff = Date.now() - CACHE_TTL_MS;
+  const lines = stack.split('\n');
+  const result: Array<{ functionName: string }> = [];
 
-    for (const [key, entry] of this.cache.entries()) {
-      if (entry.timestamp < cutoff) {
-        this.cache.delete(key);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('at ')) {
+      continue;
+    }
+
+    const rest = trimmed.slice(3).trim();
+
+    // Check if it has parens: "functionName (file:line:col)"
+    if (rest.endsWith(')')) {
+      const openParen = rest.lastIndexOf('(');
+      if (openParen > 0) {
+        const fnName = rest.slice(0, openParen).trim();
+        result.push({ functionName: fnName });
+        continue;
       }
     }
+
+    // No parens → anonymous / path-only frame
+    // Verify it looks like "path:line:col"
+    if (/^.+:\d+:\d+$/.test(rest)) {
+      result.push({ functionName: '' });
+    }
   }
+
+  return result;
 }

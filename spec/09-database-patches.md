@@ -183,3 +183,73 @@ For v1: document that `require('errorcore')` must come BEFORE `require('pg')` et
 - Bind params redacted by default.
 - Original method behavior preserved exactly.
 - All unit tests pass.
+
+---
+
+## 0.2.0 Additions
+
+### `drivers` config option (G2)
+
+**Purpose.** In webpack-bundled environments (Next.js App Router in particular), `require('pg')` inside errorcore resolves against errorcore's own module graph, not the user app's webpack module registry. The result: errorcore patches a `Client.prototype` that the app never reads queries from. This is the root cause of `ioTimeline: []` in bundled environments.
+
+The `drivers` config option lets the user pass explicit module references so errorcore patches the exact instance their code uses.
+
+**Signature.**
+
+```ts
+interface SDKConfig {
+  // ...
+  drivers?: {
+    pg?: unknown;         // require('pg')
+    mongodb?: unknown;    // require('mongodb')
+    mysql2?: unknown;     // require('mysql2')
+    ioredis?: unknown;    // require('ioredis')
+  };
+}
+```
+
+When `drivers.<name>` is set, the corresponding recorder's `install()` uses the provided reference instead of `nodeRequire(driverName)`. This patches the exact instance the user's code will use.
+
+**Per-recorder tier mapping.**
+
+| Environment | `drivers` needed? | Startup state |
+|-------------|-------------------|---------------|
+| Tier 1 — Plain Node.js | No | `ok` |
+| Tier 2 — Single-graph bundler (webpack, Vite SSR, esbuild) | Optional (auto works if not tree-shaken) | `ok` or `ok` with info note |
+| Tier 3 — Next.js App Router | Yes, OR use `serverExternalPackages` | `warn(bundled-unpatched)` until resolved |
+| Driver not installed | N/A | `skip(not-installed)` |
+
+**`explicitDriver` in `PatchInstallDeps`.** Each driver's `install(deps)` function accepts an extended deps shape:
+
+```ts
+interface PatchInstallDeps {
+  buffer: IOEventBuffer;
+  als: ALSManager;
+  config: ResolvedConfig;
+  explicitDriver?: unknown;  // from config.drivers.<name>
+}
+```
+
+When `explicitDriver` is present and truthy, `install()` skips the `try { require(driverName) }` step and uses the provided value directly. The value is cast to the driver's known type and the prototype-patching proceeds identically to the auto-detected path.
+
+If `explicitDriver` is provided but not a recognized driver shape (e.g., wrong module passed), `install()` throws a descriptive error at startup rather than silently failing at query time.
+
+**Bundled-environment detection.** Only webpack leaves a reliable runtime marker (`__webpack_require__`). Other bundlers (Vite SSR, esbuild, Rollup, bun) do not. Detection is honest about this limit:
+
+```ts
+function detectBundler(): 'webpack' | 'unknown' {
+  if (typeof (globalThis as any).__webpack_require__ !== 'undefined') return 'webpack';
+  return 'unknown';
+}
+const isNextJs = process.env.NEXT_RUNTIME === 'nodejs';
+```
+
+For each DB recorder, state is determined as follows:
+- `drivers.<name>` provided → patch that exact reference → `ok`
+- Driver absent from the resolve path → `skip(not-installed)`
+- Driver present, `detectBundler() === 'webpack'`, no `drivers.<name>` → `warn(bundled-unpatched)`
+- Driver present, `detectBundler() === 'unknown'`, no `drivers.<name>` → `ok` with optional info note
+
+Warning messages are runtime-specific:
+- Next.js: `"pg detected in bundled Next.js; add 'pg' to serverExternalPackages in next.config.js to enable DB timeline capture."`
+- Other webpack: `"pg detected in a bundled environment; pass drivers: { pg: require('pg') } to errorcore.init() to enable DB timeline capture."`

@@ -197,26 +197,17 @@ describe('Module 08 recorders', () => {
     res.setHeader('content-type', 'application/json');
     res.setHeader('set-cookie', 'hidden');
     recorder.install();
-    const fallbackEmitPatchInstalled = Server.prototype.emit !== originalEmit;
+
+    // Post-fix invariant: emit-patch is always installed, so emit('request')
+    // runs inside als.runWithContext() automatically.
+    expect(Server.prototype.emit).not.toBe(originalEmit);
 
     server.on('request', () => {
       observedRequestId = als.getRequestId();
     });
 
     try {
-      if (fallbackEmitPatchInstalled) {
-        server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
-      } else {
-        const context = (
-          recorder as unknown as {
-            getOrCreateContext(request: IncomingMessage): RequestContext;
-          }
-        ).getOrCreateContext(req as unknown as IncomingMessage);
-
-        als.runWithContext(context, () => {
-          server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
-        });
-      }
+      server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
 
       recorder.handleRequestStart({
         request: req as unknown as IncomingMessage,
@@ -280,13 +271,14 @@ describe('Module 08 recorders', () => {
     try {
       recorder.install();
 
-      const expectedPath =
-        Server.prototype.emit === originalEmit ? 'bindStore' : 'emit-patch';
+      // Post-fix: emit-patch is always installed, so Server.prototype.emit is
+      // always patched. getBindStorePath() reflects whether the bindStore
+      // subscription channel was available — not whether the emit-patch ran.
+      const bindStorePath = recorder.getBindStorePath();
 
-      expect(recorder.getBindStorePath()).toBe(expectedPath);
       expect(emitSpy).toHaveBeenCalledWith(
         'errorcore:init',
-        expect.objectContaining({ path: expectedPath })
+        expect.objectContaining({ path: bindStorePath })
       );
     } finally {
       recorder.shutdown();
@@ -885,6 +877,227 @@ describe('Module 08 recorders', () => {
       });
     } finally {
       recorder.shutdown();
+    }
+  });
+});
+
+describe('G2 — http-server shape: message.socket is optional', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('records request when diagnostic-channel payload omits socket', () => {
+    const config = createConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const request = new MockIncomingRequest();
+    request.method = 'GET';
+    request.url = '/api/test';
+
+    const response = new MockServerResponse();
+    const server = new Server();
+
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    try {
+      // Payload without top-level socket — the real diagnostic-channel shape
+      recorder.handleRequestStart({
+        request: request as unknown as IncomingMessage,
+        response: response as unknown as ServerResponse,
+        server
+      } as never);
+
+      expect(pushSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'http-server',
+          direction: 'inbound',
+          method: 'GET',
+          url: '/api/test'
+        })
+      );
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
+    }
+  });
+
+  it('still records when socket is present (backward compat)', () => {
+    const config = createConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const request = new MockIncomingRequest();
+    const response = new MockServerResponse();
+    const server = new Server();
+
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    try {
+      // Payload with socket present — backward-compat path
+      recorder.handleRequestStart({
+        request: request as unknown as IncomingMessage,
+        response: response as unknown as ServerResponse,
+        socket: request.socket as never,
+        server
+      });
+
+      expect(pushSpy).toHaveBeenCalled();
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
+    }
+  });
+});
+
+describe('G2 — undici shape: RequestImpl, not ClientRequest', () => {
+  it('records outbound fetch when payload matches undici:request:create shape', () => {
+    const config = resolveConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const headerFilter = new HeaderFilter(config);
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter
+    });
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    // undici RequestImpl shape. Headers often arrive as a flat array; the
+    // recorder must not assume Node core ClientRequest APIs (getHeader,
+    // socket, setHeader) exist on this object.
+    const request = {
+      origin: 'https://api.example.com',
+      path: '/v1/x',
+      method: 'GET',
+      headers: ['host', 'api.example.com', 'user-agent', 'test'],
+      body: null,
+      addHeader: () => undefined
+    };
+    recorder.handleRequestCreate({ request } as never);
+
+    expect(pushSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'undici',
+        direction: 'outbound',
+        method: 'GET',
+        url: 'https://api.example.com/v1/x'
+      })
+    );
+  });
+});
+
+describe('G2 — http-client shape: { request } only', () => {
+  it('records outbound request when payload contains only request', () => {
+    const config = resolveConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter
+    });
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    // Construct a minimal ClientRequest-like object. Node's real
+    // http.client.request.start payload is literally { request } only.
+    const request = Object.assign(new EventEmitter(), {
+      method: 'POST',
+      host: 'api.example.com',
+      path: '/v1/x',
+      protocol: 'https:',
+      getHeaders: () => ({ host: 'api.example.com' }),
+      getHeader: (_: string) => 'api.example.com',
+      setHeader: () => undefined,
+    });
+
+    recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+
+    expect(pushSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'http-client',
+        direction: 'outbound',
+        method: 'POST'
+      })
+    );
+  });
+});
+
+describe('G2 — ALS context propagation through server.emit', () => {
+  it('propagates ALS to handlers registered via server.on("request")', () => {
+    const config = resolveConfig();
+    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const server = new Server();
+    const originalEmit = Server.prototype.emit;
+    const req = new MockIncomingRequest();
+    const res = new MockServerResponse();
+
+    recorder.install();
+
+    // Invariant under the fix: install() ALWAYS patches Server.prototype.emit,
+    // regardless of bindStore availability. This is the mechanism that makes
+    // ALS available to framework request handlers.
+    expect(Server.prototype.emit).not.toBe(originalEmit);
+
+    let contextInHandler: string | undefined;
+    server.on('request', () => {
+      contextInHandler = als.getRequestId();
+    });
+
+    try {
+      server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
+      expect(contextInHandler).not.toBeUndefined();
+      expect(typeof contextInHandler).toBe('string');
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
     }
   });
 });

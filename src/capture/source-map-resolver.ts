@@ -3,19 +3,22 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { SourceMapConsumer } from 'source-map-js';
 
-interface CachedConsumer {
-  consumer: SourceMapConsumer;
-  usedAt: number;
-}
+type CacheEntry =
+  | { type: 'consumer'; consumer: SourceMapConsumer; usedAt: number }
+  | { type: 'missing'; cachedAt: number }
+  | { type: 'corrupt'; reason: string; cachedAt: number };
 
 const V8_FRAME_RE = /^(\s+at\s+)(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?$/;
 const SOURCEMAP_URL_RE = /\/\/[#@]\s*sourceMappingURL\s*=\s*(\S+)\s*$/;
 const WEBPACK_INTERNAL_RE = /^webpack-internal:\/\/\/[^/]*\/(\.\/.+)$/;
-const MAX_CACHE_SIZE = 50;
+const MAX_CACHE_SIZE = 128;
 // Cap .js/.map file reads. A maliciously large or simply bloated map
 // would otherwise block the event loop during background warming.
 const MAX_SOURCE_READ_BYTES = 4 * 1024 * 1024;
 const MAX_WARM_PROMISES = 256;
+// Negative (missing/corrupt) cache entries expire after 1 hour so that
+// a newly deployed source map is picked up without restarting the process.
+const NEGATIVE_ENTRY_TTL_MS = 60 * 60 * 1000;
 
 function readIfWithinSize(filePath: string): string | null {
   let contents: string;
@@ -36,7 +39,9 @@ function readIfWithinSize(filePath: string): string | null {
 }
 
 export class SourceMapResolver {
-  private readonly cache = new Map<string, CachedConsumer | null>();
+  private readonly cache = new Map<string, CacheEntry>();
+
+  private readonly syncThresholdBytes: number;
 
   private warnedNoMaps = false;
 
@@ -44,17 +49,30 @@ export class SourceMapResolver {
 
   private warmPromises: Promise<void>[] = [];
 
+  private telemetry = {
+    framesResolved: 0,
+    framesUnresolved: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    missing: 0,
+    corrupt: 0,
+    evictions: 0
+  };
+
+  public constructor(options?: { sourceMapSyncThresholdBytes?: number }) {
+    this.syncThresholdBytes = options?.sourceMapSyncThresholdBytes ?? 2 * 1024 * 1024;
+  }
+
   /**
-   * Resolve stack frames using only cached source maps. No disk I/O.
-   * Schedules background warming for any cache misses so subsequent
-   * captures of the same file will resolve correctly.
+   * Resolve stack frames using source maps. On cache miss, loads synchronously
+   * if the adjacent .map file is within the syncThresholdBytes limit; otherwise
+   * schedules a background warm for the next capture.
    */
   public resolveStack(stack: string): string {
     const lines = stack.split('\n');
     const resolved: string[] = [];
     let frameCount = 0;
     let resolvedCount = 0;
-    const missedPaths: string[] = [];
 
     for (const line of lines) {
       const match = V8_FRAME_RE.exec(line);
@@ -73,7 +91,23 @@ export class SourceMapResolver {
       const effectivePath = this.normalizeWebpackPath(filePath);
 
       if (!this.cache.has(effectivePath)) {
-        missedPaths.push(effectivePath);
+        // Cache miss: decide sync-on-miss vs async warm based on map file size.
+        this.telemetry.cacheMisses++;
+        if (this.fileSizeUnderThreshold(effectivePath)) {
+          // Map is small enough — load synchronously so this frame resolves now.
+          this.getConsumer(effectivePath);
+        } else {
+          // Map is large, size unknown, or threshold is 0 — schedule async warm.
+          this.scheduleWarm(effectivePath);
+        }
+      }
+
+      // After potential sync load above, check cache.
+      // If we took the async path, the entry may not be here yet.
+      const entry = this.cache.get(effectivePath);
+
+      if (entry === undefined) {
+        // Async warm scheduled; frame is unresolved for this capture.
         if (effectivePath !== filePath) {
           if (funcName) {
             resolved.push(`${indent}${funcName} (${effectivePath}:${lineStr}:${colStr})`);
@@ -86,24 +120,36 @@ export class SourceMapResolver {
         continue;
       }
 
-      const cached = this.cache.get(effectivePath)!;
-      if (cached === null) {
+      if (entry.type === 'missing') {
+        this.telemetry.cacheHits++;
+        this.telemetry.missing++;
         resolved.push(line);
         continue;
       }
 
-      cached.usedAt = Date.now();
-      const original = cached.consumer.originalPositionFor({
+      if (entry.type === 'corrupt') {
+        this.telemetry.cacheHits++;
+        this.telemetry.corrupt++;
+        resolved.push(line);
+        continue;
+      }
+
+      // entry.type === 'consumer'
+      this.telemetry.cacheHits++;
+      entry.usedAt = Date.now();
+      const original = entry.consumer.originalPositionFor({
         line: lineNum,
         column: colNum - 1
       });
 
       if (original.source === null || original.line === null) {
+        this.telemetry.framesUnresolved++;
         resolved.push(line);
         continue;
       }
 
       resolvedCount++;
+      this.telemetry.framesResolved++;
       const resolvedFunc = original.name ?? funcName;
       const resolvedCol = (original.column ?? 0) + 1;
       const resolvedSource = original.source;
@@ -127,10 +173,6 @@ export class SourceMapResolver {
         '    return config;\n' +
         '  },'
       );
-    }
-
-    for (const missedPath of missedPaths) {
-      this.scheduleWarm(missedPath);
     }
 
     return resolved.join('\n');
@@ -165,14 +207,16 @@ export class SourceMapResolver {
         continue;
       }
 
-      const cached = this.cache.get(effectivePath)!;
-      if (cached === null) {
+      const entry = this.cache.get(effectivePath)!;
+
+      if (entry.type === 'missing' || entry.type === 'corrupt') {
         resolved.push(line);
         continue;
       }
 
-      cached.usedAt = Date.now();
-      const original = cached.consumer.originalPositionFor({
+      // entry.type === 'consumer'
+      entry.usedAt = Date.now();
+      const original = entry.consumer.originalPositionFor({
         line: lineNum,
         column: colNum - 1
       });
@@ -209,7 +253,7 @@ export class SourceMapResolver {
     );
 
     for (const filePath of filePaths) {
-      if (this.cache.size >= MAX_CACHE_SIZE) {
+      if (this._countConsumers() >= MAX_CACHE_SIZE) {
         break;
       }
       // getConsumer handles caching + eviction internally
@@ -218,10 +262,34 @@ export class SourceMapResolver {
   }
 
   /**
+   * Return telemetry counters and reset them to zero.
+   */
+  public consumeTelemetry(): {
+    framesResolved: number;
+    framesUnresolved: number;
+    cacheHits: number;
+    cacheMisses: number;
+    missing: number;
+    corrupt: number;
+    evictions: number;
+  } {
+    const snapshot = { ...this.telemetry };
+    this.telemetry.framesResolved = 0;
+    this.telemetry.framesUnresolved = 0;
+    this.telemetry.cacheHits = 0;
+    this.telemetry.cacheMisses = 0;
+    this.telemetry.missing = 0;
+    this.telemetry.corrupt = 0;
+    this.telemetry.evictions = 0;
+    return snapshot;
+  }
+
+  /**
    * Schedule a background load for a source map file that was not in cache.
    * Uses setImmediate to avoid blocking the current tick.
+   * Used by Task 16's async path and by warmCache.
    */
-  private scheduleWarm(filePath: string): void {
+  protected scheduleWarm(filePath: string): void {
     if (this.pendingWarms.has(filePath) || this.cache.has(filePath)) {
       return;
     }
@@ -232,7 +300,7 @@ export class SourceMapResolver {
         try {
           this.getConsumer(filePath);
         } catch {
-          // Ignore — cache will store null for failures
+          // Ignore — cache will store missing/corrupt for failures
         } finally {
           this.pendingWarms.delete(filePath);
           resolve();
@@ -260,54 +328,75 @@ export class SourceMapResolver {
     this.warmPromises = [];
   }
 
-  private getConsumer(filePath: string): SourceMapConsumer | null {
-    if (this.cache.has(filePath)) {
-      const cached = this.cache.get(filePath)!;
-
-      if (cached !== null) {
-        cached.usedAt = Date.now();
-      }
-
-      return cached?.consumer ?? null;
+  private getConsumer(filePath: string): CacheEntry | null {
+    if (!filePath) {
+      return null;
     }
 
-    const consumer = this.loadConsumer(filePath);
+    if (this.cache.has(filePath)) {
+      const entry = this.cache.get(filePath)!;
 
-    if (this.cache.size >= MAX_CACHE_SIZE) {
+      // Expire negative (missing/corrupt) entries older than TTL.
+      if (entry.type === 'missing' || entry.type === 'corrupt') {
+        if (Date.now() - entry.cachedAt > NEGATIVE_ENTRY_TTL_MS) {
+          this.cache.delete(filePath);
+          // Fall through to reload below.
+        } else {
+          return entry;
+        }
+      } else {
+        // consumer entry: update LRU timestamp and return.
+        entry.usedAt = Date.now();
+        return entry;
+      }
+    }
+
+    const entry = this.loadConsumer(filePath);
+
+    if (entry === null) {
+      return null;
+    }
+
+    // Only evict when consumer entries would overflow. Missing/corrupt are
+    // lightweight and expire by TTL; they do not count against the LRU cap.
+    if (entry.type === 'consumer' && this._countConsumers() >= MAX_CACHE_SIZE) {
       this.evictOldest();
     }
 
-    if (consumer === null) {
-      this.cache.set(filePath, null);
-    } else {
-      this.cache.set(filePath, { consumer, usedAt: Date.now() });
-    }
-
-    return consumer;
+    this.cache.set(filePath, entry);
+    return entry;
   }
 
-  private loadConsumer(filePath: string): SourceMapConsumer | null {
+  private loadConsumer(filePath: string): CacheEntry | null {
     try {
       const adjacentMap = filePath + '.map';
 
       if (fs.existsSync(adjacentMap)) {
         const raw = readIfWithinSize(adjacentMap);
-        return raw === null ? null : new SourceMapConsumer(JSON.parse(raw));
+        if (raw === null) {
+          return { type: 'corrupt', reason: 'map file too large or unreadable', cachedAt: Date.now() };
+        }
+        try {
+          const consumer = new SourceMapConsumer(JSON.parse(raw));
+          return { type: 'consumer', consumer, usedAt: Date.now() };
+        } catch (e) {
+          return { type: 'corrupt', reason: String(e), cachedAt: Date.now() };
+        }
       }
 
       if (!fs.existsSync(filePath)) {
-        return null;
+        return { type: 'missing', cachedAt: Date.now() };
       }
 
       const source = readIfWithinSize(filePath);
       if (source === null) {
-        return null;
+        return { type: 'missing', cachedAt: Date.now() };
       }
       const lastLines = source.slice(-512);
       const match = SOURCEMAP_URL_RE.exec(lastLines);
 
       if (match === null) {
-        return null;
+        return { type: 'missing', cachedAt: Date.now() };
       }
 
       const url = match[1];
@@ -316,16 +405,21 @@ export class SourceMapResolver {
         const base64Match = /base64,(.+)/.exec(url);
 
         if (base64Match === null) {
-          return null;
+          return { type: 'corrupt', reason: 'data: URL missing base64 payload', cachedAt: Date.now() };
         }
         // Size-cap the inline map's encoded form before decoding. A 4 MB
         // base64 blob expands to ~3 MB and is still a reasonable bound
         // for any legitimate production source map.
         if (base64Match[1].length > MAX_SOURCE_READ_BYTES) {
-          return null;
+          return { type: 'corrupt', reason: 'inline source map exceeds size limit', cachedAt: Date.now() };
         }
         const decoded = Buffer.from(base64Match[1], 'base64').toString('utf8');
-        return new SourceMapConsumer(JSON.parse(decoded));
+        try {
+          const consumer = new SourceMapConsumer(JSON.parse(decoded));
+          return { type: 'consumer', consumer, usedAt: Date.now() };
+        } catch (e) {
+          return { type: 'corrupt', reason: String(e), cachedAt: Date.now() };
+        }
       }
 
       const baseDir = path.resolve(path.dirname(filePath));
@@ -336,31 +430,46 @@ export class SourceMapResolver {
       // uses '/') do not bypass the check.
       const rel = path.relative(baseDir, mapPath);
       if (rel.startsWith('..' + path.sep) || rel === '..' || path.isAbsolute(rel)) {
-        return null;
+        return { type: 'missing', cachedAt: Date.now() };
       }
 
       if (!fs.existsSync(mapPath)) {
-        return null;
+        return { type: 'missing', cachedAt: Date.now() };
       }
 
       const raw = readIfWithinSize(mapPath);
-      return raw === null ? null : new SourceMapConsumer(JSON.parse(raw));
-    } catch {
-      return null;
+      if (raw === null) {
+        return { type: 'corrupt', reason: 'map file too large or unreadable', cachedAt: Date.now() };
+      }
+      try {
+        const consumer = new SourceMapConsumer(JSON.parse(raw));
+        return { type: 'consumer', consumer, usedAt: Date.now() };
+      } catch (e) {
+        return { type: 'corrupt', reason: String(e), cachedAt: Date.now() };
+      }
+    } catch (e) {
+      return { type: 'corrupt', reason: String(e), cachedAt: Date.now() };
     }
   }
 
+  private _countConsumers(): number {
+    let count = 0;
+    for (const entry of this.cache.values()) {
+      if (entry.type === 'consumer') count++;
+    }
+    return count;
+  }
+
+  /**
+   * Evict the least-recently-used consumer entry from the cache.
+   * Missing/corrupt entries are not evicted here — they expire by TTL.
+   */
   private evictOldest(): void {
     let oldestKey: string | null = null;
     let oldestTime = Infinity;
 
     for (const [key, entry] of this.cache.entries()) {
-      if (entry === null) {
-        this.cache.delete(key);
-        return;
-      }
-
-      if (entry.usedAt < oldestTime) {
+      if (entry.type === 'consumer' && entry.usedAt < oldestTime) {
         oldestTime = entry.usedAt;
         oldestKey = key;
       }
@@ -368,6 +477,31 @@ export class SourceMapResolver {
 
     if (oldestKey !== null) {
       this.cache.delete(oldestKey);
+      this.telemetry.evictions++;
+    }
+  }
+
+  /**
+   * Sweep expired negative entries from the cache. Called lazily.
+   */
+  protected _sweepCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if ((entry.type === 'missing' || entry.type === 'corrupt') &&
+          now - entry.cachedAt > NEGATIVE_ENTRY_TTL_MS) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  protected fileSizeUnderThreshold(filePath: string): boolean {
+    if (this.syncThresholdBytes <= 0) return false;
+    const adjacentMap = filePath + '.map';
+    try {
+      const s = fs.statSync(adjacentMap);
+      return s.size <= this.syncThresholdBytes;
+    } catch {
+      return false;
     }
   }
 

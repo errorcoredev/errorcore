@@ -14,4 +14,9 @@ describe('errorcore/nextjs exports parity', () => {
 
     expect(edgeNames).toEqual(nodeNames);
   });
+
+  it('Node entry exports withNextMiddleware', async () => {
+    const mod = await import('../../../../src/integrations/nextjs/index');
+    expect(typeof mod.withNextMiddleware).toBe('function');
+  });
 });

@@ -2,6 +2,7 @@
 import type { IOEventSlot, RequestContext } from '../types';
 import { isSdkInternalRequest } from './internal';
 import { pushIOEvent, toDurationMs } from './utils';
+import type { RecorderState } from '../sdk-diagnostics';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -195,6 +196,10 @@ export class UndiciRecorder {
 
   public shutdown(): void {
     return;
+  }
+
+  public getState(): RecorderState {
+    return { state: 'ok' };
   }
 
   private getSlot(request: unknown): IOEventSlot | undefined {

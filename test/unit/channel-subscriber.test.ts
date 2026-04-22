@@ -29,7 +29,8 @@ function withDiagnosticsChannelMock<T>(
 function createSubscriber() {
   return new ChannelSubscriber({
     httpServer: {
-      handleRequestStart: vi.fn()
+      handleRequestStart: vi.fn(),
+      handleResponseFinish: vi.fn()
     },
     httpClient: {
       handleRequestStart: vi.fn()
@@ -66,6 +67,8 @@ describe('ChannelSubscriber', () => {
 
     expect(diagnosticsChannel.subscribe.mock.calls.map((call) => call[0])).toEqual([
       'http.server.request.start',
+      'http.server.response.finish',
+      'http.server.response.created',
       'http.client.request.start',
       'undici:request:create',
       'undici:request:headers',
@@ -88,9 +91,11 @@ describe('ChannelSubscriber', () => {
       subscriber.unsubscribeAll();
     });
 
-    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(7);
+    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(9);
     expect(diagnosticsChannel.unsubscribe.mock.calls.map((call) => call[0])).toEqual([
       'http.server.request.start',
+      'http.server.response.finish',
+      'http.server.response.created',
       'http.client.request.start',
       'undici:request:create',
       'undici:request:headers',
@@ -110,7 +115,8 @@ describe('ChannelSubscriber', () => {
       httpServer: {
         handleRequestStart: vi.fn(() => {
           throw new Error('boom');
-        })
+        }),
+        handleResponseFinish: vi.fn()
       },
       httpClient: {
         handleRequestStart: vi.fn()
@@ -158,7 +164,7 @@ describe('ChannelSubscriber', () => {
     ).not.toThrow();
 
     expect(debug).toHaveBeenCalledTimes(1);
-    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(7);
+    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(9);
   });
 
   it('is idempotent when subscribeAll is called twice', () => {
@@ -174,7 +180,42 @@ describe('ChannelSubscriber', () => {
       subscriber.subscribeAll();
     });
 
-    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(14);
-    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(7);
+    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(18);
+    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(9);
+  });
+});
+
+describe('G2 — response finish/created dual subscription', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('subscribes to both http.server.response.finish and http.server.response.created when available', () => {
+    const subscribed: string[] = [];
+    const diagnosticsChannel = {
+      subscribe: vi.fn((name: string) => { subscribed.push(name); }),
+      unsubscribe: vi.fn()
+    };
+    withDiagnosticsChannelMock(diagnosticsChannel, () => {
+      const sub = new ChannelSubscriber({
+        httpServer: {
+          handleRequestStart: vi.fn(),
+          handleResponseFinish: vi.fn()
+        },
+        httpClient: { handleRequestStart: vi.fn() },
+        undiciRecorder: {
+          handleRequestCreate: vi.fn(),
+          handleRequestHeaders: vi.fn(),
+          handleRequestTrailers: vi.fn(),
+          handleRequestError: vi.fn()
+        },
+        netDns: { handleNetConnect: vi.fn() }
+      });
+      sub.subscribeAll();
+    });
+
+    expect(subscribed).toContain('http.server.response.finish');
+    expect(subscribed).toContain('http.server.response.created');
   });
 });

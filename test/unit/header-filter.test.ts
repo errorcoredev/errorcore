@@ -459,6 +459,52 @@ describe('HeaderFilter', () => {
     });
   });
 
+  describe('G2 — undici flat-array header normalization', () => {
+    it('handles flat-array headers (undici native shape)', () => {
+      const filter = new HeaderFilter(createConfig());
+      const out = filter.filterAndNormalizeHeaders([
+        'host', 'api.example.com',
+        'user-agent', 'test/1.0',
+        'accept', '*/*',
+        'authorization', 'Bearer SECRET',  // blocklisted; should NOT appear
+      ]);
+      expect(out.host).toBe('api.example.com');
+      expect(out['user-agent']).toBe('test/1.0');
+      expect(out.accept).toBe('*/*');
+      expect(out.authorization).toBeUndefined();
+    });
+
+    it('handles odd-length flat arrays gracefully (trailing lone key dropped)', () => {
+      const filter = new HeaderFilter(createConfig());
+      const out = filter.filterAndNormalizeHeaders(['host', 'x.example', 'trailing']);
+      expect(out.host).toBe('x.example');
+      expect(out.trailing).toBeUndefined();
+    });
+
+    it('continues to handle tuple-of-tuples form (backward compat)', () => {
+      const filter = new HeaderFilter(createConfig());
+      const out = filter.filterAndNormalizeHeaders([
+        ['host', 'a.example'],
+        ['user-agent', 'test'],
+      ]);
+      expect(out.host).toBe('a.example');
+      expect(out['user-agent']).toBe('test');
+    });
+
+    it('treats empty array as empty headers', () => {
+      const filter = new HeaderFilter(createConfig());
+      expect(filter.filterAndNormalizeHeaders([])).toEqual({});
+    });
+
+    it('treats array whose first entry is non-string, non-array as empty (no crash)', () => {
+      const filter = new HeaderFilter(createConfig());
+      // Degenerate input — neither flat-pairs nor tuple-of-tuples.
+      const out = filter.filterAndNormalizeHeaders([42 as unknown, 'x']);
+      // We neither crash nor invent bogus keys.
+      expect(Object.keys(out).length).toBe(0);
+    });
+  });
+
   describe('header value normalization', () => {
     it('passes through string values unchanged', () => {
       const filter = new HeaderFilter(

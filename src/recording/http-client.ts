@@ -8,6 +8,7 @@ import {
   isSdkInternalRequest
 } from './internal';
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
+import type { RecorderState } from '../sdk-diagnostics';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -206,5 +207,9 @@ export class HttpClientRecorder {
 
   public shutdown(): void {
     return;
+  }
+
+  public getState(): RecorderState {
+    return { state: 'ok' };
   }
 }

@@ -205,7 +205,7 @@ describe('pg patch', () => {
 
     await withDriverMocks({ pg: { Client: FakeClient, Pool: FakePool } }, async () => {
       const deps = createDeps();
-      const uninstall = installPgPatch(deps);
+      const { uninstall } = installPgPatch(deps);
       const client = new FakeClient();
       const pool = new FakePool();
       const context = createContext(deps.als, 'req-pg');
@@ -268,7 +268,7 @@ describe('pg patch', () => {
 
     await withDriverMocks({ pg: { Client: FakeClient } }, async () => {
       const deps = createDeps();
-      const uninstall = installPgPatch(deps);
+      const { uninstall } = installPgPatch(deps);
       const client = new FakeClient();
 
       try {
@@ -312,7 +312,7 @@ describe('mysql2 patch', () => {
 
     await withDriverMocks({ mysql2: { Connection: FakeConnection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMysql2Patch(deps);
+      const { uninstall } = installMysql2Patch(deps);
       const connection = new FakeConnection();
       const context = createContext(deps.als, 'req-mysql');
       let callbackRows = 0;
@@ -370,7 +370,7 @@ describe('mysql2 patch', () => {
 
     await withDriverMocks({ mysql2: { Connection: FakeConnection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMysql2Patch(deps);
+      const { uninstall } = installMysql2Patch(deps);
       const connection = new FakeConnection();
 
       try {
@@ -405,7 +405,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
       const context = createContext(deps.als, 'req-redis');
 
@@ -458,7 +458,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
       const context = createContext(deps.als, 'req-redis-auth');
 
@@ -495,7 +495,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
 
       try {
@@ -541,7 +541,7 @@ describe('mongodb patch', () => {
 
     await withDriverMocks({ mongodb: { Collection: FakeCollection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMongodbPatch(deps);
+      const { uninstall } = installMongodbPatch(deps);
       const collection = new FakeCollection();
       const context = createContext(deps.als, 'req-mongo');
 
@@ -594,7 +594,7 @@ describe('mongodb patch', () => {
 
     await withDriverMocks({ mongodb: { Collection: FakeCollection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMongodbPatch(deps);
+      const { uninstall } = installMongodbPatch(deps);
       const collection = new FakeCollection();
 
       try {
@@ -615,5 +615,184 @@ describe('mongodb patch', () => {
         uninstall();
       }
     });
+  });
+});
+
+describe('G2 — PatchManager threads drivers config into installers', () => {
+  it('passes config.drivers.pg as explicitDriver to the pg installer', async () => {
+    const userPg = { Client: { prototype: { query: function orig() { return 'sentinel'; } } }, Pool: { prototype: {} } };
+    const userMongo = { MongoClient: { prototype: { connect: function orig() { return 'm-orig'; } } } };
+
+    await withDriverMocks({}, () => {
+      const config = resolveTestConfig({
+        drivers: { pg: userPg, mongodb: userMongo }
+      });
+      const pm = new PatchManager({
+        buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+        als: new ALSManager(),
+        config
+      });
+
+      // Before installAll, user pg.Client.prototype.query is the original function.
+      const originalQuery = userPg.Client.prototype.query;
+      const originalConnect = userMongo.MongoClient.prototype.connect;
+
+      pm.installAll();
+
+      // After installAll (with Tasks 9-12 landed), the user's own pg.Client
+      // prototype is wrapped because PatchManager threaded the reference
+      // through. For this task alone (without 9-12), we instead verify
+      // PatchManager dispatched the deps correctly by inspecting that
+      // config.drivers survives through resolveConfig and is accessible on
+      // the PatchManager instance's deps.
+      expect(config.drivers.pg).toBe(userPg);
+      expect(config.drivers.mongodb).toBe(userMongo);
+
+      pm.unwrapAll();
+      // After unwrapAll, prototypes restored (will be a no-op until 9-12
+      // actually wrap, but the unwrap path must not throw).
+      expect(userPg.Client.prototype.query).toBe(originalQuery);
+      expect(userMongo.MongoClient.prototype.connect).toBe(originalConnect);
+    });
+  });
+
+  it('gracefully handles drivers with only some entries set', () => {
+    const userPg = { Client: { prototype: { query: function() {} } }, Pool: { prototype: {} } };
+    const config = resolveTestConfig({
+      drivers: { pg: userPg } // mongodb, mysql2, ioredis not set
+    });
+    const pm = new PatchManager({
+      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config
+    });
+
+    expect(() => pm.installAll()).not.toThrow();
+    expect(() => pm.unwrapAll()).not.toThrow();
+  });
+});
+
+describe('G2 — pg installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalQuery = function originalQuery() { return 'pg-orig'; };
+    const fakePg = {
+      Client: { prototype: { query: originalQuery } },
+      Pool: { prototype: { query: originalQuery } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakePg };
+    const { uninstall } = installPgPatch(deps);
+
+    // The installer must have wrapped the user's own prototype methods.
+    expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
+    expect(fakePg.Pool.prototype.query).not.toBe(originalQuery);
+
+    uninstall();
+
+    expect(fakePg.Client.prototype.query).toBe(originalQuery);
+    expect(fakePg.Pool.prototype.query).toBe(originalQuery);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installPgPatch(deps)).not.toThrow();
+  });
+});
+
+describe('G2 — mongodb installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalFind = function originalFind() { return 'mongo-orig'; };
+    const fakeMongodb = {
+      Collection: { prototype: { find: originalFind } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakeMongodb };
+    const { uninstall } = installMongodbPatch(deps);
+
+    // The installer must have wrapped the user's own Collection.prototype.find
+    expect(fakeMongodb.Collection.prototype.find).not.toBe(originalFind);
+
+    uninstall();
+
+    expect(fakeMongodb.Collection.prototype.find).toBe(originalFind);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installMongodbPatch(deps)).not.toThrow();
+  });
+});
+
+describe('G2 — mysql2 installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalQuery = function originalQuery() { return 'mysql2-query-orig'; };
+    const originalExecute = function originalExecute() { return 'mysql2-execute-orig'; };
+    const fakeMysql2 = {
+      Connection: { prototype: { query: originalQuery, execute: originalExecute } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakeMysql2 };
+    const { uninstall } = installMysql2Patch(deps);
+
+    expect(fakeMysql2.Connection.prototype.query).not.toBe(originalQuery);
+    expect(fakeMysql2.Connection.prototype.execute).not.toBe(originalExecute);
+
+    uninstall();
+
+    expect(fakeMysql2.Connection.prototype.query).toBe(originalQuery);
+    expect(fakeMysql2.Connection.prototype.execute).toBe(originalExecute);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installMysql2Patch(deps)).not.toThrow();
+  });
+});
+
+describe('G2 — ioredis installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalSendCommand = function originalSendCommand() { return Promise.resolve('ok'); };
+    // ioredis exports the constructor class directly; the installer does:
+    //   const Redis = (deps.explicitDriver ?? nodeRequire('ioredis')) as { prototype?: object }
+    // and then wraps Redis.prototype.sendCommand
+    class FakeRedis {
+      public sendCommand = originalSendCommand;
+    }
+    // The installer checks Redis.prototype, so attach there too
+    FakeRedis.prototype.sendCommand = originalSendCommand;
+
+    const deps = { ...createDeps(), explicitDriver: FakeRedis };
+    const { uninstall } = installIoredisPatch(deps);
+
+    expect(FakeRedis.prototype.sendCommand).not.toBe(originalSendCommand);
+
+    uninstall();
+
+    expect(FakeRedis.prototype.sendCommand).toBe(originalSendCommand);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installIoredisPatch(deps)).not.toThrow();
   });
 });

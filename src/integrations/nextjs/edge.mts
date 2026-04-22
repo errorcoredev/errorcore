@@ -67,5 +67,12 @@ export function withServerAction<TArgs extends unknown[], TResult>(
   return action;
 }
 
+export function withNextMiddleware<TReq, TResult>(
+  middleware: (req: TReq) => Promise<TResult>,
+  _sdk?: unknown,
+): (req: TReq) => Promise<TResult> {
+  return middleware;
+}
+
 export type { SDKConfig } from '../../types.js';
 export type { NextLikeRequest, WithServerActionOptions } from './types.js';

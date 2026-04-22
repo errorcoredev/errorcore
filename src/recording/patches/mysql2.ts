@@ -6,6 +6,8 @@ import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
 import { redactSensitiveQueryText } from '../../pii/scrubber';
 import { pushIOEvent } from '../utils';
+import type { RecorderState } from '../../sdk-diagnostics';
+import { detectBundler } from '../../sdk-diagnostics';
 
 const nodeRequire = createRequire(__filename);
 
@@ -199,9 +201,15 @@ function instrumentMethod(
   };
 }
 
-export function install(deps: PatchInstallDeps): () => void {
+export function install(deps: PatchInstallDeps): { uninstall: () => void; state: RecorderState } {
+  if (deps.explicitDriver === undefined && detectBundler() === 'webpack') {
+    return {
+      uninstall: () => undefined,
+      state: { state: 'warn', reason: 'bundled-unpatched' }
+    };
+  }
   try {
-    const mysql2 = nodeRequire('mysql2') as {
+    const mysql2 = (deps.explicitDriver ?? nodeRequire('mysql2')) as {
       Connection?: { prototype?: object };
     };
 
@@ -214,17 +222,24 @@ export function install(deps: PatchInstallDeps): () => void {
       );
     }
 
-    return () => {
+    const uninstall = () => {
       if (mysql2.Connection?.prototype !== undefined) {
         unwrapMethod(mysql2.Connection.prototype, 'query');
         unwrapMethod(mysql2.Connection.prototype, 'execute');
       }
     };
+    return { uninstall, state: { state: 'ok' } };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') {
-      console.warn('[ErrorCore] Failed to install mysql2 patch');
+    if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {
+      return {
+        uninstall: () => undefined,
+        state: { state: 'skip', reason: 'not-installed' }
+      };
     }
-
-    return () => undefined;
+    console.warn('[ErrorCore] Failed to install mysql2 patch');
+    return {
+      uninstall: () => undefined,
+      state: { state: 'skip', reason: 'install-failed' }
+    };
   }
 }

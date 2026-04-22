@@ -26,6 +26,7 @@ import type {
   PackageAssemblyWorkerResponse,
   RequestContext
 } from '../../src/types';
+import { SourceMapResolver } from '../../src/capture/source-map-resolver';
 import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 
 const require = createRequire(import.meta.url);
@@ -735,6 +736,128 @@ describe('PackageBuilder', () => {
 
     expect(pkg.completeness.localVariablesCaptured).toBe(true);
     expect(pkg.completeness.localVariablesTruncated).toBe(true);
+  });
+
+  it('Layer 3: marks alignment=full when local frames ≤ rendered stack frames', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'boom',
+        stack: 'Error: boom\n    at handler (/app/src/handler.js:10:5)\n    at process (/app/src/server.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'handler', filePath: '/app/src/handler.js', lineNumber: 10, columnNumber: 5, locals: { x: 1 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 2 rendered frames, 1 local variable frame → no trimming
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+
+  it('Layer 3: trims locals to rendered frame count and marks alignment=prefix_only', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'clipped',
+        stack: 'Error: clipped\n    at outer (/app/src/handler.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'outer', filePath: '/app/src/handler.js', lineNumber: 1, columnNumber: 1, locals: { a: 1 } },
+        { functionName: 'inner', filePath: '/app/src/inner.js', lineNumber: 2, columnNumber: 1, locals: { b: 2 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 1 rendered frame, 2 local frames → trim to 1
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.localVariables?.[0]?.functionName).toBe('outer');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('prefix_only');
+  });
+
+  it('Layer 3: skips trimming when stack has no at-frames (zero rendered count)', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'minimal',
+        stack: 'Error: minimal',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'fn', filePath: '/app/src/fn.js', lineNumber: 1, columnNumber: 1, locals: { z: 1 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 0 rendered frames → no trimming (safe fallback)
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+});
+
+describe('G1 — Layer 3 alignment helpers', () => {
+  it('localVariablesFrameAlignment is undefined when no locals captured', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, { localVariables: null });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesFrameAlignment).toBeUndefined();
+  });
+});
+
+describe('G1 — Layer 1/2/3 telemetry in completeness', () => {
+  it('threads captureLayer and degradation from parts into completeness', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'test',
+        stack: 'Error: test\n    at fn (/app/src/fn.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'fn', filePath: '/app/src/fn.js', lineNumber: 1, columnNumber: 1, locals: { x: 1 } }
+      ],
+      localVariablesCaptureLayer: 'tag',
+      localVariablesDegradation: 'exact'
+    });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesCaptureLayer).toBe('tag');
+    expect(pkg.completeness.localVariablesDegradation).toBe('exact');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+
+  it('threads identity+dropped_hash telemetry into completeness', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      localVariables: null,
+      localVariablesCaptureLayer: 'identity',
+      localVariablesDegradation: 'dropped_hash'
+    });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesCaptureLayer).toBe('identity');
+    expect(pkg.completeness.localVariablesDegradation).toBe('dropped_hash');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBeUndefined();
   });
 });
 
@@ -1766,5 +1889,55 @@ describe('ErrorCapturer', () => {
     const pkg = capturer.capture(new Error('miss'));
 
     expect(pkg?.completeness.captureFailures).toContain('locals: cache_miss (pauses=0)');
+  });
+});
+
+describe('G3 — sourceMapResolution telemetry in completeness', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('includes sourceMapResolution counts after a capture', () => {
+    const config = resolveConfig({});
+    const processMetadata = new ProcessMetadata(config);
+    const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const sourceMapResolver = new SourceMapResolver();
+    const capturer = new ErrorCapturer({
+      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker,
+      processMetadata,
+      packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
+      transport: { send: vi.fn() },
+      encryption: null,
+      bodyCapture: noopBodyCapture,
+      config,
+      sourceMapResolver
+    });
+
+    const error = new Error('src-map-telemetry-test');
+    // Stack referencing a path that won't have a source map — triggers
+    // a missing/not-found entry in the source map resolver.
+    error.stack = 'Error: src-map-telemetry-test\n    at foo (/nonexistent/telemetry.js:10:5)';
+
+    const pkg = capturer.capture(error);
+
+    expect(pkg?.completeness.sourceMapResolution).toBeDefined();
+    const sm = pkg!.completeness.sourceMapResolution!;
+    expect(typeof sm.framesResolved).toBe('number');
+    expect(typeof sm.framesUnresolved).toBe('number');
+    expect(typeof sm.cacheHits).toBe('number');
+    expect(typeof sm.cacheMisses).toBe('number');
+    expect(typeof sm.missing).toBe('number');
+    expect(typeof sm.corrupt).toBe('number');
+    expect(typeof sm.evictions).toBe('number');
+    // At least one field should be > 0 because the capture triggered resolution.
+    const totalActivity = sm.framesResolved + sm.framesUnresolved + sm.cacheHits + sm.cacheMisses + sm.missing + sm.corrupt;
+    expect(totalActivity).toBeGreaterThan(0);
+
+    requestTracker.shutdown();
+    processMetadata.shutdown();
   });
 });

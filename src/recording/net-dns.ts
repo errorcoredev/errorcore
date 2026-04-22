@@ -7,6 +7,7 @@ import type { IOEventSlot, RequestContext } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
 import { isInternalCallActive, runAsInternal } from './internal';
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
+import type { RecorderState } from '../sdk-diagnostics';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -175,6 +176,10 @@ export class NetDnsRecorder {
     while (this.restores.length > 0) {
       this.restores.pop()?.();
     }
+  }
+
+  public getState(): RecorderState {
+    return { state: 'ok' };
   }
 
   private patchNet(): void {

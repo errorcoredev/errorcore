@@ -257,3 +257,109 @@ Post-build check:
 - `npm run build && npm run verify:edge-stub && npm test` all pass.
 - Both smokes (`smoke-node.cjs`, `smoke-edge.mjs`) print OK.
 - Main entry behavior unchanged — all pre-existing tests still pass.
+
+---
+
+## 0.2.0 Additions
+
+### Middleware capture (C1)
+
+**Problem.** `withErrorcore` wraps the route handler. Clerk's middleware runs earlier and can reject requests (401/404) before any route handler executes. Every denied request disappears from capture.
+
+**New export.** `withNextMiddleware` from `errorcore/nextjs`:
+
+```ts
+export function withNextMiddleware(
+  middleware: (req: NextRequest) => Promise<NextResponse | Response>,
+  sdk?: SDKInstanceLike,
+): (req: NextRequest) => Promise<NextResponse | Response>;
+```
+
+**Behavior:**
+
+1. If SDK not active, return middleware untouched (pass-through).
+2. If ALS context already exists (middleware nested inside an existing route context), run middleware inside the existing context — no double-registration.
+3. Otherwise, create a new `RequestContext` from the `NextRequest` (same header filtering and traceparent parsing as `withErrorcore`), register in `requestTracker`.
+4. `als.runWithContext` the middleware body.
+5. Capture thrown errors, rethrow. Clean up in `finally`.
+6. Return-value handling:
+   - `undefined` return → pass-through. Never treated as a rejection, never captured, regardless of `captureMiddlewareStatusCodes`.
+   - `Response` / `NextResponse` return → inspect `.status`. If it matches `config.captureMiddlewareStatusCodes`, capture a synthetic `Error(\`Middleware returned HTTP ${status}\`)` with `name = 'MiddlewareRejection'`.
+   - Anything else → pass-through, no capture.
+
+**`captureMiddlewareStatusCodes` config.**
+
+```ts
+interface SDKConfig {
+  captureMiddlewareStatusCodes?: number[] | 'none' | 'all';  // default: 'none'
+}
+```
+
+- `'none'` (default) — never capture middleware-returned responses, only thrown errors
+- `number[]` — capture if returned status is in the list (e.g., `[500, 502, 503, 504]`)
+- `'all'` — capture every non-2xx response
+
+Default `'none'` avoids rate-limit exhaustion from Clerk denying bot traffic. Users who want auth-denial visibility opt in explicitly.
+
+**ALS propagation contract.** The ALS context started by `withNextMiddleware` propagates automatically into the downstream route handler. In Node runtime this is intrinsic to `AsyncLocalStorage` — the request moves through `middleware → route` within the same async chain. The `withErrorcore` wrapper at `middleware/nextjs.ts` already checks `instance.als.getContext?.() !== undefined` and skips re-creating a context, so the flow nests correctly.
+
+**Edge runtime.** The existing `edge.mts` no-op stub exports `withNextMiddleware` as a passthrough. Only Node runtime gets real wrapping.
+
+**No user-land escape hatch.** `getModuleInstance` stays `@internal` and undocumented. Users who need bespoke middleware behavior use `withNextMiddleware` with `captureMiddlewareStatusCodes`, or open an issue to drive a future public `errorcore/advanced` subpath.
+
+### Edge runtime capture (C2)
+
+No code change. The `edge.mts` no-op stub is intentional — `errorcore`'s Node-only dependencies (`node:inspector`, `node:async_hooks`, file transport) cannot run in Edge. This is a correctness guarantee.
+
+**Concrete Edge capture path (for users who need it):**
+
+> **Edge-runtime routes are not captured by `errorcore/nextjs` (the Edge entry is a no-op stub).** If you need error capture from Edge handlers, POST directly to your `errorcore` ingestion endpoint:
+>
+> ```ts
+> // app/api/chat/route.ts — runtime: edge
+> export const runtime = 'edge';
+>
+> async function encryptForIngest(payload: object, rawKey: ArrayBuffer): Promise<EncryptedEnvelope> {
+>   const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt']);
+>   const iv = crypto.getRandomValues(new Uint8Array(12));
+>   const pt = new TextEncoder().encode(JSON.stringify(payload));
+>   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, pt);
+>   return {
+>     key_id: process.env.ERRORCORE_KEY_ID,
+>     iv: btoa(String.fromCharCode(...iv)),
+>     ciphertext: btoa(String.fromCharCode(...new Uint8Array(ct))),
+>   };
+> }
+>
+> export async function POST(req: Request) {
+>   try {
+>     // ... handler logic
+>   } catch (err) {
+>     const envelope = await encryptForIngest({ error: { name: err.name, message: err.message, stack: err.stack }, capturedAt: new Date().toISOString() }, ingestKey);
+>     await fetch(process.env.ERRORCORE_COLLECTOR_URL, {
+>       method: 'POST',
+>       headers: { 'content-type': 'application/json', 'authorization': `Bearer ${process.env.ERRORCORE_INGEST_TOKEN}` },
+>       body: JSON.stringify(envelope),
+>     });
+>     throw err;
+>   }
+> }
+> ```
+
+Expected envelope format (published as part of the ingest API doc):
+
+```json
+{
+  "key_id": "optional — required when the collector supports key rotation",
+  "salt": "base64, when using password-derived keys",
+  "iv": "base64, 12 bytes for AES-GCM",
+  "ciphertext": "base64",
+  "authTag": "optional when not combined into ciphertext"
+}
+```
+
+**Unencrypted path (dev only):** If you don't want to encrypt from Edge, the ingest token must have `allow_unencrypted: true` on the project — fine for local development, **risky in production** because the payload traverses the network in plaintext. Documented as such.
+
+**Limitations (out of scope for 0.2.0):**
+- C3: framework-level 404s and static 500s remain invisible. No interceptor exists for these at the Edge layer.
+- C5: client-side (browser) errors are out of SDK scope.

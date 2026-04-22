@@ -9,6 +9,21 @@ import type {
   SerializationLimits
 } from './types';
 
+let legacyInsecureTransportWarned = false;
+function warnLegacyInsecureTransportOnce(): void {
+  if (legacyInsecureTransportWarned) return;
+  legacyInsecureTransportWarned = true;
+  console.warn(
+    '[ErrorCore] allowInsecureTransport is deprecated and ignored. ' +
+    'Remove it from your config. (Deprecated in 0.2.0, will be removed in 1.0.0.) ' +
+    'Use allowPlainHttpTransport to enable plain-http collector URLs.'
+  );
+}
+// Test-only reset for the one-shot flag.
+export function __resetLegacyInsecureTransportWarning(): void {
+  legacyInsecureTransportWarned = false;
+}
+
 const DEFAULT_SERIALIZATION: SerializationLimits = {
   maxDepth: 8,
   maxArrayItems: 20,
@@ -190,10 +205,22 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   const captureResponseBodies = explicitBodyControlsProvided
     ? userConfig.captureResponseBodies ?? false
     : userConfig.captureBody ?? false;
-  if ((userConfig as { allowInsecureTransport?: unknown }).allowInsecureTransport !== undefined) {
+  const legacyInsecureTransport = (userConfig as { allowInsecureTransport?: unknown })
+    .allowInsecureTransport;
+  if (legacyInsecureTransport === true) {
+    if (userConfig.allowPlainHttpTransport === false) {
+      throw new Error(
+        'Config contradiction: allowInsecureTransport: true and allowPlainHttpTransport: false cannot both be set. ' +
+        'Remove allowInsecureTransport (deprecated) and set allowPlainHttpTransport: true if you intend to allow plain HTTP.'
+      );
+    }
     throw new Error(
-      'allowInsecureTransport was removed. Use allowPlainHttpTransport to enable plain-http collector URLs.'
+      'allowInsecureTransport: true was renamed to allowPlainHttpTransport: true in 0.2.0. ' +
+      'Update your config. (Deprecated in 0.2.0, will be removed in 1.0.0.)'
     );
+  }
+  if (legacyInsecureTransport === false) {
+    warnLegacyInsecureTransportOnce();
   }
   const allowPlainHttpTransport = userConfig.allowPlainHttpTransport ?? false;
   const allowInvalidCollectorCertificates =
@@ -297,6 +324,45 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     typeof userConfig.onInternalWarning !== 'function'
   ) {
     throw new Error('onInternalWarning must be a function or undefined');
+  }
+
+  const drivers = userConfig.drivers ?? {};
+  if (typeof drivers !== 'object' || drivers === null || Array.isArray(drivers)) {
+    throw new Error('drivers must be an object with pg/mongodb/mysql2/ioredis references');
+  }
+
+  const silent = userConfig.silent ?? false;
+  if (typeof silent !== 'boolean') {
+    throw new Error('silent must be a boolean');
+  }
+
+  const sourceMapSyncThresholdBytes =
+    userConfig.sourceMapSyncThresholdBytes ?? 2 * 1024 * 1024;
+  if (
+    !Number.isInteger(sourceMapSyncThresholdBytes) ||
+    sourceMapSyncThresholdBytes < 0
+  ) {
+    throw new Error('sourceMapSyncThresholdBytes must be a non-negative integer');
+  }
+
+  const captureMiddlewareStatusCodes = userConfig.captureMiddlewareStatusCodes ?? 'none';
+  if (
+    captureMiddlewareStatusCodes !== 'none' &&
+    captureMiddlewareStatusCodes !== 'all' &&
+    !Array.isArray(captureMiddlewareStatusCodes)
+  ) {
+    throw new Error(
+      `captureMiddlewareStatusCodes must be 'none', 'all', or integer[]`
+    );
+  }
+  if (Array.isArray(captureMiddlewareStatusCodes)) {
+    for (const code of captureMiddlewareStatusCodes) {
+      if (!Number.isInteger(code) || code < 100 || code > 599) {
+        throw new Error(
+          `captureMiddlewareStatusCodes entries must be integers 100-599; got ${String(code)}`
+        );
+      }
+    }
   }
 
   for (const [fieldName, value] of [
@@ -437,7 +503,11 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     flushIntervalMs,
     resolveSourceMaps: userConfig.resolveSourceMaps ?? true,
     serverless,
-    onInternalWarning: userConfig.onInternalWarning
+    onInternalWarning: userConfig.onInternalWarning,
+    drivers,
+    silent,
+    sourceMapSyncThresholdBytes,
+    captureMiddlewareStatusCodes,
   };
 }
 

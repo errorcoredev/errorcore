@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Server } from 'node:http';
 import { channel } from 'node:diagnostics_channel';
 import * as fs from 'node:fs';
@@ -16,6 +16,13 @@ import {
 import { createSDK } from '../../src/sdk';
 import { Encryption } from '../../src/security/encryption';
 import { DeadLetterStore } from '../../src/transport/dead-letter-store';
+import {
+  detectBundler,
+  isNextJsNodeRuntime,
+  classifyRecorderStatus,
+  formatStartupLine,
+  formatWarnGuidance
+} from '../../src/sdk-diagnostics';
 
 function createTestSDK() {
   return createSDK({ transport: { type: 'stdout' }, allowUnencrypted: true });
@@ -292,17 +299,16 @@ describe('SDK composition', () => {
 
   it('does not patch Server.prototype.emit until activate and restores fallback patch on shutdown', async () => {
     const originalEmit = Server.prototype.emit;
-    const requestStartChannel = channel('http.server.request.start') as {
-      bindStore?: unknown;
-    };
-    const bindStoreAvailable = typeof requestStartChannel.bindStore === 'function';
     const sdk = createTestSDK();
 
     try {
       expect(Server.prototype.emit).toBe(originalEmit);
 
       sdk.activate();
-      expect(Server.prototype.emit === originalEmit).toBe(bindStoreAvailable);
+      // Post-fix (G2): emit-patch is always installed on activate, regardless
+      // of whether bindStore is available — it is the mechanism that propagates
+      // ALS to handlers registered via server.on('request', ...).
+      expect(Server.prototype.emit).not.toBe(originalEmit);
 
       await sdk.shutdown();
       expect(Server.prototype.emit).toBe(originalEmit);
@@ -524,5 +530,154 @@ describe('SDK composition', () => {
 
     expect(stdoutWrite).toHaveBeenCalled();
     expect(createSDKFacade).toBeDefined();
+  });
+});
+
+describe('G2 — bundler detection', () => {
+  it('detectBundler returns webpack when __webpack_require__ is defined', () => {
+    (globalThis as Record<string, unknown>).__webpack_require__ = () => undefined;
+    try {
+      expect(detectBundler()).toBe('webpack');
+    } finally {
+      delete (globalThis as Record<string, unknown>).__webpack_require__;
+    }
+  });
+
+  it('detectBundler returns unknown otherwise', () => {
+    expect(detectBundler()).toBe('unknown');
+  });
+
+  it('isNextJsNodeRuntime reads NEXT_RUNTIME === nodejs', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    process.env.NEXT_RUNTIME = 'nodejs';
+    try {
+      expect(isNextJsNodeRuntime()).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+
+  it('isNextJsNodeRuntime returns false when NEXT_RUNTIME is absent or edge', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    delete process.env.NEXT_RUNTIME;
+    try {
+      expect(isNextJsNodeRuntime()).toBe(false);
+      process.env.NEXT_RUNTIME = 'edge';
+      expect(isNextJsNodeRuntime()).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+});
+
+describe('G2 — recorder status assembly', () => {
+  it('classifyRecorderStatus emits ok / skip / warn correctly', () => {
+    expect(classifyRecorderStatus({ installed: true })).toEqual({ state: 'ok' });
+    expect(classifyRecorderStatus({ installed: false, reason: 'not-installed' })).toEqual({
+      state: 'skip',
+      reason: 'not-installed'
+    });
+    expect(classifyRecorderStatus({ installed: false, reason: 'bundled-unpatched' })).toEqual({
+      state: 'warn',
+      reason: 'bundled-unpatched'
+    });
+  });
+
+  it('classifyRecorderStatus defaults reason to unknown when omitted on installed=false', () => {
+    expect(classifyRecorderStatus({ installed: false })).toEqual({
+      state: 'skip',
+      reason: 'unknown'
+    });
+  });
+});
+
+describe('G2 — startup line formatting', () => {
+  it('formats a summary line with mixed ok/skip/warn states', () => {
+    const line = formatStartupLine({
+      version: '0.2.0',
+      nodeVersion: '20.11.0',
+      recorders: {
+        'http-server': { state: 'ok' },
+        'pg': { state: 'skip', reason: 'not-installed' },
+        'mongodb': { state: 'warn', reason: 'bundled-unpatched' }
+      }
+    });
+    expect(line).toBe(
+      '[errorcore] 0.2.0 node=20.11.0 recorders: http-server=ok pg=skip(not-installed) mongodb=warn(bundled-unpatched)'
+    );
+  });
+});
+
+describe('G2 — warn guidance formatting', () => {
+  it('returns null for non-warn states', () => {
+    expect(formatWarnGuidance('pg', { state: 'ok' }, { isNextJs: false })).toBeNull();
+    expect(
+      formatWarnGuidance('pg', { state: 'skip', reason: 'not-installed' }, { isNextJs: false })
+    ).toBeNull();
+  });
+
+  it('formats bundled-unpatched for Next.js recommending serverExternalPackages', () => {
+    const msg = formatWarnGuidance(
+      'pg',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: true }
+    );
+    expect(msg).toContain('serverExternalPackages');
+    expect(msg).toContain("'pg'");
+  });
+
+  it('formats bundled-unpatched for non-Next.js recommending drivers option', () => {
+    const msg = formatWarnGuidance(
+      'mongodb',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: false }
+    );
+    expect(msg).toContain("drivers:");
+    expect(msg).toContain("require('mongodb')");
+  });
+});
+
+describe('G2 — startup diagnostic emission', () => {
+  let origLog: typeof console.log;
+  let origWarn: typeof console.warn;
+  let logs: string[];
+
+  beforeEach(() => {
+    logs = [];
+    origLog = console.log;
+    origWarn = console.warn;
+    console.log = (msg: string) => { logs.push(String(msg)); };
+    console.warn = (msg: string) => { logs.push(String(msg)); };
+  });
+  afterEach(() => {
+    console.log = origLog;
+    console.warn = origWarn;
+  });
+
+  it('emits a single summary line when silent is false', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: false
+    });
+    sdk.activate();
+    const line = logs.find((l) => /^\[errorcore\] .* node=.* recorders: /.test(l));
+    expect(line).toBeDefined();
+    expect(line).toContain('http-server=ok');
+    await sdk.shutdown();
+  });
+
+  it('emits nothing matching [errorcore] <version> when silent is true', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true
+    });
+    sdk.activate();
+    const summaryLines = logs.filter((l) => /^\[errorcore\] \d+\.\d+\.\d+ node=/.test(l));
+    expect(summaryLines).toEqual([]);
+    await sdk.shutdown();
   });
 });

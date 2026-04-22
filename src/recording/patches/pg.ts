@@ -6,6 +6,8 @@ import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
 import { redactSensitiveQueryText } from '../../pii/scrubber';
 import { pushIOEvent } from '../utils';
+import type { RecorderState } from '../../sdk-diagnostics';
+import { detectBundler } from '../../sdk-diagnostics';
 
 const nodeRequire = createRequire(__filename);
 
@@ -246,9 +248,15 @@ function instrumentQuery(
   };
 }
 
-export function install(deps: PatchInstallDeps): () => void {
+export function install(deps: PatchInstallDeps): { uninstall: () => void; state: RecorderState } {
+  if (deps.explicitDriver === undefined && detectBundler() === 'webpack') {
+    return {
+      uninstall: () => undefined,
+      state: { state: 'warn', reason: 'bundled-unpatched' }
+    };
+  }
   try {
-    const pg = nodeRequire('pg') as {
+    const pg = (deps.explicitDriver ?? nodeRequire('pg')) as {
       Client?: { prototype?: object };
       Pool?: { prototype?: object };
     };
@@ -265,7 +273,7 @@ export function install(deps: PatchInstallDeps): () => void {
       );
     }
 
-    return () => {
+    const uninstall = () => {
       if (pg.Client?.prototype !== undefined) {
         unwrapMethod(pg.Client.prototype, 'query');
       }
@@ -274,11 +282,18 @@ export function install(deps: PatchInstallDeps): () => void {
         unwrapMethod(pg.Pool.prototype, 'query');
       }
     };
+    return { uninstall, state: { state: 'ok' } };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') {
-      console.warn('[ErrorCore] Failed to install pg patch');
+    if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {
+      return {
+        uninstall: () => undefined,
+        state: { state: 'skip', reason: 'not-installed' }
+      };
     }
-
-    return () => undefined;
+    console.warn('[ErrorCore] Failed to install pg patch');
+    return {
+      uninstall: () => undefined,
+      state: { state: 'skip', reason: 'install-failed' }
+    };
   }
 }

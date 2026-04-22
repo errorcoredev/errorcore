@@ -135,6 +135,18 @@ export interface Completeness {
   encrypted: boolean;
   captureFailures: string[];
   rateLimiterDrops?: RateLimiterDropSummary;
+  localVariablesCaptureLayer?: 'tag' | 'identity';
+  localVariablesDegradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'background';
+  localVariablesFrameAlignment?: 'full' | 'prefix_only';
+  sourceMapResolution?: {
+    framesResolved: number;
+    framesUnresolved: number;
+    cacheHits: number;
+    cacheMisses: number;
+    missing: number;
+    corrupt: number;
+    evictions: number;
+  };
 }
 
 export interface ErrorInfo {
@@ -300,6 +312,20 @@ export interface ErrorPackageParts {
     spanId: string;
     parentSpanId: string | null;
   };
+  sourceMapResolution?: {
+    framesResolved: number;
+    framesUnresolved: number;
+    cacheHits: number;
+    cacheMisses: number;
+    missing: number;
+    corrupt: number;
+    evictions: number;
+  };
+  /** Layer 1/2 telemetry threaded from InspectorManager.getLocalsWithDiagnostics */
+  localVariablesCaptureLayer?: 'tag' | 'identity';
+  localVariablesDegradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'background';
+  /** Layer 3 alignment flag — set by PackageBuilder.build() */
+  localVariablesFrameAlignment?: 'full' | 'prefix_only';
 }
 
 export interface PackageAssemblyResult {
@@ -374,6 +400,15 @@ export interface SDKConfig {
   resolveSourceMaps?: boolean;
   serverless?: boolean | 'auto';
   onInternalWarning?: (warning: { code: string; message: string; count: number }) => void;
+  drivers?: {
+    pg?: unknown;
+    mongodb?: unknown;
+    mysql2?: unknown;
+    ioredis?: unknown;
+  };
+  silent?: boolean;
+  sourceMapSyncThresholdBytes?: number;
+  captureMiddlewareStatusCodes?: number[] | 'none' | 'all';
 }
 
 export interface ResolvedConfig {
@@ -413,6 +448,15 @@ export interface ResolvedConfig {
   resolveSourceMaps: boolean;
   serverless: boolean;
   onInternalWarning: ((warning: { code: string; message: string; count: number }) => void) | undefined;
+  drivers: {
+    pg?: unknown;
+    mongodb?: unknown;
+    mysql2?: unknown;
+    ioredis?: unknown;
+  };
+  silent: boolean;
+  sourceMapSyncThresholdBytes: number;
+  captureMiddlewareStatusCodes: number[] | 'none' | 'all';
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {

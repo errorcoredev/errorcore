@@ -144,3 +144,35 @@ Every handler is wrapped: `(message, name) => { try { recorder.handleX(message) 
 - Handlers are wrapped in try/catch.
 - Graceful degradation for missing channels.
 - All unit tests pass.
+
+---
+
+## 0.2.0 Additions
+
+### Dual subscribe for response-finished events (G2)
+
+**Problem.** The response-finished `diagnostics_channel` name changed across Node versions. Older Node versions emit `http.server.response.finish`; newer Node versions emit `http.server.response.created`. Subscribing to only one channel causes response finalization to be missed on the other version family.
+
+**Fix.** Subscribe to **both** channels when available. Deduplicate by request identity using a `WeakSet<IncomingMessage>` so a request that triggers both channels (if both are emitted in a given version) only produces one finalized IOEventSlot.
+
+**Updated channel registry:**
+
+```
+http.server.request.start       -> httpServer.handleRequestStart
+http.server.response.finish     -> httpServer.handleResponseFinish   (if available)
+http.server.response.created    -> httpServer.handleResponseFinish   (if available, deduplicated)
+http.client.request.start       -> httpClient.handleRequestStart
+undici:request:create           -> undiciRecorder.handleRequestCreate
+undici:request:headers          -> undiciRecorder.handleRequestHeaders
+undici:request:trailers         -> undiciRecorder.handleRequestTrailers
+undici:request:error            -> undiciRecorder.handleRequestError
+net.client.socket               -> netDns.handleNetConnect  (if available)
+net.server.socket               -> netDns.handleNetConnect  (if available)
+```
+
+**Deduplication contract.** `HttpServerRecorder` maintains a `WeakSet<IncomingMessage>` (`_finalizedRequests`). `handleResponseFinish(message)` checks `_finalizedRequests.has(message.request)` before acting. If already present, return immediately. Otherwise add the request to the set and proceed with finalization. The WeakSet holds no strong reference — entries are GC'd with the request object.
+
+**Rationale.** The dual-subscribe approach is safer than a runtime version-sniff (`process.version`) because:
+1. The channel simply will not fire on versions that don't support it — `dc.subscribe` on a non-existent channel name is a no-op (graceful degradation already handled by the existing `subscribeAll` pattern).
+2. Version strings are fragile as a long-term condition (Node releases, custom builds, Bun compatibility).
+3. WeakSet dedup is O(1) and allocation-free on the common case where only one channel fires per request.

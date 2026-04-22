@@ -6,6 +6,7 @@ import { install as installMongodbPatch } from './mongodb';
 import { install as installMysql2Patch } from './mysql2';
 import { install as installPgPatch } from './pg';
 import type { IOEventSlot, RequestContext, ResolvedConfig } from '../../types';
+import type { RecorderState } from '../../sdk-diagnostics';
 
 const OWNED_METHODS = Symbol('errorcore.ownedMethods');
 const SDK_WRAPPER_OWNER = Symbol('errorcore.sdkWrapperOwner');
@@ -34,6 +35,14 @@ export interface PatchInstallDeps {
   buffer: IOEventBufferLike;
   als: ALSManagerLike;
   config: ResolvedConfig;
+  /**
+   * When set, the installer MUST patch methods on this reference instead of
+   * resolving the driver via nodeRequire(). Used for webpack-bundled
+   * environments where the app's bundled copy of the driver is distinct from
+   * what nodeRequire() would return. Passed through from config.drivers by
+   * PatchManager.
+   */
+  explicitDriver?: unknown;
 }
 
 type OwnedWrapperFunction = Function & {
@@ -179,6 +188,8 @@ export function unwrapMethod(target: object, methodName: string): void {
 export class PatchManager {
   private readonly deps: PatchInstallDeps;
 
+  private readonly recorderStates: Record<string, RecorderState> = {};
+
   private uninstallers: Array<() => void> = [];
 
   public constructor(deps: PatchInstallDeps) {
@@ -186,12 +197,20 @@ export class PatchManager {
   }
 
   public installAll(): void {
-    this.uninstallers = [
-      installPgPatch(this.deps),
-      installMysql2Patch(this.deps),
-      installIoredisPatch(this.deps),
-      installMongodbPatch(this.deps)
-    ];
+    const { drivers } = this.deps.config;
+    const pg = installPgPatch({ ...this.deps, explicitDriver: drivers.pg });
+    const mysql2 = installMysql2Patch({ ...this.deps, explicitDriver: drivers.mysql2 });
+    const ioredis = installIoredisPatch({ ...this.deps, explicitDriver: drivers.ioredis });
+    const mongodb = installMongodbPatch({ ...this.deps, explicitDriver: drivers.mongodb });
+    this.uninstallers = [pg.uninstall, mysql2.uninstall, ioredis.uninstall, mongodb.uninstall];
+    this.recorderStates.pg = pg.state;
+    this.recorderStates.mysql2 = mysql2.state;
+    this.recorderStates.ioredis = ioredis.state;
+    this.recorderStates.mongodb = mongodb.state;
+  }
+
+  public getRecorderStates(): Record<string, RecorderState> {
+    return { ...this.recorderStates };
   }
 
   public unwrapAll(): void {

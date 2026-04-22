@@ -5,6 +5,8 @@ import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
 import { pushIOEvent } from '../utils';
+import type { RecorderState } from '../../sdk-diagnostics';
+import { detectBundler } from '../../sdk-diagnostics';
 
 const nodeRequire = createRequire(__filename);
 
@@ -36,9 +38,15 @@ function pushEvent(
   pushIOEvent(context, slot, deps.config.bufferSize);
 }
 
-export function install(deps: PatchInstallDeps): () => void {
+export function install(deps: PatchInstallDeps): { uninstall: () => void; state: RecorderState } {
+  if (deps.explicitDriver === undefined && detectBundler() === 'webpack') {
+    return {
+      uninstall: () => undefined,
+      state: { state: 'warn', reason: 'bundled-unpatched' }
+    };
+  }
   try {
-    const Redis = nodeRequire('ioredis') as { prototype?: object };
+    const Redis = (deps.explicitDriver ?? nodeRequire('ioredis')) as { prototype?: object };
 
     if (Redis.prototype !== undefined) {
       wrapMethod(Redis.prototype, 'sendCommand', (original) => {
@@ -136,16 +144,23 @@ export function install(deps: PatchInstallDeps): () => void {
       });
     }
 
-    return () => {
+    const uninstall = () => {
       if (Redis.prototype !== undefined) {
         unwrapMethod(Redis.prototype, 'sendCommand');
       }
     };
+    return { uninstall, state: { state: 'ok' } };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') {
-      console.warn('[ErrorCore] Failed to install ioredis patch');
+    if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {
+      return {
+        uninstall: () => undefined,
+        state: { state: 'skip', reason: 'not-installed' }
+      };
     }
-
-    return () => undefined;
+    console.warn('[ErrorCore] Failed to install ioredis patch');
+    return {
+      uninstall: () => undefined,
+      state: { state: 'skip', reason: 'install-failed' }
+    };
   }
 }

@@ -8,6 +8,7 @@ import type { Socket } from 'node:net';
 import type { IOEventSlot, RequestContext, ResolvedConfig } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
+import type { RecorderState } from '../sdk-diagnostics';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
@@ -69,6 +70,8 @@ interface BindStoreChannel {
 }
 
 const RESPONSE_FINALIZER = Symbol('errorcore.responseFinalizer');
+
+const FINALIZED_REQUESTS = new WeakSet<IncomingMessage>();
 
 type ResponseWithFinalizer = ServerResponse & {
   [RESPONSE_FINALIZER]?: RequestFinalizer;
@@ -181,10 +184,12 @@ class RequestFinalizer {
 function handleResponseClose(this: ServerResponse): void {
   const response = this as ResponseWithFinalizer;
   const finalizer = response[RESPONSE_FINALIZER];
-
   if (finalizer === undefined) {
     return;
   }
+  const request = finalizer.request;
+  if (FINALIZED_REQUESTS.has(request)) return;
+  FINALIZED_REQUESTS.add(request);
 
   finalizer.finalize(
     !((response.writableFinished ?? false) || response.writableEnded)
@@ -236,22 +241,30 @@ export class HttpServerRecorder {
 
   public install(): void {
     this.tryBindStore();
-    if (!this.bindStoreSucceeded) {
-      this.installEmitPatch();
-    }
+    // Always install the emit-patch. bindStore wraps channel subscribers
+    // with store.run() during channel.publish(), but it does NOT set the
+    // ALS for the downstream server.emit('request', req, res) call. As a
+    // result, request handlers registered via server.on('request', ...)
+    // (Next.js, Fastify, any framework that uses the event) run outside
+    // our ALS scope when only bindStore is active. The emit-patch wraps
+    // Server.prototype.emit('request') in als.runWithContext(), which is
+    // the mechanism that makes the context available to those handlers.
+    // bindStore and emit-patch use the same WeakMap<IncomingMessage,
+    // RequestContext> backing store, so they return the same context for
+    // the same request — no double-registration.
+    this.installEmitPatch();
   }
 
   public handleRequestStart(message: {
     request: IncomingMessage;
     response: ServerResponse;
-    socket: Socket;
+    socket?: Socket;
     server: Server;
   }): void {
     try {
       if (
         message.request === undefined ||
-        message.response === undefined ||
-        message.socket === undefined
+        message.response === undefined
       ) {
         return;
       }
@@ -276,7 +289,7 @@ export class HttpServerRecorder {
       event.method = context.method;
       event.url = context.url;
       event.statusCode = null;
-      event.fd = extractFd(socket);
+      event.fd = socket === undefined ? null : extractFd(socket);
       event.requestHeaders = context.headers;
       event.responseHeaders = null;
       event.requestBody = null;
@@ -325,9 +338,31 @@ export class HttpServerRecorder {
     }
   }
 
+  public handleResponseFinish(message: unknown): void {
+    try {
+      const request = (message as { request?: IncomingMessage }).request;
+      const response = (message as { response?: ServerResponse }).response;
+      if (request === undefined || response === undefined) return;
+      if (FINALIZED_REQUESTS.has(request)) return;
+      FINALIZED_REQUESTS.add(request);
+
+      const finalizer = (response as ResponseWithFinalizer)[RESPONSE_FINALIZER];
+      if (finalizer === undefined) return;
+      // Channel-driven finalization is never "aborted" — response.finish/created fire on clean lifecycle.
+      finalizer.finalize(false);
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      console.warn(`[ErrorCore] Failed to finalize response via channel: ${messageText}`);
+    }
+  }
+
   public shutdown(): void {
     this.emitPatchRestore?.();
     this.emitPatchRestore = null;
+  }
+
+  public getState(): RecorderState {
+    return { state: 'ok' };
   }
 
   public getBindStorePath(): 'bindStore' | 'emit-patch' {

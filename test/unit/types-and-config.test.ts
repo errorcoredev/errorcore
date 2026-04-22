@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { resolveConfig } from '../../src/config';
+import { resolveConfig, __resetLegacyInsecureTransportWarning } from '../../src/config';
 import type {
   ErrorInfo,
   ErrorPackage,
@@ -105,7 +105,12 @@ describe('resolveConfig', () => {
       useWorkerAssembly: true,
       flushIntervalMs: 5000,
       resolveSourceMaps: true,
-      serverless: false
+      serverless: false,
+      onInternalWarning: undefined,
+      drivers: {},
+      silent: false,
+      sourceMapSyncThresholdBytes: 2 * 1024 * 1024,
+      captureMiddlewareStatusCodes: 'none'
     });
   });
 
@@ -294,18 +299,6 @@ describe('resolveConfig', () => {
       allowPlainHttpTransport: true,
       allowInvalidCollectorCertificates: true
     });
-  });
-
-  it('rejects the removed allowInsecureTransport alias with a clear error', () => {
-    expect(() =>
-      resolveConfig({
-        transport: { type: 'stdout' },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        allowInsecureTransport: true as unknown as never,
-        allowUnencrypted: true
-        // @ts-expect-error verifying rejected legacy field
-      } as Record<string, unknown>)
-    ).toThrow('allowInsecureTransport was removed');
   });
 
   it('defaults allowUnencrypted to !isProduction() so zero-config dev works', () => {
@@ -497,5 +490,159 @@ describe('type exports', () => {
     expect(errorPackage.schemaVersion).toBe('1.0.0');
     expect(limits.maxPayloadSize).toBe(1024);
     expect(resolved.transport.type).toBe('stdout');
+  });
+});
+
+describe('0.2.0 config surface', () => {
+  it('accepts drivers with per-driver references', () => {
+    const fakePg = { Client: { prototype: {} } };
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      drivers: { pg: fakePg }
+    });
+    expect(resolved.drivers.pg).toBe(fakePg);
+    expect(resolved.drivers.mongodb).toBeUndefined();
+  });
+
+  it('defaults drivers to empty object when omitted', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(resolved.drivers).toEqual({});
+  });
+
+  it('defaults silent=false, sourceMapSyncThresholdBytes=2MB, captureMiddlewareStatusCodes=none', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(resolved.silent).toBe(false);
+    expect(resolved.sourceMapSyncThresholdBytes).toBe(2 * 1024 * 1024);
+    expect(resolved.captureMiddlewareStatusCodes).toBe('none');
+  });
+
+  it('accepts captureMiddlewareStatusCodes as all, none, or integer array', () => {
+    const all = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: 'all' });
+    const none = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: 'none' });
+    const arr = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: [401, 500] });
+    expect(all.captureMiddlewareStatusCodes).toBe('all');
+    expect(none.captureMiddlewareStatusCodes).toBe('none');
+    expect(arr.captureMiddlewareStatusCodes).toEqual([401, 500]);
+  });
+
+  it('rejects non-integer or out-of-range captureMiddlewareStatusCodes entries', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: [401, 99]
+    })).toThrow(/captureMiddlewareStatusCodes/);
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: [401, 600]
+    })).toThrow(/captureMiddlewareStatusCodes/);
+  });
+
+  it('rejects captureMiddlewareStatusCodes when not string-union or array', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: 401 as never
+    })).toThrow(/captureMiddlewareStatusCodes/);
+  });
+});
+
+describe('G4 — allowInsecureTransport semantics', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Reset the module-scoped one-shot warn flag between tests
+    __resetLegacyInsecureTransportWarning();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('accepts allowInsecureTransport: false as a no-op with a one-shot warn', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: false
+    } as never)).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/allowInsecureTransport.*deprecated/i);
+
+    // Second call within the same process should not re-warn
+    resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: false
+    } as never);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects allowInsecureTransport: true with actionable error', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: true
+    } as never)).toThrow(/allowPlainHttpTransport/);
+  });
+
+  it('rejects allowInsecureTransport: true + allowPlainHttpTransport: false as contradiction', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: true,
+      allowPlainHttpTransport: false
+    } as never)).toThrow(/contradiction/i);
+  });
+
+  it('absence of allowInsecureTransport does not warn', () => {
+    resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Completeness schema — 0.2.0 additions', () => {
+  it('Completeness accepts new optional fields without breaking existing consumers', () => {
+    const c: import('../../src/types').Completeness = {
+      requestCaptured: true,
+      requestBodyTruncated: false,
+      ioTimelineCaptured: true,
+      usedAmbientEvents: false,
+      ioEventsDropped: 0,
+      ioPayloadsTruncated: 0,
+      alsContextAvailable: true,
+      localVariablesCaptured: true,
+      localVariablesTruncated: false,
+      stateTrackingEnabled: false,
+      stateReadsCaptured: false,
+      concurrentRequestsCaptured: true,
+      piiScrubbed: true,
+      encrypted: false,
+      captureFailures: [],
+      localVariablesCaptureLayer: 'tag',
+      localVariablesDegradation: 'exact',
+      localVariablesFrameAlignment: 'full',
+      sourceMapResolution: {
+        framesResolved: 3,
+        framesUnresolved: 0,
+        cacheHits: 3,
+        cacheMisses: 0,
+        missing: 0,
+        corrupt: 0,
+        evictions: 0
+      }
+    };
+    expect(c.localVariablesCaptureLayer).toBe('tag');
+    expect(c.sourceMapResolution?.framesResolved).toBe(3);
   });
 });
