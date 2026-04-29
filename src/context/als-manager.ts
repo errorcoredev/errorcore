@@ -2,7 +2,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomBytes } from 'node:crypto';
 
-import type { RequestContext } from '../types';
+import { EventClock } from './event-clock';
+import { parseTracestate, formatTracestate } from './tracestate';
+import type { RequestContext, ResolvedConfig } from '../types';
+
+const DEFAULT_VENDOR_KEY = 'ec';
 
 function parseTraceparent(header: string | undefined): {
   traceId: string;
@@ -33,9 +37,20 @@ export class ALSManager {
 
   private readonly pidPrefix: string;
 
-  public constructor() {
+  private readonly eventClock: EventClock;
+
+  private readonly vendorKey: string;
+
+  public constructor(deps: {
+    eventClock?: EventClock;
+    config?: Pick<ResolvedConfig, 'traceContext'>;
+  } = {}) {
     this.store = new AsyncLocalStorage<RequestContext>();
     this.pidPrefix = `${process.pid}-`;
+    // EventClock + config are optional for test ergonomics; the SDK
+    // composition root passes both explicitly.
+    this.eventClock = deps.eventClock ?? new EventClock();
+    this.vendorKey = deps.config?.traceContext?.vendorKey ?? DEFAULT_VENDOR_KEY;
   }
 
   public createRequestContext(req: {
@@ -44,6 +59,7 @@ export class ALSManager {
     // Callers pass a fresh, request-scoped headers object that this context owns.
     headers: Record<string, string>;
     traceparent?: string;
+    tracestate?: string;
   }): RequestContext {
     // Wrap at Number.MAX_SAFE_INTEGER so the counter never produces a
     // non-integer id. In practice a process would have to sustain
@@ -58,6 +74,16 @@ export class ALSManager {
     const spanId = generateSpanId();
     const parentSpanId = parsed?.parentSpanId ?? null;
 
+    // W3C tracestate ingest (module 21): merge any peer clock value before
+    // any seq is consumed in this request, so subsequent stamps within this
+    // request are guaranteed to exceed the peer's clk:<n>.
+    const parsedTs = parseTracestate(req.tracestate, this.vendorKey);
+    if (parsedTs.receivedSeq !== null) {
+      this.eventClock.merge(parsedTs.receivedSeq);
+    }
+    const inheritedTracestate =
+      parsedTs.inheritedEntries.length > 0 ? parsedTs.inheritedEntries : undefined;
+
     return {
       requestId,
       startTime: process.hrtime.bigint(),
@@ -69,11 +95,27 @@ export class ALSManager {
       ioEvents: [],
       stateReads: [],
       stateWrites: [],
-      // inheritedTracestate is populated in module 21; left undefined here.
+      inheritedTracestate,
       traceId,
       spanId,
       parentSpanId
     };
+  }
+
+  /**
+   * Build the outbound `tracestate` value for the current ALS context. Returns
+   * null if there is no active context (recorders skip header injection in
+   * that case). The returned string carries our entry leftmost (most recent)
+   * followed by inherited vendor entries, capped to W3C limits.
+   */
+  public formatOutboundTracestate(): string | null {
+    const ctx = this.getContext();
+    if (ctx === undefined) return null;
+    return formatTracestate(
+      this.eventClock.current(),
+      ctx.inheritedTracestate,
+      this.vendorKey
+    );
   }
 
   public releaseRequestContext(_context: RequestContext): void {}

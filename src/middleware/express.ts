@@ -35,7 +35,8 @@ export function expressMiddleware(sdk?: SDKInstanceLike) {
         method: req.method,
         url: req.url,
         headers: filterHeaders(instance, req.headers),
-        traceparent: req.headers['traceparent'] as string | undefined
+        traceparent: req.headers['traceparent'] as string | undefined,
+        tracestate: req.headers['tracestate'] as string | undefined
       });
 
       instance.requestTracker.add(ctx);

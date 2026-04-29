@@ -11,6 +11,7 @@ export interface SDKInstanceLike {
       url: string;
       headers: Record<string, string>;
       traceparent?: string;
+      tracestate?: string;
     }): RequestContext;
     getContext?(): RequestContext | undefined;
     runWithContext<T>(ctx: RequestContext, fn: () => T): T;

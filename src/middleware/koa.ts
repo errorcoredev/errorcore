@@ -30,7 +30,8 @@ export function koaMiddleware(sdk?: SDKInstanceLike) {
         method: ctx.request.method,
         url: ctx.request.url,
         headers: filterHeaders(instance, ctx.request.headers),
-        traceparent: ctx.request.headers['traceparent'] as string | undefined
+        traceparent: ctx.request.headers['traceparent'] as string | undefined,
+        tracestate: ctx.request.headers['tracestate'] as string | undefined
       });
 
       instance.requestTracker.add(requestContext);

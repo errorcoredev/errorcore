@@ -65,10 +65,13 @@ export function withErrorcore<
     try {
       const headers: Record<string, string> = {};
       let traceparent: string | undefined;
+      let tracestate: string | undefined;
       req.headers.forEach((value, key) => {
         headers[key] = value;
         if (key === 'traceparent') {
           traceparent = value;
+        } else if (key === 'tracestate') {
+          tracestate = value;
         }
       });
 
@@ -76,7 +79,8 @@ export function withErrorcore<
         method: req.method,
         url: req.url,
         headers: filterHeaders(instance, headers),
-        traceparent
+        traceparent,
+        tracestate
       });
     } catch {
       return handler(req, routeContext);

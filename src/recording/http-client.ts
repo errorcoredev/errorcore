@@ -20,6 +20,7 @@ interface IOEventBufferLike {
 
 interface ALSManagerLike {
   getContext(): RequestContext | undefined;
+  formatOutboundTracestate?(): string | null;
 }
 
 interface BodyCaptureLike {
@@ -123,6 +124,12 @@ export class HttpClientRecorder {
         const traceparent = `00-${context.traceId}-${context.spanId}-01`;
         try {
           request.setHeader('traceparent', traceparent);
+          // Module 21: prepend our ec=clk:<n> entry to inherited vendor
+          // entries from ingress and emit alongside traceparent.
+          const tracestate = this.als.formatOutboundTracestate?.() ?? null;
+          if (tracestate !== null && tracestate.length > 0) {
+            request.setHeader('tracestate', tracestate);
+          }
         } catch {
           // Request might already be sent or header immutable
         }

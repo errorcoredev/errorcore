@@ -40,7 +40,8 @@ export function fastifyPlugin(sdk?: SDKInstanceLike) {
           method: request.raw.method,
           url: request.raw.url,
           headers: filterHeaders(instance, request.raw.headers),
-          traceparent: request.raw.headers['traceparent'] as string | undefined
+          traceparent: request.raw.headers['traceparent'] as string | undefined,
+          tracestate: request.raw.headers['tracestate'] as string | undefined
         });
 
         instance.requestTracker.add(ctx);

@@ -337,7 +337,11 @@ export class ErrorCapturer {
         traceContext: context ? {
           traceId: context.traceId,
           spanId: context.spanId,
-          parentSpanId: context.parentSpanId
+          parentSpanId: context.parentSpanId,
+          // Module 21: carry the INBOUND tracestate verbatim. The egress
+          // version we emit on outbound HTTP is built fresh from the live
+          // EventClock; that's not what the package records.
+          tracestate: context.headers['tracestate']
         } : undefined,
         sourceMapResolution: sourceMapTelemetry
       };

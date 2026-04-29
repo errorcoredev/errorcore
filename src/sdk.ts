@@ -607,7 +607,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     maxBytes: config.bufferMaxBytes,
     eventClock
   });
-  const als = new ALSManager();
+  const als = new ALSManager({ eventClock, config });
   const headerFilter = new HeaderFilter(config);
   const scrubber = new Scrubber(config);
   const rateLimiter = new RateLimiter({

@@ -42,7 +42,8 @@ export const hapiPlugin = {
           method: request.method.toUpperCase(),
           url: request.url.pathname,
           headers: filterHeaders(instance, request.headers),
-          traceparent: request.headers['traceparent'] as string | undefined
+          traceparent: request.headers['traceparent'] as string | undefined,
+          tracestate: request.headers['tracestate'] as string | undefined
         });
 
         instance.requestTracker.add(ctx);

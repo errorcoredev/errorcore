@@ -13,6 +13,7 @@ interface IOEventBufferLike {
 
 interface ALSManagerLike {
   getContext(): RequestContext | undefined;
+  formatOutboundTracestate?(): string | null;
 }
 
 interface HeaderFilterLike {
@@ -87,6 +88,11 @@ export class UndiciRecorder {
         try {
           if (typeof (request as any).addHeader === 'function') {
             (request as any).addHeader('traceparent', traceparent);
+            // Module 21: emit ec=clk:<n> alongside traceparent.
+            const tracestate = this.als.formatOutboundTracestate?.() ?? null;
+            if (tracestate !== null && tracestate.length > 0) {
+              (request as any).addHeader('tracestate', tracestate);
+            }
           }
         } catch {
           // Undici request object might not support addHeader

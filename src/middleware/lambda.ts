@@ -51,7 +51,7 @@ function detectEventSource(event: Record<string, unknown>): string {
 function extractRequestContext(
   event: unknown,
   lambdaContext: LambdaContext
-): { method: string; url: string; headers: Record<string, string>; eventSource: string; traceparent?: string } {
+): { method: string; url: string; headers: Record<string, string>; eventSource: string; traceparent?: string; tracestate?: string } {
   if (event == null || typeof event !== 'object') {
     return { method: 'INVOKE', url: `invoke/${lambdaContext.functionName}`, headers: {}, eventSource: 'invoke' };
   }
@@ -68,7 +68,7 @@ function extractRequestContext(
     const method = typeof http.method === 'string' ? http.method : 'GET';
     const url = typeof ev.rawPath === 'string' ? ev.rawPath : typeof ev.path === 'string' ? ev.path : '/';
     const headers = normalizeHeaders(ev.headers);
-    return { method, url, headers, eventSource: 'apigateway-v2', traceparent: headers['traceparent'] };
+    return { method, url, headers, eventSource: 'apigateway-v2', traceparent: headers['traceparent'], tracestate: headers['tracestate'] };
   }
 
   // API Gateway v1 / REST API
@@ -91,14 +91,15 @@ function extractRequestContext(
     }
 
     const isAlb = (ev.requestContext as Record<string, unknown>).elb != null;
-    return { method, url, headers, eventSource: isAlb ? 'alb' : 'apigateway-v1', traceparent: headers['traceparent'] };
+    return { method, url, headers, eventSource: isAlb ? 'alb' : 'apigateway-v1', traceparent: headers['traceparent'], tracestate: headers['tracestate'] };
   }
 
   // Non-HTTP events (SQS, SNS, S3, DynamoDB, EventBridge, Kinesis, Step Functions)
   const eventSource = detectEventSource(ev);
   let traceparent: string | undefined;
+  let tracestate: string | undefined;
 
-  // Check SQS message attributes for traceparent
+  // Check SQS message attributes for traceparent / tracestate
   if (eventSource === 'sqs' && Array.isArray(ev.Records)) {
     const first = ev.Records[0] as Record<string, unknown>;
     if (first.messageAttributes != null && typeof first.messageAttributes === 'object') {
@@ -109,6 +110,12 @@ function extractRequestContext(
           traceparent = tp.stringValue;
         }
       }
+      if (attrs.tracestate != null && typeof attrs.tracestate === 'object') {
+        const ts = attrs.tracestate as Record<string, unknown>;
+        if (typeof ts.stringValue === 'string') {
+          tracestate = ts.stringValue;
+        }
+      }
     }
   }
 
@@ -117,7 +124,8 @@ function extractRequestContext(
     url: `${eventSource}/${lambdaContext.functionName}`,
     headers: {},
     eventSource,
-    traceparent
+    traceparent,
+    tracestate
   };
 }
 
@@ -142,7 +150,8 @@ export function wrapLambda<TEvent = unknown, TResult = unknown>(
         method: extracted.method,
         url: extracted.url,
         headers: filteredHeaders,
-        traceparent: extracted.traceparent
+        traceparent: extracted.traceparent,
+        tracestate: extracted.tracestate
       });
     } catch {
       return handler(event, lambdaContext);
@@ -255,7 +264,8 @@ export function wrapServerless<TArgs extends unknown[], TResult>(
         method: extracted.method,
         url: extracted.url,
         headers: filterHeaders(instance, extracted.headers),
-        traceparent: extracted.headers['traceparent']
+        traceparent: extracted.headers['traceparent'],
+        tracestate: extracted.headers['tracestate']
       });
     } catch {
       return handler(...args);
