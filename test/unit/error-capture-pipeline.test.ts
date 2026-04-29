@@ -6,8 +6,14 @@ import { Scrubber } from '../../src/pii/scrubber';
 import { Encryption } from '../../src/security/encryption';
 import { RateLimiter } from '../../src/security/rate-limiter';
 import { ALSManager } from '../../src/context/als-manager';
+import { EventClock } from '../../src/context/event-clock';
 import { RequestTracker } from '../../src/context/request-tracker';
 import { IOEventBuffer } from '../../src/buffer/io-event-buffer';
+
+function makeBuffer(opts: { capacity: number; maxBytes: number }): IOEventBuffer {
+  const Ctor = IOEventBuffer;
+  return new Ctor({ ...opts, eventClock: new EventClock() });
+}
 import {
   buildPackageAssemblyResult,
   finalizePackageAssemblyResult,
@@ -868,7 +874,7 @@ describe('ErrorCapturer', () => {
 
   it('captures a full package with context, locals, io events, encryption, and transport handoff', async () => {
     const config = resolveConfig({ encryptionKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789' });
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-err');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -972,7 +978,7 @@ describe('ErrorCapturer', () => {
 
   it('dispatches to worker assembly when dispatcher is available and returns null', async () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-worker');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -1022,7 +1028,7 @@ describe('ErrorCapturer', () => {
 
   it('falls back to inline assembly when worker assembly throws', async () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-fallback');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -1075,7 +1081,7 @@ describe('ErrorCapturer', () => {
     const config = resolveConfig({
       piiScrubber: (_key, value) => value
     });
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-inline');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -1131,7 +1137,7 @@ describe('ErrorCapturer', () => {
       shutdown: vi.fn(async () => undefined)
     };
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 }),
+      buffer: makeBuffer({ capacity: 20, maxBytes: 1_000_000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1155,7 +1161,7 @@ describe('ErrorCapturer', () => {
 
   it('uses ambient events when ALS context is unavailable', () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const processMetadata = new ProcessMetadata(config);
@@ -1200,7 +1206,7 @@ describe('ErrorCapturer', () => {
   it('returns null when rate limited', () => {
     const config = resolveConfig({});
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 0, windowMs: 60_000 }),
@@ -1233,7 +1239,7 @@ describe('ErrorCapturer', () => {
     const processMetadata = new ProcessMetadata(config);
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1297,7 +1303,7 @@ describe('ErrorCapturer', () => {
         encryption: new Encryption(config.encryptionKey as string)
       });
       const capturer = new ErrorCapturer({
-        buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+        buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
         als: new ALSManager(),
         inspector: {
           getLocals: vi.fn(() => null),
@@ -1400,7 +1406,7 @@ describe('ErrorCapturer', () => {
           encryption: new Encryption(encryptionKey)
         });
         const capturer = new ErrorCapturer({
-          buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+          buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
           als: new ALSManager(),
           inspector: {
             getLocals: vi.fn(() => null),
@@ -1503,7 +1509,7 @@ describe('ErrorCapturer', () => {
           encryption: new Encryption(encryptionKey)
         });
         const capturer = new ErrorCapturer({
-          buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+          buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
           als: new ALSManager(),
           inspector: {
             getLocals: vi.fn(() => null),
@@ -1559,7 +1565,7 @@ describe('ErrorCapturer', () => {
     const processMetadata = new ProcessMetadata(config);
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1598,7 +1604,7 @@ describe('ErrorCapturer', () => {
 
   it('emits sanitized warning codes when worker fallback capture also fails', async () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-fallback-warning');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -1652,7 +1658,7 @@ describe('ErrorCapturer', () => {
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1705,7 +1711,7 @@ describe('ErrorCapturer', () => {
     }
 
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1734,7 +1740,7 @@ describe('ErrorCapturer', () => {
 
   it('includes ambientContext when ALS context is unavailable', () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const processMetadata = new ProcessMetadata(config);
@@ -1769,7 +1775,7 @@ describe('ErrorCapturer', () => {
 
   it('includes eviction log in the package', () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 1, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 1, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const processMetadata = new ProcessMetadata(config);
@@ -1806,7 +1812,7 @@ describe('ErrorCapturer', () => {
   it('includes timeAnchor in every package', () => {
     const config = resolveConfig({});
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1834,7 +1840,7 @@ describe('ErrorCapturer', () => {
 
     const rateLimiter = new RateLimiter({ maxCaptures: 1, windowMs: 1000 });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter,
@@ -1867,7 +1873,7 @@ describe('ErrorCapturer', () => {
   it('records inspector miss reason in captureFailures when locals capture is enabled', () => {
     const config = resolveConfig({ captureLocalVariables: true });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: {
         getLocals: vi.fn(() => null),
@@ -1903,7 +1909,7 @@ describe('G3 — sourceMapResolution telemetry in completeness', () => {
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const sourceMapResolver = new SourceMapResolver();
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),

@@ -7,7 +7,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { IOEventBuffer } from '../../src/buffer/io-event-buffer';
 import { ALSManager } from '../../src/context/als-manager';
+import { EventClock } from '../../src/context/event-clock';
 import { RequestTracker } from '../../src/context/request-tracker';
+
+function makeBuffer(opts: { capacity: number; maxBytes: number }): IOEventBuffer {
+  const Ctor = IOEventBuffer;
+  return new Ctor({ ...opts, eventClock: new EventClock() });
+}
 import { HeaderFilter } from '../../src/pii/header-filter';
 import { Scrubber } from '../../src/pii/scrubber';
 import { BodyCapture } from '../../src/recording/body-capture';
@@ -172,7 +178,7 @@ describe('Module 08 recorders', () => {
 
   it('records inbound HTTP requests, propagates ALS context, and attaches body capture', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const headerFilter = new HeaderFilter(config);
@@ -253,7 +259,7 @@ describe('Module 08 recorders', () => {
 
   it('reports whether bindStore or the emit patch is active at install time', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const emitSpy = vi.spyOn(process, 'emit');
@@ -288,7 +294,7 @@ describe('Module 08 recorders', () => {
 
   it('restores Server.prototype.emit on shutdown when the SDK owns the top wrapper', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const recorder = new HttpServerRecorder({
@@ -318,7 +324,7 @@ describe('Module 08 recorders', () => {
 
   it('leaves a third-party Server.prototype.emit wrapper in place during shutdown', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const recorder = new HttpServerRecorder({
@@ -352,7 +358,7 @@ describe('Module 08 recorders', () => {
 
   it('marks aborted inbound requests', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const recorder = new HttpServerRecorder({
@@ -499,7 +505,7 @@ describe('Module 08 recorders', () => {
 
   it('records outbound HTTP client requests and response metadata', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const context = createRequestContext(als);
     const bodyCapture = new BodyCapture(config);
@@ -546,7 +552,7 @@ describe('Module 08 recorders', () => {
 
   it('ignores SDK-internal outbound HTTP client requests', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new HttpClientRecorder({
       buffer,
       als: new ALSManager(),
@@ -566,7 +572,7 @@ describe('Module 08 recorders', () => {
 
   it('records outbound HTTP client errors with contextLost when ALS is unavailable', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new HttpClientRecorder({
       buffer,
       als: new ALSManager(),
@@ -593,7 +599,7 @@ describe('Module 08 recorders', () => {
 
   it('records undici request create, headers, and trailers without stale correlation', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const recorder = new UndiciRecorder({
       buffer,
@@ -664,7 +670,7 @@ describe('Module 08 recorders', () => {
 
   it('ignores SDK-internal undici requests', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new UndiciRecorder({
       buffer,
       als: new ALSManager(),
@@ -686,7 +692,7 @@ describe('Module 08 recorders', () => {
 
   it('records DNS lookups through the internal patch and marks contextLost when ALS is unavailable', async () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
     
     dnsModule.lookup = ((
@@ -733,7 +739,7 @@ describe('Module 08 recorders', () => {
   });
 
   it('restores dns and net wrappers on shutdown when the SDK owns the top layer', () => {
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
     const originalConnect = netModule.connect;
     const originalCreateConnection = netModule.createConnection;
@@ -760,7 +766,7 @@ describe('Module 08 recorders', () => {
   });
 
   it('leaves later third-party dns and net wrappers in place during shutdown', () => {
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
     const originalConnect = netModule.connect;
     const originalCreateConnection = netModule.createConnection;
@@ -810,7 +816,7 @@ describe('Module 08 recorders', () => {
   });
 
   it('skips DNS lookups executed through runAsInternal', async () => {
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
 
     dnsModule.lookup = ((
@@ -852,7 +858,7 @@ describe('Module 08 recorders', () => {
 
   it('records TCP connect events via the net handler with contextLost when ALS is unavailable', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new NetDnsRecorder({
       buffer,
       als: new ALSManager()
@@ -888,7 +894,7 @@ describe('G2 — http-server shape: message.socket is optional', () => {
 
   it('records request when diagnostic-channel payload omits socket', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const headerFilter = new HeaderFilter(config);
@@ -938,7 +944,7 @@ describe('G2 — http-server shape: message.socket is optional', () => {
 
   it('still records when socket is present (backward compat)', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const headerFilter = new HeaderFilter(config);
@@ -981,7 +987,7 @@ describe('G2 — http-server shape: message.socket is optional', () => {
 describe('G2 — undici shape: RequestImpl, not ClientRequest', () => {
   it('records outbound fetch when payload matches undici:request:create shape', () => {
     const config = resolveConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const headerFilter = new HeaderFilter(config);
     const recorder = new UndiciRecorder({
@@ -1018,7 +1024,7 @@ describe('G2 — undici shape: RequestImpl, not ClientRequest', () => {
 describe('G2 — http-client shape: { request } only', () => {
   it('records outbound request when payload contains only request', () => {
     const config = resolveConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const headerFilter = new HeaderFilter(config);
     const bodyCapture = new BodyCapture(config);
@@ -1057,7 +1063,7 @@ describe('G2 — http-client shape: { request } only', () => {
 describe('G2 — ALS context propagation through server.emit', () => {
   it('propagates ALS to handlers registered via server.on("request")', () => {
     const config = resolveConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const headerFilter = new HeaderFilter(config);

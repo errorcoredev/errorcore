@@ -1,4 +1,5 @@
 
+import type { EventClock } from '../context/event-clock';
 import type { AmbientEventContext, EvictionRecord, IOEventSlot } from '../types';
 
 // Accounts for serialized JSON field names and structure, not the in-memory null slot size.
@@ -11,6 +12,7 @@ const EMPTY_REQUEST_SLOTS: IOEventSlot[] = [];
 interface IOEventBufferOptions {
   capacity: number;
   maxBytes: number;
+  eventClock: EventClock;
 }
 
 interface IOEventBufferStats {
@@ -49,7 +51,7 @@ export class IOEventBuffer {
 
   private overflowCount = 0;
 
-  private nextSeq = 1;
+  private readonly eventClock: EventClock;
 
   private requestIdIndex: Map<string, IOEventSlot[]> | null = null;
 
@@ -64,6 +66,7 @@ export class IOEventBuffer {
   public constructor(options: IOEventBufferOptions) {
     this.capacity = options.capacity;
     this.maxBytes = options.maxBytes;
+    this.eventClock = options.eventClock;
     this.slots = new Array<IOEventSlot | null>(this.capacity).fill(null);
     this.evictionSlots = new Array<EvictionRecord | null>(
       IOEventBuffer.EVICTION_LOG_CAPACITY
@@ -72,7 +75,7 @@ export class IOEventBuffer {
 
   public push(event: PushableIOEvent): { slot: IOEventSlot; seq: number } {
     this.requestIdIndex = null;
-    const seq = this.nextSeq;
+    const seq = this.eventClock.tick();
     const estimatedBytes = estimateBytes(event);
     const index = this.writeHead % this.capacity;
     const overwrittenSlot = this.slots[index];
@@ -92,7 +95,6 @@ export class IOEventBuffer {
     this.payloadBytes += estimatedBytes;
     this.slotCount += 1;
     this.writeHead += 1;
-    this.nextSeq += 1;
 
     return { slot, seq };
   }

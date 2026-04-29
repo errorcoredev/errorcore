@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import { IOEventBuffer } from '../../src/buffer/io-event-buffer';
+import { EventClock } from '../../src/context/event-clock';
 import type { IOEventSlot } from '../../src/types';
 
 type PushableIOEvent = Omit<IOEventSlot, 'seq' | 'estimatedBytes'>;
+
+function makeBuffer(opts: { capacity: number; maxBytes: number }): IOEventBuffer {
+  const Ctor = IOEventBuffer;
+  return new Ctor({ ...opts, eventClock: new EventClock() });
+}
 
 function createEvent(overrides: Partial<PushableIOEvent> = {}): PushableIOEvent {
   return {
@@ -57,7 +63,7 @@ function applyBackfill(
 
 describe('IOEventBuffer', () => {
   it('pushes and reads back a single event with computed metadata', () => {
-    const buffer = new IOEventBuffer({ capacity: 3, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 3, maxBytes: 4096 });
     const { slot, seq } = buffer.push(
       createEvent({
         requestId: 'req-1',
@@ -79,7 +85,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('overwrites the oldest event when capacity is exceeded', () => {
-    const buffer = new IOEventBuffer({ capacity: 2, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 2, maxBytes: 4096 });
 
     buffer.push(createEvent({ requestId: 'req-1', url: '/1' }));
     buffer.push(createEvent({ requestId: 'req-2', url: '/2' }));
@@ -90,7 +96,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('maintains chronological order after wrap-around', () => {
-    const buffer = new IOEventBuffer({ capacity: 3, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 3, maxBytes: 4096 });
 
     buffer.push(createEvent({ requestId: 'req-1' }));
     buffer.push(createEvent({ requestId: 'req-2' }));
@@ -106,7 +112,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('evicts oldest slots to satisfy the byte budget', () => {
-    const buffer = new IOEventBuffer({ capacity: 5, maxBytes: 700 });
+    const buffer = makeBuffer({ capacity: 5, maxBytes: 700 });
 
     buffer.push(
       createEvent({ requestId: 'req-1', requestBody: Buffer.alloc(300, 1) })
@@ -126,7 +132,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('keeps byte accounting accurate across pushes and overwrites', () => {
-    const buffer = new IOEventBuffer({ capacity: 2, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 2, maxBytes: 4096 });
 
     buffer.push(createEvent({ requestId: 'req-1', requestBody: Buffer.alloc(10) }));
     buffer.push(createEvent({ requestId: 'req-2', responseBody: Buffer.alloc(20) }));
@@ -140,7 +146,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('filters by request id across interleaved requests', () => {
-    const buffer = new IOEventBuffer({ capacity: 6, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 6, maxBytes: 4096 });
 
     buffer.push(createEvent({ requestId: 'req-a', url: '/1' }));
     buffer.push(createEvent({ requestId: 'req-b', url: '/2' }));
@@ -154,7 +160,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('removes evicted request slots from the request-id index', () => {
-    const buffer = new IOEventBuffer({ capacity: 2, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 2, maxBytes: 4096 });
 
     buffer.push(createEvent({ requestId: 'req-a', url: '/1' }));
     buffer.push(createEvent({ requestId: 'req-b', url: '/2' }));
@@ -165,7 +171,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('supports live body backfill and payload byte updates', () => {
-    const buffer = new IOEventBuffer({ capacity: 2, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 2, maxBytes: 4096 });
     const { slot, seq } = buffer.push(createEvent({ requestId: 'req-1' }));
 
     const applied = applyBackfill(buffer, slot, seq, Buffer.from('hello'));
@@ -178,7 +184,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('silently discards recycled-slot backfill when the seq mismatches', () => {
-    const buffer = new IOEventBuffer({ capacity: 1, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 1, maxBytes: 4096 });
 
     const first = buffer.push(createEvent({ requestId: 'req-1' }));
     buffer.push(createEvent({ requestId: 'req-2' }));
@@ -198,7 +204,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('clears all live slots and resets byte totals without resetting overflow count', () => {
-    const buffer = new IOEventBuffer({ capacity: 2, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 2, maxBytes: 4096 });
 
     buffer.push(createEvent({ requestBody: Buffer.alloc(5) }));
     buffer.push(createEvent({ requestBody: Buffer.alloc(5) }));
@@ -219,7 +225,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('returns all live slots when getRecent exceeds the slot count', () => {
-    const buffer = new IOEventBuffer({ capacity: 5, maxBytes: 4096 });
+    const buffer = makeBuffer({ capacity: 5, maxBytes: 4096 });
 
     buffer.push(createEvent({ requestId: 'req-1' }));
     buffer.push(createEvent({ requestId: 'req-2' }));
@@ -231,14 +237,13 @@ describe('IOEventBuffer', () => {
   });
 
   it('does not infinite-loop when readHead lands on a null hole during byte eviction', () => {
-    const buffer = new IOEventBuffer({ capacity: 3, maxBytes: 512 });
+    const buffer = makeBuffer({ capacity: 3, maxBytes: 512 });
     const internal = buffer as unknown as {
       slots: (IOEventSlot | null)[];
       readHead: number;
       writeHead: number;
       slotCount: number;
       payloadBytes: number;
-      nextSeq: number;
     };
 
     internal.slots[2] = {
@@ -250,7 +255,8 @@ describe('IOEventBuffer', () => {
     internal.writeHead = 3;
     internal.slotCount = 1;
     internal.payloadBytes = 256;
-    internal.nextSeq = 2;
+    // seq is now provided by the injected EventClock, not an internal counter.
+    // The clock is fresh, so the next tick returns 1.
 
     const { seq } = buffer.push(
       createEvent({
@@ -259,7 +265,7 @@ describe('IOEventBuffer', () => {
       })
     );
 
-    expect(seq).toBe(2);
+    expect(seq).toBe(1);
     expect(buffer.drain().map((slot) => slot.requestId)).toEqual(['req-next']);
     expect(buffer.getStats()).toEqual({
       slotCount: 1,
@@ -271,7 +277,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('getRecentWithContext returns ambient metadata with seq gaps and distinct request ids', () => {
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
 
     buffer.push(createEvent({ requestId: 'req-a', target: 'svc-1' }));
     buffer.push(createEvent({ requestId: 'req-b', target: 'svc-2' }));
@@ -289,7 +295,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('getRecentWithContext detects seq gaps from evictions', () => {
-    const buffer = new IOEventBuffer({ capacity: 2, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 2, maxBytes: 100000 });
 
     buffer.push(createEvent({ requestId: 'req-1' }));
     buffer.push(createEvent({ requestId: 'req-2' }));
@@ -304,7 +310,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('getRecentWithContext returns null seqRange for empty buffer', () => {
-    const buffer = new IOEventBuffer({ capacity: 5, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 5, maxBytes: 100000 });
     const { events, context } = buffer.getRecentWithContext(5);
 
     expect(events).toEqual([]);
@@ -314,7 +320,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('records eviction metadata in the eviction log', () => {
-    const buffer = new IOEventBuffer({ capacity: 2, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 2, maxBytes: 100000 });
 
     buffer.push(createEvent({ requestId: 'req-1', type: 'http-client', direction: 'outbound', target: 'api.example.com' }));
     buffer.push(createEvent({ requestId: 'req-2' }));
@@ -332,7 +338,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('caps the eviction log at 100 entries using a ring', () => {
-    const buffer = new IOEventBuffer({ capacity: 1, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 1, maxBytes: 100000 });
 
     for (let i = 0; i < 150; i += 1) {
       buffer.push(createEvent({ requestId: `req-${i}` }));
@@ -346,7 +352,7 @@ describe('IOEventBuffer', () => {
   });
 
   it('stays consistent under a rapid push loop', () => {
-    const buffer = new IOEventBuffer({ capacity: 100, maxBytes: 1000000 });
+    const buffer = makeBuffer({ capacity: 100, maxBytes: 1000000 });
 
     for (let index = 0; index < 10000; index += 1) {
       buffer.push(createEvent({ requestId: `req-${index}` }));

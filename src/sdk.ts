@@ -9,6 +9,7 @@ import {
 } from './sdk-diagnostics';
 import { IOEventBuffer } from './buffer/io-event-buffer';
 import { ALSManager } from './context/als-manager';
+import { EventClock } from './context/event-clock';
 import { RequestTracker } from './context/request-tracker';
 import { HeaderFilter } from './pii/header-filter';
 import { Scrubber } from './pii/scrubber';
@@ -600,9 +601,11 @@ export class SDKInstance {
 export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
   const config = resolveConfig(userConfig);
   const transportAuthorization = getTransportAuthorization(userConfig.transport);
+  const eventClock = new EventClock();
   const buffer = new IOEventBuffer({
     capacity: config.bufferSize,
-    maxBytes: config.bufferMaxBytes
+    maxBytes: config.bufferMaxBytes,
+    eventClock
   });
   const als = new ALSManager();
   const headerFilter = new HeaderFilter(config);

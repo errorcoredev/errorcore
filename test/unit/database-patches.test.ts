@@ -4,6 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { IOEventBuffer } from '../../src/buffer/io-event-buffer';
 import { ALSManager } from '../../src/context/als-manager';
+import { EventClock } from '../../src/context/event-clock';
+
+function makeBuffer(opts: { capacity: number; maxBytes: number }): IOEventBuffer {
+  const Ctor = IOEventBuffer;
+  return new Ctor({ ...opts, eventClock: new EventClock() });
+}
 import { PatchManager, unwrapMethod, wrapMethod } from '../../src/recording/patches/patch-manager';
 import { install as installPgPatch } from '../../src/recording/patches/pg';
 import { install as installMysql2Patch } from '../../src/recording/patches/mysql2';
@@ -17,7 +23,7 @@ function createDeps(overrides: Parameters<typeof resolveTestConfig>[0] = {}) {
   const config = resolveTestConfig(overrides);
 
   return {
-    buffer: new IOEventBuffer({ capacity: 100, maxBytes: 1_000_000 }),
+    buffer: makeBuffer({ capacity: 100, maxBytes: 1_000_000 }),
     als: new ALSManager(),
     config
   };
@@ -628,7 +634,7 @@ describe('G2 — PatchManager threads drivers config into installers', () => {
         drivers: { pg: userPg, mongodb: userMongo }
       });
       const pm = new PatchManager({
-        buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+        buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
         als: new ALSManager(),
         config
       });
@@ -662,7 +668,7 @@ describe('G2 — PatchManager threads drivers config into installers', () => {
       drivers: { pg: userPg } // mongodb, mysql2, ioredis not set
     });
     const pm = new PatchManager({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       config
     });
