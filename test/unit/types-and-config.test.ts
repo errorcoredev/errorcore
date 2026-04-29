@@ -110,8 +110,61 @@ describe('resolveConfig', () => {
       drivers: {},
       silent: false,
       sourceMapSyncThresholdBytes: 2 * 1024 * 1024,
-      captureMiddlewareStatusCodes: 'none'
+      captureMiddlewareStatusCodes: 'none',
+      traceContext: { vendorKey: 'ec' },
+      stateTracking: { captureWrites: true, maxWritesPerContext: 50 }
     });
+  });
+
+  it('accepts user overrides for traceContext.vendorKey and stateTracking', () => {
+    const resolved = resolveTestConfig({
+      traceContext: { vendorKey: 'errorcore' },
+      stateTracking: { captureWrites: false, maxWritesPerContext: 100 }
+    });
+    expect(resolved.traceContext).toEqual({ vendorKey: 'errorcore' });
+    expect(resolved.stateTracking).toEqual({
+      captureWrites: false,
+      maxWritesPerContext: 100
+    });
+  });
+
+  it('rejects invalid traceContext.vendorKey', () => {
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'EC' } })
+    ).toThrow('traceContext.vendorKey must match');
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: '' } })
+    ).toThrow('traceContext.vendorKey must match');
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'has space' } })
+    ).toThrow('traceContext.vendorKey must match');
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'a'.repeat(257) } })
+    ).toThrow('traceContext.vendorKey must match');
+    // Valid: lowercase, digits, hyphen, underscore, asterisk, slash
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'errorcore' } })
+    ).not.toThrow();
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'a-b_c*d/e' } })
+    ).not.toThrow();
+  });
+
+  it('rejects invalid stateTracking config', () => {
+    expect(() =>
+      // @ts-expect-error runtime validation
+      resolveTestConfig({ stateTracking: { captureWrites: 'yes' } })
+    ).toThrow('stateTracking.captureWrites must be a boolean');
+    expect(() =>
+      resolveTestConfig({ stateTracking: { maxWritesPerContext: -1 } })
+    ).toThrow('stateTracking.maxWritesPerContext');
+    expect(() =>
+      resolveTestConfig({ stateTracking: { maxWritesPerContext: 1.5 } })
+    ).toThrow('stateTracking.maxWritesPerContext');
+    // 0 is valid (caps writes off entirely while keeping captureWrites=true)
+    expect(() =>
+      resolveTestConfig({ stateTracking: { maxWritesPerContext: 0 } })
+    ).not.toThrow();
   });
 
   it('merges user config over defaults', () => {

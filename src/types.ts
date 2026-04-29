@@ -441,6 +441,13 @@ export interface SDKConfig {
   silent?: boolean;
   sourceMapSyncThresholdBytes?: number;
   captureMiddlewareStatusCodes?: number[] | 'none' | 'all';
+  traceContext?: {
+    vendorKey?: string;
+  };
+  stateTracking?: {
+    captureWrites?: boolean;
+    maxWritesPerContext?: number;
+  };
 }
 
 export interface ResolvedConfig {
@@ -489,6 +496,13 @@ export interface ResolvedConfig {
   silent: boolean;
   sourceMapSyncThresholdBytes: number;
   captureMiddlewareStatusCodes: number[] | 'none' | 'all';
+  traceContext: {
+    vendorKey: string;
+  };
+  stateTracking: {
+    captureWrites: boolean;
+    maxWritesPerContext: number;
+  };
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {

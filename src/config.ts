@@ -345,6 +345,24 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     throw new Error('sourceMapSyncThresholdBytes must be a non-negative integer');
   }
 
+  const vendorKey = userConfig.traceContext?.vendorKey ?? 'ec';
+  if (!/^[a-z0-9_\-*\/]{1,256}$/.test(vendorKey)) {
+    throw new Error(
+      'traceContext.vendorKey must match the W3C tracestate vendor-key grammar [a-z0-9_\\-*\\/]{1,256}'
+    );
+  }
+
+  const captureWrites = userConfig.stateTracking?.captureWrites ?? true;
+  if (typeof captureWrites !== 'boolean') {
+    throw new Error('stateTracking.captureWrites must be a boolean');
+  }
+  const maxWritesPerContext =
+    userConfig.stateTracking?.maxWritesPerContext ?? 50;
+  assertNonNegativeInteger(
+    maxWritesPerContext,
+    'stateTracking.maxWritesPerContext'
+  );
+
   const captureMiddlewareStatusCodes = userConfig.captureMiddlewareStatusCodes ?? 'none';
   if (
     captureMiddlewareStatusCodes !== 'none' &&
@@ -508,6 +526,8 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     silent,
     sourceMapSyncThresholdBytes,
     captureMiddlewareStatusCodes,
+    traceContext: { vendorKey },
+    stateTracking: { captureWrites, maxWritesPerContext },
   };
 }
 

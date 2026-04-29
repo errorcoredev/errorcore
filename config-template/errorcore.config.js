@@ -136,4 +136,23 @@ module.exports = {
   //     return config;
   //   },
   resolveSourceMaps: true,
+
+  // W3C tracestate vendor key for cross-service Lamport clock propagation.
+  // Must match [a-z0-9_\-*\/]{1,256}. Default: 'ec'.
+  // Pick a short key — outbound tracestate is capped at 512 chars total.
+  traceContext: {
+    vendorKey: 'ec',
+  },
+
+  // State tracking — captures reads (always) and writes (set/delete) on
+  // tracked Maps and plain objects. Writes are recorded as a separate stream
+  // alongside reads on the request context.
+  stateTracking: {
+    // When false, set/delete on tracked containers run normally but are not
+    // recorded. Reads continue to be captured.
+    captureWrites: true,
+    // Per-request cap on captured writes. Overflow drops are silent and
+    // surfaced in completeness.stateWritesDropped on the shipped package.
+    maxWritesPerContext: 50,
+  },
 };
