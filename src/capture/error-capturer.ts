@@ -296,6 +296,7 @@ export class ErrorCapturer {
         this.bodyCapture.materializeSlotBodies(event);
       }
       const stateReads = context?.stateReads ?? [];
+      const stateWrites = context?.stateWrites ?? [];
       const concurrentRequests = this.requestTracker.getSummaries();
       const stateTrackingEnabled =
         stateReads.length > 0 || this.stateTrackerStatus?.isTrackingEnabled() === true;
@@ -320,6 +321,8 @@ export class ErrorCapturer {
         evictionLog: this.buffer.getEvictionLog(),
         ambientContext,
         stateReads,
+        stateWrites,
+        completenessOverflow: context?.completenessOverflow,
         concurrentRequests,
         processMetadata: this.processMetadata.getMergedMetadata(),
         timeAnchor: this.processMetadata.getTimeAnchor(),

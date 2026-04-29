@@ -17,6 +17,8 @@ import type {
   ResolvedConfig,
   StateRead,
   StateReadSerialized,
+  StateWrite,
+  StateWriteSerialized,
   TimeAnchor
 } from '../types';
 
@@ -83,6 +85,17 @@ function serializeStateRead(read: StateRead): StateReadSerialized {
     key: read.key,
     value: read.value,
     timestamp: read.timestamp.toString()
+  };
+}
+
+function serializeStateWrite(write: StateWrite): StateWriteSerialized {
+  return {
+    seq: write.seq,
+    hrtimeNs: write.hrtimeNs.toString(),
+    container: write.container,
+    operation: write.operation,
+    key: write.key,
+    value: write.value
   };
 }
 
@@ -254,6 +267,9 @@ export class PackageBuilder {
     const serializedStateReads = parts.stateReads.map((read) =>
       serializeStateRead(read)
     );
+    const serializedStateWrites = parts.stateWrites.map((write) =>
+      serializeStateWrite(write)
+    );
     const serializedEvictionLog = parts.evictionLog.map(serializeEvictionRecord);
 
     // Layer 3: frame-index alignment between captured locals and rendered stack
@@ -278,6 +294,10 @@ export class PackageBuilder {
     for (const r of parts.stateReads) {
       if (r.seq < minSeq) minSeq = r.seq;
       if (r.seq > maxSeq) maxSeq = r.seq;
+    }
+    for (const w of parts.stateWrites) {
+      if (w.seq < minSeq) minSeq = w.seq;
+      if (w.seq > maxSeq) maxSeq = w.seq;
     }
     const eventClockRange = { min: minSeq, max: maxSeq };
 
@@ -315,6 +335,7 @@ export class PackageBuilder {
       evictionLog: serializedEvictionLog,
       ambientContext: parts.ambientContext,
       stateReads: serializedStateReads,
+      stateWrites: serializedStateWrites,
       concurrentRequests: parts.concurrentRequests.map((summary) => ({ ...summary })),
       processMetadata: { ...parts.processMetadata },
       codeVersion: { ...parts.codeVersion },
@@ -322,7 +343,8 @@ export class PackageBuilder {
       trace: parts.traceContext ? {
         traceId: parts.traceContext.traceId,
         spanId: parts.traceContext.spanId,
-        parentSpanId: parts.traceContext.parentSpanId
+        parentSpanId: parts.traceContext.parentSpanId,
+        tracestate: parts.traceContext.tracestate
       } : undefined,
       completeness: this.computeCompleteness(parts, false, {
         ioTimeline: serializedTimeline,
@@ -449,6 +471,7 @@ export class PackageBuilder {
         (pkg.localVariables?.length ?? 0) > this.config.maxLocalsFrames,
       stateTrackingEnabled,
       stateReadsCaptured: pkg.stateReads.length > 0,
+      stateWritesDropped: parts.completenessOverflow?.stateWritesDropped,
       concurrentRequestsCaptured: pkg.concurrentRequests.length > 0,
       piiScrubbed: true,
       encrypted,

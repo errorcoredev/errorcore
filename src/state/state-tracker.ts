@@ -1,7 +1,7 @@
 
 import { TIGHT_LIMITS, cloneAndLimit } from '../serialization/clone-and-limit';
 import { EventClock } from '../context/event-clock';
-import type { RequestContext, StateRead } from '../types';
+import type { RequestContext, ResolvedConfig, StateRead, StateWrite } from '../types';
 
 interface ALSManagerLike {
   getContext(): RequestContext | undefined;
@@ -20,18 +20,30 @@ const INTERNAL_OBJECT_PROPERTIES = new Set<string>([
 ]);
 const MAX_STATE_READS_PER_CONTEXT = 50;
 
+const DEFAULT_STATE_TRACKING_CONFIG: Pick<ResolvedConfig, 'stateTracking'>['stateTracking'] = {
+  captureWrites: true,
+  maxWritesPerContext: 50
+};
+
 export class StateTracker {
   private readonly als: ALSManagerLike;
 
   private readonly eventClock: EventClock;
 
+  private readonly stateTrackingConfig: ResolvedConfig['stateTracking'];
+
   private trackingEnabled = false;
 
-  public constructor(deps: { als: ALSManagerLike; eventClock?: EventClock }) {
+  public constructor(deps: {
+    als: ALSManagerLike;
+    eventClock?: EventClock;
+    config?: Pick<ResolvedConfig, 'stateTracking'>;
+  }) {
     this.als = deps.als;
     // EventClock is optional for test ergonomics; the SDK composition root
     // always passes one shared instance (module 19 contract).
     this.eventClock = deps.eventClock ?? new EventClock();
+    this.stateTrackingConfig = deps.config?.stateTracking ?? DEFAULT_STATE_TRACKING_CONFIG;
   }
 
   public track<T extends Map<unknown, unknown> | Record<string, unknown>>(
@@ -56,7 +68,41 @@ export class StateTracker {
     container: Map<unknown, unknown>
   ): Map<unknown, unknown> {
     return new Proxy(container, {
-      get: (target, property) => {
+      get: (target, property, receiver) => {
+        if (property === 'set') {
+          const original = Reflect.get(target, property, target) as Map<
+            unknown,
+            unknown
+          >['set'];
+
+          return (key: unknown, value: unknown) => {
+            // Run the host's Map.set first. Map.prototype.set returns the
+            // underlying Map, but for chaining via the proxy to keep
+            // intercepting subsequent .set calls, we return `receiver` (the
+            // proxy itself) instead. Recorder runs after.
+            original.call(target, key, value);
+            if (this.stateTrackingConfig.captureWrites) {
+              this.safeRecordStateWrite(name, 'set', key, value);
+            }
+            return receiver;
+          };
+        }
+
+        if (property === 'delete') {
+          const original = Reflect.get(target, property, target) as Map<
+            unknown,
+            unknown
+          >['delete'];
+
+          return (key: unknown) => {
+            const result = original.call(target, key);
+            if (this.stateTrackingConfig.captureWrites) {
+              this.safeRecordStateWrite(name, 'delete', key, undefined);
+            }
+            return result;
+          };
+        }
+
         if (property === 'get') {
           const original = Reflect.get(target, property, target) as Map<
             unknown,
@@ -154,6 +200,34 @@ export class StateTracker {
 
         this.safeRecordStateRead(name, 'get', property, value);
         return value;
+      },
+      set: (target, property, value, receiver) => {
+        // The Reflect.set return value MUST be returned unchanged: strict-mode
+        // proxy invariants reject any deviation, and a frozen target's
+        // false-return is what triggers the host TypeError. Recorder fires
+        // after Reflect, isolating telemetry failures.
+        const ok = Reflect.set(target, property, value, receiver);
+        if (!this.stateTrackingConfig.captureWrites) return ok;
+        if (
+          typeof property === 'symbol' ||
+          INTERNAL_OBJECT_PROPERTIES.has(property)
+        ) {
+          return ok;
+        }
+        this.safeRecordStateWrite(name, 'set', property, value);
+        return ok;
+      },
+      deleteProperty: (target, property) => {
+        const ok = Reflect.deleteProperty(target, property);
+        if (!this.stateTrackingConfig.captureWrites) return ok;
+        if (
+          typeof property === 'symbol' ||
+          INTERNAL_OBJECT_PROPERTIES.has(property)
+        ) {
+          return ok;
+        }
+        this.safeRecordStateWrite(name, 'delete', property, undefined);
+        return ok;
       }
     });
   }
@@ -219,5 +293,53 @@ export class StateTracker {
     };
 
     context.stateReads.push(stateRead);
+  }
+
+  /**
+   * Same isolation contract as safeRecordStateRead: any failure inside the
+   * recorder (cloneAndLimit on a hostile value, ALS misbehavior) is swallowed
+   * so it never propagates to the host write.
+   */
+  private safeRecordStateWrite(
+    container: string,
+    operation: 'set' | 'delete',
+    key: unknown,
+    value: unknown
+  ): void {
+    try {
+      this.recordStateWrite(container, operation, key, value);
+    } catch {
+      // Intentional swallow: telemetry failure must not affect host writes.
+    }
+  }
+
+  private recordStateWrite(
+    container: string,
+    operation: 'set' | 'delete',
+    key: unknown,
+    value: unknown
+  ): void {
+    const context = this.als.getContext();
+    if (context === undefined) return;
+
+    const cap = this.stateTrackingConfig.maxWritesPerContext;
+    if (context.stateWrites.length >= cap) {
+      if (context.completenessOverflow === undefined) {
+        context.completenessOverflow = { stateWritesDropped: 0 };
+      }
+      context.completenessOverflow.stateWritesDropped += 1;
+      return;
+    }
+
+    const stateWrite: StateWrite = {
+      seq: this.eventClock.tick(),
+      hrtimeNs: process.hrtime.bigint(),
+      container,
+      operation,
+      key: cloneAndLimit(key, TIGHT_LIMITS),
+      value: operation === 'delete' ? undefined : cloneAndLimit(value, TIGHT_LIMITS)
+    };
+
+    context.stateWrites.push(stateWrite);
   }
 }

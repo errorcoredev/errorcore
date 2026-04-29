@@ -68,6 +68,8 @@ export class ALSManager {
       bodyTruncated: false,
       ioEvents: [],
       stateReads: [],
+      stateWrites: [],
+      // inheritedTracestate is populated in module 21; left undefined here.
       traceId,
       spanId,
       parentSpanId

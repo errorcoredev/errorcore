@@ -256,6 +256,214 @@ describe('StateTracker', () => {
   });
 });
 
+describe('StateTracker — write capture (module 22)', () => {
+  it('records object set via the Proxy set trap', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track('cfg', {} as Record<string, unknown>);
+    const context = createContext(als, 'req-obj-set');
+
+    als.runWithContext(context, () => {
+      tracked.foo = 'bar';
+    });
+
+    expect(context.stateWrites).toHaveLength(1);
+    expect(context.stateWrites[0]).toMatchObject({
+      container: 'cfg',
+      operation: 'set',
+      key: 'foo',
+      value: 'bar',
+      seq: expect.any(Number)
+    });
+    expect(typeof context.stateWrites[0]?.hrtimeNs).toBe('bigint');
+  });
+
+  it('records object delete via the deleteProperty trap', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track('cfg', { foo: 1 } as Record<string, unknown>);
+    const context = createContext(als, 'req-obj-del');
+
+    als.runWithContext(context, () => {
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+      delete tracked.foo;
+    });
+
+    expect(context.stateWrites).toHaveLength(1);
+    expect(context.stateWrites[0]).toMatchObject({
+      operation: 'delete',
+      key: 'foo',
+      value: undefined
+    });
+  });
+
+  it('records Map.set with chained calls and preserves the Map return value', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track('cache', new Map<string, number>()) as Map<string, number>;
+    const context = createContext(als, 'req-map-set');
+
+    let chained: Map<string, number> | undefined;
+    als.runWithContext(context, () => {
+      chained = tracked.set('a', 1).set('b', 2);
+    });
+
+    expect(chained).toBe(tracked);
+    expect(context.stateWrites).toHaveLength(2);
+    expect(context.stateWrites[0]).toMatchObject({ operation: 'set', key: 'a', value: 1 });
+    expect(context.stateWrites[1]).toMatchObject({ operation: 'set', key: 'b', value: 2 });
+  });
+
+  it('records Map.delete and returns the boolean result unchanged', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track(
+      'cache',
+      new Map<string, number>([['a', 1]])
+    ) as Map<string, number>;
+    const context = createContext(als, 'req-map-del');
+
+    let deletedExisting: boolean | undefined;
+    let deletedMissing: boolean | undefined;
+    als.runWithContext(context, () => {
+      deletedExisting = tracked.delete('a');
+      deletedMissing = tracked.delete('nonexistent');
+    });
+
+    expect(deletedExisting).toBe(true);
+    expect(deletedMissing).toBe(false);
+    expect(context.stateWrites).toHaveLength(2);
+    expect(context.stateWrites[0]).toMatchObject({ operation: 'delete', key: 'a', value: undefined });
+    expect(context.stateWrites[1]).toMatchObject({ operation: 'delete', key: 'nonexistent', value: undefined });
+  });
+
+  it('caps writes at maxWritesPerContext and counts overflow on completenessOverflow', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({
+      als,
+      config: { stateTracking: { captureWrites: true, maxWritesPerContext: 3 } }
+    });
+    const tracked = tracker.track('cfg', {} as Record<string, unknown>);
+    const context = createContext(als, 'req-cap');
+
+    als.runWithContext(context, () => {
+      for (let i = 0; i < 10; i += 1) tracked[`k${i}`] = i;
+    });
+
+    expect(context.stateWrites).toHaveLength(3);
+    expect(context.completenessOverflow?.stateWritesDropped).toBe(7);
+  });
+
+  it('does not record writes when captureWrites is false', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({
+      als,
+      config: { stateTracking: { captureWrites: false, maxWritesPerContext: 50 } }
+    });
+    const tracked = tracker.track('cfg', {} as Record<string, unknown>);
+    const context = createContext(als, 'req-disabled');
+
+    als.runWithContext(context, () => {
+      tracked.x = 1;
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+      delete tracked.x;
+    });
+
+    expect(context.stateWrites).toHaveLength(0);
+  });
+
+  it('skips Symbol and internal property writes', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track('cfg', {} as Record<string, unknown>);
+    const context = createContext(als, 'req-internals');
+
+    als.runWithContext(context, () => {
+      const sym = Symbol('s');
+      (tracked as Record<symbol | string, unknown>)[sym] = 1;
+      // INTERNAL_OBJECT_PROPERTIES — recorder must skip these even on write.
+      tracked.constructor = function noop() { /* noop */ };
+    });
+
+    expect(context.stateWrites).toHaveLength(0);
+  });
+
+  it('returns the boolean from Reflect.set unchanged for frozen targets', () => {
+    'use strict';
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const frozen = Object.freeze({ a: 1 } as Record<string, unknown>);
+    const tracked = tracker.track('cfg', frozen);
+    const context = createContext(als, 'req-frozen');
+
+    // Strict mode: writing to a frozen target throws TypeError. This is a
+    // strict-mode invariant on the proxy: returning false from set without
+    // throwing would be a violation; returning true would be a lie.
+    expect(() =>
+      als.runWithContext(context, () => {
+        (tracked as Record<string, unknown>).a = 2;
+      })
+    ).toThrow(TypeError);
+  });
+
+  it('does not record writes outside ALS context', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track('cfg', {} as Record<string, unknown>);
+
+    expect(() => {
+      tracked.x = 1;
+    }).not.toThrow();
+  });
+
+  it('survives a recorder failure on hostile write values without breaking the host write', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track('cfg', {} as Record<string, unknown>);
+    const context = createContext(als, 'req-hostile-write');
+
+    const hostile: { toJSON: () => never } = {
+      get toJSON(): never {
+        throw new Error('hostile toJSON on write');
+      }
+    };
+
+    als.runWithContext(context, () => {
+      tracked.payload = hostile;
+    });
+
+    // Host write must succeed even if the recorder threw.
+    expect(tracked.payload).toBe(hostile);
+  });
+
+  it('stamps strictly increasing seq across reads and writes', () => {
+    const als = new ALSManager();
+    const tracker = new StateTracker({ als });
+    const tracked = tracker.track('cfg', { initial: 1 } as Record<string, unknown>);
+    const context = createContext(als, 'req-seq-order');
+
+    als.runWithContext(context, () => {
+      void tracked.initial; // read
+      tracked.foo = 'bar'; // write
+      void tracked.foo; // read
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+      delete tracked.foo; // write
+    });
+
+    const seqs = [
+      context.stateReads[0]?.seq,
+      context.stateWrites[0]?.seq,
+      context.stateReads[1]?.seq,
+      context.stateWrites[1]?.seq
+    ].filter((s): s is number => typeof s === 'number');
+
+    expect(seqs).toHaveLength(4);
+    for (let i = 1; i < seqs.length; i += 1) {
+      expect(seqs[i]).toBeGreaterThan(seqs[i - 1]);
+    }
+  });
+});
+
 describe('ALSManager throw-unwind', () => {
   it('unwinds the context store when the callback throws', () => {
     const als = new ALSManager();

@@ -59,9 +59,13 @@ export interface RequestContext {
   bodyTruncated: boolean;
   ioEvents: IOEventSlot[];
   stateReads: StateRead[];
+  stateWrites: StateWrite[];
+  inheritedTracestate?: string[];
   traceId: string;
   spanId: string;
   parentSpanId: string | null;
+  /** Internal scratch — not serialized; surfaced into Completeness at package time. */
+  completenessOverflow?: { stateWritesDropped: number };
 }
 
 export interface StateRead {
@@ -71,6 +75,24 @@ export interface StateRead {
   key: unknown;
   value: unknown;
   timestamp: bigint;
+}
+
+export interface StateWrite {
+  seq: number;
+  hrtimeNs: bigint;
+  container: string;
+  operation: 'set' | 'delete';
+  key: unknown;
+  value: unknown;
+}
+
+export interface StateWriteSerialized {
+  seq: number;
+  hrtimeNs: string;
+  container: string;
+  operation: 'set' | 'delete';
+  key: unknown;
+  value: unknown;
 }
 
 export interface CapturedFrame {
@@ -132,6 +154,7 @@ export interface Completeness {
   localVariablesTruncated: boolean;
   stateTrackingEnabled: boolean;
   stateReadsCaptured: boolean;
+  stateWritesDropped?: number;
   concurrentRequestsCaptured: boolean;
   piiScrubbed: boolean;
   encrypted: boolean;
@@ -273,6 +296,7 @@ export interface ErrorPackage {
   evictionLog: EvictionRecordSerialized[];
   ambientContext?: AmbientEventContext;
   stateReads: StateReadSerialized[];
+  stateWrites: StateWriteSerialized[];
   concurrentRequests: RequestSummary[];
   processMetadata: ProcessMetadata;
   codeVersion: { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string };
@@ -281,6 +305,7 @@ export interface ErrorPackage {
     traceId: string;
     spanId: string;
     parentSpanId: string | null;
+    tracestate?: string;
   };
   integrity?: {
     algorithm: 'HMAC-SHA256';
@@ -306,6 +331,9 @@ export interface ErrorPackageParts {
   evictionLog: EvictionRecord[];
   ambientContext?: AmbientEventContext;
   stateReads: StateRead[];
+  stateWrites: StateWrite[];
+  /** Internal: passed through from RequestContext.completenessOverflow. */
+  completenessOverflow?: { stateWritesDropped: number };
   concurrentRequests: RequestSummary[];
   processMetadata: ProcessMetadata;
   timeAnchor: TimeAnchor;
@@ -321,6 +349,7 @@ export interface ErrorPackageParts {
     traceId: string;
     spanId: string;
     parentSpanId: string | null;
+    tracestate?: string;
   };
   sourceMapResolution?: {
     framesResolved: number;

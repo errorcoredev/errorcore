@@ -184,6 +184,7 @@ function createPackageParts(
     ioTimeline: [],
     evictionLog: [],
     stateReads: context?.stateReads ?? [],
+    stateWrites: context?.stateWrites ?? [],
     concurrentRequests: [],
     processMetadata: {
       nodeVersion: process.version,
@@ -460,6 +461,7 @@ describe('PackageBuilder', () => {
       ],
       evictionLog: [],
       stateReads: context.stateReads,
+      stateWrites: [],
       concurrentRequests: [
         {
           requestId: 'req-2',
@@ -561,6 +563,7 @@ describe('PackageBuilder', () => {
       evictionLog: [],
       stateReads: [
         {
+          seq: 2,
           container: 'cache',
           operation: 'get',
           key: 'key',
@@ -568,6 +571,7 @@ describe('PackageBuilder', () => {
           timestamp: 1n
         }
       ],
+      stateWrites: [],
       concurrentRequests: [],
       processMetadata: {
         nodeVersion: process.version,

@@ -634,7 +634,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     bodyCaptureContentTypes: config.bodyCaptureContentTypes,
     scrubber
   });
-  const stateTracker = new StateTracker({ als, eventClock });
+  const stateTracker = new StateTracker({ als, eventClock, config });
   const httpServerRecorder = new HttpServerRecorder({
     buffer,
     als,
