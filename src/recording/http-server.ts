@@ -23,6 +23,8 @@ interface ALSManagerLike {
     method: string;
     url: string;
     headers: Record<string, string>;
+    traceparent?: string;
+    tracestate?: string;
   }): RequestContext;
   runWithContext<T>(ctx: RequestContext, fn: () => T): T;
   getContext(): RequestContext | undefined;
@@ -437,11 +439,20 @@ export class HttpServerRecorder {
       return existing;
     }
 
-    const headers = this.getFilteredRequestHeaders(request.headers as Record<string, unknown>);
+    const rawHeaders = request.headers as Record<string, unknown>;
+    const headers = this.getFilteredRequestHeaders(rawHeaders);
     const context = this.als.createRequestContext({
       method: request.method ?? 'UNKNOWN',
       url: request.url ?? '',
-      headers
+      headers,
+      // W3C trace context (modules 06, 21): pull these BEFORE filtering so
+      // the headerAllowlist doesn't strip them. ALSManager parses both.
+      traceparent: typeof rawHeaders['traceparent'] === 'string'
+        ? (rawHeaders['traceparent'] as string)
+        : undefined,
+      tracestate: typeof rawHeaders['tracestate'] === 'string'
+        ? (rawHeaders['tracestate'] as string)
+        : undefined
     });
 
     this.requestContexts.set(request, context);

@@ -60,6 +60,9 @@ export interface RequestContext {
   ioEvents: IOEventSlot[];
   stateReads: StateRead[];
   stateWrites: StateWrite[];
+  /** Inbound tracestate header verbatim (module 21). Echoed to ErrorPackage. */
+  inboundTracestate?: string;
+  /** Foreign vendor entries from inbound tracestate, preserved for re-emission. */
   inheritedTracestate?: string[];
   traceId: string;
   spanId: string;

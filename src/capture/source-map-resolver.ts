@@ -38,10 +38,29 @@ function readIfWithinSize(filePath: string): string | null {
   return contents;
 }
 
+function detectV8SourceMapFlag(): boolean {
+  const inExecArgv = process.execArgv.some(
+    (a) => a === '--enable-source-maps' || a.startsWith('--enable-source-maps=')
+  );
+  if (inExecArgv) return true;
+  const opts = process.env.NODE_OPTIONS ?? '';
+  // Match --enable-source-maps as a standalone flag or as `=value`. The
+  // trailing-context group (\s|=|$) prevents false-matching speculative
+  // future flags like --enable-source-maps-pretty.
+  return /(^|\s)--enable-source-maps(\s|=|$)/.test(opts);
+}
+
 export class SourceMapResolver {
   private readonly cache = new Map<string, CacheEntry>();
 
   private readonly syncThresholdBytes: number;
+
+  /**
+   * When V8 is already resolving source maps via --enable-source-maps,
+   * resolveStack short-circuits to a no-op so we don't double-resolve and
+   * waste CPU. The flag is captured once at construction.
+   */
+  private readonly v8ResolvesSourceMaps: boolean = detectV8SourceMapFlag();
 
   private warnedNoMaps = false;
 
@@ -69,6 +88,16 @@ export class SourceMapResolver {
    * schedules a background warm for the next capture.
    */
   public resolveStack(stack: string): string {
+    // Module 13 1.1.0 fast path: if V8 is already resolving source maps, the
+    // input stack is already source-mapped. Re-running our resolver would
+    // double-rewrite at best and corrupt at worst.
+    if (this.v8ResolvesSourceMaps) {
+      return stack;
+    }
+    return this._resolveStackImpl(stack);
+  }
+
+  private _resolveStackImpl(stack: string): string {
     const lines = stack.split('\n');
     const resolved: string[] = [];
     let frameCount = 0;
@@ -249,7 +278,9 @@ export class SourceMapResolver {
     }
 
     const filePaths = Object.keys(require.cache).filter(
-      (p) => !p.includes('node_modules') && (p.endsWith('.js') || p.endsWith('.mjs'))
+      (p) =>
+        !p.includes('node_modules') &&
+        (p.endsWith('.js') || p.endsWith('.mjs') || p.endsWith('.cjs'))
     );
 
     for (const filePath of filePaths) {

@@ -340,8 +340,12 @@ export class ErrorCapturer {
           parentSpanId: context.parentSpanId,
           // Module 21: carry the INBOUND tracestate verbatim. The egress
           // version we emit on outbound HTTP is built fresh from the live
-          // EventClock; that's not what the package records.
-          tracestate: context.headers['tracestate']
+          // EventClock; that's not what the package records. Read from
+          // RequestContext.inboundTracestate (set by ALSManager) — the
+          // request's `headers` map has been filtered through the
+          // headerAllowlist by the time it reaches the recorder, so it
+          // does not retain `tracestate` by default.
+          tracestate: context.inboundTracestate
         } : undefined,
         sourceMapResolution: sourceMapTelemetry
       };

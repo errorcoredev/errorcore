@@ -95,6 +95,10 @@ export class ALSManager {
       ioEvents: [],
       stateReads: [],
       stateWrites: [],
+      // Stored verbatim for echo into ErrorPackage.trace.tracestate. Stays
+      // separate from `inheritedTracestate`, which has our own-vendor entry
+      // stripped for clean re-emission.
+      inboundTracestate: req.tracestate,
       inheritedTracestate,
       traceId,
       spanId,
