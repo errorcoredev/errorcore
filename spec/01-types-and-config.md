@@ -29,9 +29,9 @@ Define all shared TypeScript interfaces and the configuration schema with defaul
 
 ## Scope
 
-- Define all shared interfaces (`IOEventSlot`, `RequestContext`, `StateRead`, `CapturedFrame`, `ErrorPackage`, `Completeness`, `SerializationLimits`, `SDKConfig`, `ResolvedConfig`)
+- Define all shared interfaces (`IOEventSlot`, `RequestContext`, `StateRead`, `StateWrite`, `CapturedFrame`, `ErrorPackage`, `Completeness`, `SerializationLimits`, `SDKConfig`, `ResolvedConfig`)
 - Define a `resolveConfig(userConfig: Partial<SDKConfig>): ResolvedConfig` function that merges user input with defaults and validates constraints
-- Export the `ErrorPackage` schema at version `1.0.0`
+- Export the `ErrorPackage` schema at version `1.1.0`
 
 ---
 
@@ -60,9 +60,10 @@ None. Pure TypeScript type definitions and plain object manipulation.
 
 ```typescript
 interface IOEventSlot {
-  seq: number;
+  seq: number;                             // from EventClock.tick() (module 19)
+  hrtimeNs: bigint;                        // process.hrtime.bigint() at push() (module 20)
   phase: 'active' | 'done';
-  startTime: bigint;
+  startTime: bigint;                       // when the IO operation started (may differ from hrtimeNs)
   endTime: bigint | null;
   durationMs: number | null;
   type: 'http-server' | 'http-client' | 'undici' | 'db-query' | 'dns' | 'tcp' | 'cache-read';
@@ -101,6 +102,13 @@ interface RequestContext {
   bodyTruncated: boolean;
   ioEvents: IOEventSlot[];
   stateReads: StateRead[];
+  stateWrites: StateWrite[];               // module 22
+  inheritedTracestate?: string[];          // module 21
+  traceId: string;
+  spanId: string;
+  parentSpanId: string | null;
+  /** Internal scratch — not serialized; surfaced into Completeness at package time. */
+  completenessOverflow?: { stateWritesDropped: number };
 }
 ```
 
@@ -108,11 +116,34 @@ interface RequestContext {
 
 ```typescript
 interface StateRead {
+  seq: number;                             // from EventClock.tick() (module 20)
   container: string;
   operation: string;
   key: unknown;
   value: unknown;    // eagerly serialized POJO — no external references
   timestamp: bigint;
+}
+```
+
+### StateWrite (module 22)
+
+```typescript
+interface StateWrite {
+  seq: number;                             // from EventClock.tick()
+  hrtimeNs: bigint;                        // process.hrtime.bigint()
+  container: string;
+  operation: 'set' | 'delete';
+  key: unknown;                            // cloneAndLimit(TIGHT_LIMITS)
+  value: unknown;                          // cloneAndLimit(TIGHT_LIMITS); undefined for 'delete'
+}
+
+interface StateWriteSerialized {
+  seq: number;
+  hrtimeNs: string;                        // bigint → string
+  container: string;
+  operation: 'set' | 'delete';
+  key: unknown;
+  value: unknown;
 }
 ```
 
@@ -142,6 +173,7 @@ interface Completeness {
   localVariablesTruncated: boolean;
   stateTrackingEnabled: boolean;
   stateReadsCaptured: boolean;
+  stateWritesDropped?: number;             // module 22 — overflow surfaced here
   concurrentRequestsCaptured: boolean;
   piiScrubbed: boolean;
   encrypted: boolean;
@@ -149,12 +181,25 @@ interface Completeness {
 }
 ```
 
+### TimeAnchor
+
+```typescript
+interface TimeAnchor {
+  wallClockMs: number;                     // Date.now() at SDK startup (one-shot)
+  hrtimeNs: string;                        // process.hrtime.bigint().toString() at SDK startup
+}
+```
+
 ### ErrorPackage
 
 ```typescript
 interface ErrorPackage {
-  schemaVersion: '1.0.0';
-  capturedAt: string;
+  schemaVersion: '1.1.0';
+  capturedAt: string;                      // ISO 8601, per-package (not per-event)
+  errorEventSeq: number;                   // module 20 — EventClock.tick() at capture entry
+  errorEventHrtimeNs: string;              // module 20 — bigint serialized
+  eventClockRange: { min: number; max: number };  // module 20 — over all stamped events
+  timeAnchor: TimeAnchor;                  // for consumer-side wall-clock derivation
   error: {
     type: string;
     message: string;
@@ -174,10 +219,17 @@ interface ErrorPackage {
   };
   ioTimeline: IOEventSerialized[];
   stateReads: StateReadSerialized[];
+  stateWrites: StateWriteSerialized[];     // module 22 — peer to stateReads
   concurrentRequests: RequestSummary[];
   processMetadata: ProcessMetadata;
   codeVersion: { gitSha?: string; packageVersion?: string };
   environment: Record<string, string>;
+  trace?: {
+    traceId: string;
+    spanId: string;
+    parentSpanId: string | null;
+    tracestate?: string;                   // module 21 — inbound header verbatim at capture time
+  };
   completeness: Completeness;
 }
 ```
@@ -220,6 +272,13 @@ interface SDKConfig {
   maxCachedLocals?: number;
   maxLocalsFrames?: number;
   allowInsecureTransport?: boolean;
+  traceContext?: {
+    vendorKey?: string;                    // module 21 — default 'ec'
+  };
+  stateTracking?: {
+    captureWrites?: boolean;               // module 22 — default true
+    maxWritesPerContext?: number;          // module 22 — default 50
+  };
 }
 ```
 
@@ -254,6 +313,9 @@ interface SDKConfig {
 | `maxLocalsCollectionsPerSecond` | 20 |
 | `maxCachedLocals` | 50 |
 | `maxLocalsFrames` | 5 |
+| `traceContext.vendorKey` | `'ec'` (must match `[a-z0-9_\-*\/]{1,256}`) |
+| `stateTracking.captureWrites` | `true` |
+| `stateTracking.maxWritesPerContext` | 50 |
 
 ### resolveConfig behavior
 
@@ -262,6 +324,8 @@ interface SDKConfig {
 - Validate `bufferSize` >= 10 and <= 100000.
 - Validate `bufferMaxBytes` >= 1048576 (1 MB).
 - Validate `maxPayloadSize` >= 1024 and <= `bufferMaxBytes`.
+- Validate `traceContext.vendorKey` matches `/^[a-z0-9_\-*\/]{1,256}$/` (W3C tracestate vendor-key grammar).
+- Validate `stateTracking.maxWritesPerContext` is a non-negative integer.
 - If validation fails, throw a descriptive `Error` at init time — not a silent fallback.
 
 ---

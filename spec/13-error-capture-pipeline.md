@@ -1,9 +1,10 @@
 # Module 13: Error Capture Pipeline
 
 > **Spec status:** LOCKED
-> **Source files:** `src/capture/error-capturer.ts`, `src/capture/process-metadata.ts`, `src/capture/package-builder.ts`
-> **Dependencies:** Modules 01, 02, 03, 04, 05, 06, 12
+> **Source files:** `src/capture/error-capturer.ts`, `src/capture/process-metadata.ts`, `src/capture/package-builder.ts`, `src/capture/source-map-resolver.ts`
+> **Dependencies:** Modules 01, 02, 03, 04, 05, 06, 12, 19 (EventClock), 20 (universal stamping)
 > **Build order position:** 13
+> **Schema version contributed to:** 1.1.0
 
 ---
 
@@ -121,6 +122,12 @@ class PackageBuilder {
 ### ErrorCapturer.capture() sequence — 500ms budget
 
 ```
+0. Stamp at entry (module 20)
+   errorEventSeq = eventClock.tick()
+   errorEventHrtimeNs = process.hrtime.bigint()
+   These are taken BEFORE rate-limit / serialization so all later events
+   stamp with strictly greater seq values.
+
 1. Rate limit check
    rateLimiter.tryAcquire() -> if false: return null
 
@@ -202,15 +209,18 @@ function serializeError(error: Error, depth: number = 0): ErrorInfo {
 ### PackageBuilder.build
 
 1. Assemble all parts into `ErrorPackage` schema
-2. Run PII scrubber on the entire package: `scrubber.scrubObject(package)`
-3. Compute completeness flags based on what data is present/absent
-4. Final size check: `JSON.stringify(package).length` vs `maxTotalPackageSize`
-5. If too large, progressively shed data:
+2. Compute `eventClockRange = { min, max }` over the union of `errorEventSeq` plus all stamped seqs in `ioTimeline`, `stateReads`, `stateWrites` (module 20). Use a loop, not `Math.min(...arr)` — large arrays may stack-overflow.
+3. Set `schemaVersion: '1.1.0'`. `capturedAt` remains a per-package ISO timestamp.
+4. Surface `parts.completenessOverflow.stateWritesDropped` (if present) into `Completeness.stateWritesDropped` (module 22).
+5. Run PII scrubber on the entire package: `scrubber.scrubObject(package)`
+6. Compute completeness flags based on what data is present/absent
+7. Final size check: `JSON.stringify(package).length` vs `maxTotalPackageSize`
+8. If too large, progressively shed data:
    a. Truncate I/O event bodies (largest first)
    b. Drop ambient I/O events (keep only failing request's timeline)
-   c. Drop state reads
+   c. Drop state reads (and state writes — same priority)
    d. Update completeness flags
-6. Return the final package
+9. Return the final package
 
 ---
 
@@ -333,3 +343,29 @@ sourceMapResolution?: {
 ### New config field
 
 `sourceMapSyncThresholdBytes: number` (default `2_097_152`, i.e., 2 MB). Setting to `0` forces fully async behavior (matches pre-0.2.0 semantics, for users who prefer the cascade-safe option unconditionally). Available as `config.sourceMapSyncThresholdBytes`; plumbed through `sdk.ts` to the resolver constructor.
+
+---
+
+## 1.1.0 Additions
+
+### Stamping at capture entry (module 20)
+
+Before any work in `ErrorCapturer.capture()`, stamp `errorEventSeq = eventClock.tick()` and `errorEventHrtimeNs = process.hrtime.bigint()`. These flow through `ErrorPackageParts` into the shipped package and become the authoritative ordering anchor for the error itself.
+
+`PackageBuilder.build()` adds three new top-level fields to `ErrorPackage`:
+
+- `errorEventSeq: number`
+- `errorEventHrtimeNs: string` (bigint serialized)
+- `eventClockRange: { min: number; max: number }` — computed over the union of `errorEventSeq`, all `ioTimeline[].seq`, all `stateReads[].seq`, all `stateWrites[].seq`.
+
+If the package has no events beyond the error itself, `eventClockRange = { min: errorEventSeq, max: errorEventSeq }`.
+
+The package also gains `stateWrites: StateWriteSerialized[]` (module 22) and `trace.tracestate?: string` (module 21 — the inbound header verbatim at capture time, NOT the egress version).
+
+Wall-clock policy: `capturedAt` (per-package ISO) stays. `LocalsCacheEntry.createdAt` (per-pause `Date.now()`) is internal and not shipped. No NEW per-event `Date.now()` call sites are introduced.
+
+### Sourcemap fast-path
+
+When `process.execArgv` includes `--enable-source-maps` or `process.env.NODE_OPTIONS` contains it, V8 already resolves source maps; `SourceMapResolver.resolveStack` short-circuits to a no-op (telemetry zeros). The detection runs once at resolver construction.
+
+The `warmCache` extension filter is extended to include `.cjs` alongside `.js` and `.mjs`. `resolveStackCacheOnly` is unchanged.

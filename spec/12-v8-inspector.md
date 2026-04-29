@@ -2,7 +2,7 @@
 
 > **Spec status:** LOCKED
 > **Source files:** `src/capture/inspector-manager.ts`
-> **Dependencies:** Module 01 (types, config)
+> **Dependencies:** Module 01 (types, config), Module 19 (EventClock — for stamping at pause), Module 20 (universal stamping contract)
 > **Build order position:** 12
 
 ---
@@ -128,13 +128,17 @@ The cache is keyed by a short capture ID (`string`), not by error message text. 
 // Ring buffer entry
 interface LocalsCacheEntry {
   captureId: string;
+  seq: number;                  // EventClock.tick() at top of _onPaused (module 20)
+  hrtimeNs: bigint;             // process.hrtime.bigint() at top of _onPaused (module 20)
   frames: CapturedFrame[];
   requestId: string | null;
   errorName: string;
   errorMessage: string;
   frameCount: number;
   structuralHash: string;   // SHA-1 of functionNames.join('\u241F')
-  capturedAt: number;       // hrtime epoch, for rate control only
+  capturedAt: number;       // Date.now() \u2014 internal-only, used for ring-buffer entry-age inspection;
+                            //   NOT shipped in any package. See module 20 for the wall-clock policy
+                            //   (consumers must use hrtimeNs, never createdAt).
 }
 ```
 
@@ -165,6 +169,8 @@ Secondary index: separate lookup structures for Layer 2 identity-tuple matching 
 ### _onPaused handler — critical hot path
 
 **CRITICAL CONSTRAINT:** All `session.post()` calls use the CALLBACK form. Callbacks fire synchronously while V8 is paused. This is confirmed by Node.js internals (PR #27893) and Sentry's production experience (PR #7637). `Debugger.resume` MUST be called synchronously before the handler returns. The entire handler is wrapped in `try/finally` with `session.post('Debugger.resume')` in the finally block.
+
+**Stamping at entry (module 20):** Before any filtering, gating, or async I/O, stamp `seq = eventClock.tick()` and `hrtimeNs = process.hrtime.bigint()`. These values flow into the eventual `LocalsCacheEntry`. Captures that miss (rate-limited, no app frames, etc.) consume a `seq` value monotonically — this is intended; gaps in the seq stream from outside the inspector are observable downstream and indicate a pause we declined to record.
 
 **4-gate fast path:**
 

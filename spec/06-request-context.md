@@ -2,7 +2,7 @@
 
 > **Spec status:** LOCKED
 > **Source files:** `src/context/als-manager.ts`, `src/context/request-tracker.ts`
-> **Dependencies:** Module 01 (types, config)
+> **Dependencies:** Module 01 (types, config), Module 19 (EventClock — for `merge` on tracestate ingest), Module 21 (tracestate parsing)
 > **Build order position:** 6
 
 ---
@@ -64,12 +64,23 @@ Provide the `AsyncLocalStorage`-based request context binding that correlates I/
 
 ```typescript
 class ALSManager {
-  constructor();
-  createRequestContext(req: { method: string; url: string; headers: Record<string, string> }): RequestContext;
+  constructor(deps: {
+    eventClock: EventClock;                                       // module 19
+    config: Pick<ResolvedConfig, 'traceContext'>;                 // module 21
+  });
+  createRequestContext(req: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+    traceparent?: string;
+    tracestate?: string;                                          // module 21
+  }): RequestContext;
   runWithContext<T>(ctx: RequestContext, fn: () => T): T;
   getContext(): RequestContext | undefined;
   getRequestId(): string | undefined;
   getStore(): AsyncLocalStorage<RequestContext>;
+  formatTraceparent(): string | null;
+  formatOutboundTracestate(): string | null;                      // module 21
 }
 ```
 
@@ -104,8 +115,18 @@ interface RequestSummary {
 - `createRequestContext` copies values out of the `req` parameter into a new `RequestContext` object. It does NOT store a reference to the original `req` object (GC safety).
 - `requestId` generated via `crypto.randomUUID()`.
 - `startTime` generated via `process.hrtime.bigint()`.
-- `ioEvents` and `stateReads` arrays are initialized empty.
+- `ioEvents`, `stateReads`, and `stateWrites` arrays are initialized empty.
 - `getStore()` exposes the raw `AsyncLocalStorage` instance for use with `diagnostics_channel.channel.bindStore()`.
+
+### Tracestate ingest (module 21)
+
+When `req.tracestate` is provided:
+
+1. Call `parseTracestate(req.tracestate, vendorKey)` (module 21).
+2. If `receivedSeq !== null`, call `eventClock.merge(receivedSeq)` (module 19). The merge bumps our local clock so subsequent events stamp with values guaranteed greater than the peer's.
+3. Store `parsed.inheritedEntries` on `RequestContext.inheritedTracestate` if non-empty (else leave undefined). These are re-emitted by HTTP recorders on egress.
+
+`formatOutboundTracestate()` returns the egress string for the **current** ALS context using `formatTracestate(eventClock.current(), ctx.inheritedTracestate, vendorKey)`. Returns `null` if no ALS context is active. Used by `recording/http-client.ts` and `recording/undici.ts`.
 
 ### RequestTracker
 

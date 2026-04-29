@@ -1,7 +1,7 @@
 # ErrorCore SDK — Master Specification Index
 
 > **Status:** LOCKED
-> **Schema version:** 1.0.0
+> **Schema version:** 1.1.0
 > **Runtime target:** Node.js >= 20
 > **Language:** TypeScript (compiled to JS for distribution)
 > **Dependencies:** Zero runtime dependencies. Only `node:` built-in modules.
@@ -62,6 +62,10 @@ Modules MUST be implemented in this exact order. Each module depends only on mod
 | 15 | [15-middleware](15-middleware.md) | `src/middleware/express.ts`, `src/middleware/fastify.ts`, `src/middleware/koa.ts`, `src/middleware/hapi.ts`, `src/middleware/raw-http.ts` | 01, 06 |
 | 16 | [16-sdk-composition](16-sdk-composition.md) | `src/sdk.ts`, `src/index.ts` | ALL prior modules |
 | 18 | [18-health-metrics](18-health-metrics.md) | `src/health/health-metrics.ts`, `src/health/types.ts` | 13, 14, 16 |
+| 19 | [19-event-clock](19-event-clock.md) | `src/context/event-clock.ts` | None |
+| 20 | [20-event-stamping](20-event-stamping.md) | (cross-cutting; modifies 01, 03, 11, 12, 13, 22) | 19 |
+| 21 | [21-w3c-tracestate](21-w3c-tracestate.md) | `src/context/tracestate.ts`, modifies `als-manager.ts`, recorders, middleware | 01, 06, 19 |
+| 22 | [22-state-write-tracking](22-state-write-tracking.md) | modifies `src/state/state-tracker.ts` | 01, 02, 06, 11, 19 |
 
 ---
 
@@ -83,6 +87,8 @@ src/
   context/
     als-manager.ts          — AsyncLocalStorage lifecycle (class, not singleton)
     request-tracker.ts      — Active in-flight request Map
+    event-clock.ts          — Process-wide Lamport-style monotonic counter (module 19)
+    tracestate.ts           — W3C tracestate parse/format helpers (module 21)
 
   recording/
     channel-subscriber.ts   — diagnostics_channel subscription orchestrator
