@@ -46,6 +46,7 @@ function serializeEvictionRecord(record: EvictionRecord): EvictionRecordSerializ
 function serializeIOEvent(event: IOEventSlot, scrubber: Scrubber): IOEventSerialized {
   return {
     seq: event.seq,
+    hrtimeNs: event.hrtimeNs.toString(),
     type: event.type,
     direction: event.direction,
     target: event.target,
@@ -76,6 +77,7 @@ function serializeIOEvent(event: IOEventSlot, scrubber: Scrubber): IOEventSerial
 
 function serializeStateRead(read: StateRead): StateReadSerialized {
   return {
+    seq: read.seq,
     container: read.container,
     operation: read.operation,
     key: read.key,
@@ -267,9 +269,24 @@ export class PackageBuilder {
       frameAlignment = alignment;
     }
 
+    let minSeq = parts.errorEventSeq;
+    let maxSeq = parts.errorEventSeq;
+    for (const e of parts.ioTimeline) {
+      if (e.seq < minSeq) minSeq = e.seq;
+      if (e.seq > maxSeq) maxSeq = e.seq;
+    }
+    for (const r of parts.stateReads) {
+      if (r.seq < minSeq) minSeq = r.seq;
+      if (r.seq > maxSeq) maxSeq = r.seq;
+    }
+    const eventClockRange = { min: minSeq, max: maxSeq };
+
     const packageObject: ErrorPackage = {
-      schemaVersion: '1.0.0',
+      schemaVersion: '1.1.0',
       capturedAt: new Date().toISOString(),
+      errorEventSeq: parts.errorEventSeq,
+      errorEventHrtimeNs: parts.errorEventHrtimeNs.toString(),
+      eventClockRange,
       fingerprint: parts.fingerprint,
       timeAnchor: { ...parts.timeAnchor },
       error: {

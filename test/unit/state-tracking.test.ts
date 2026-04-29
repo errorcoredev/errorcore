@@ -29,6 +29,7 @@ describe('StateTracker', () => {
     expect(value).toEqual({ profile: { role: 'admin' } });
     expect(context.stateReads).toEqual([
       {
+        seq: expect.any(Number),
         container: 'users',
         operation: 'get',
         key: 'user-1',

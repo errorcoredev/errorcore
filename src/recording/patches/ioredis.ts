@@ -32,7 +32,7 @@ function getTarget(instance: Record<string, unknown>): string {
 function pushEvent(
   deps: PatchInstallDeps,
   context: RequestContext | undefined,
-  event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>
+  event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>
 ): void {
   const { slot } = deps.buffer.push(event);
   pushIOEvent(context, slot, deps.config.bufferSize);
@@ -68,7 +68,7 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
               ? command.args[0]
               : undefined;
           const key = isCredentialCommand ? undefined : rawKey;
-          const event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'> = {
+          const event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'> = {
             phase: 'active',
             startTime,
             endTime: null,

@@ -100,7 +100,7 @@ function isStreamLike(value: unknown): boolean {
 function pushEvent(
   deps: PatchInstallDeps,
   context: RequestContext | undefined,
-  event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>
+  event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>
 ): void {
   const { slot } = deps.buffer.push(event);
   pushIOEvent(context, slot, deps.config.bufferSize);
@@ -116,7 +116,7 @@ function createBaseEvent(
     query: string;
     params: unknown[];
   }
-): Omit<IOEventSlot, 'seq' | 'estimatedBytes'> {
+): Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'> {
   return {
     phase: 'active',
     startTime: input.startTime,
@@ -152,7 +152,7 @@ function createBaseEvent(
 function finalizeEvent(
   deps: PatchInstallDeps,
   context: RequestContext | undefined,
-  event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>,
+  event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>,
   result: unknown,
   error?: Error
 ): void {

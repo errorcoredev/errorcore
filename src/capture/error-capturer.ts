@@ -4,6 +4,7 @@ import { createDebug } from '../debug';
 import type { Encryption } from '../security/encryption';
 import type { RateLimiter } from '../security/rate-limiter';
 import type { ALSManager } from '../context/als-manager';
+import { EventClock } from '../context/event-clock';
 import type { HealthMetrics } from '../health/health-metrics';
 import { HTTP_TRANSPORT_TIMEOUT_MESSAGE } from '../transport/http-transport';
 
@@ -197,6 +198,8 @@ export class ErrorCapturer {
 
   private readonly healthMetrics: HealthMetrics | null;
 
+  private readonly eventClock: EventClock;
+
   private readonly pendingTransportDispatches = new Set<Promise<void>>();
 
   private readonly deliveryDiagnostics: CaptureDeliveryDiagnostics = {
@@ -217,6 +220,7 @@ export class ErrorCapturer {
     encryption?: Encryption | null;
     bodyCapture: BodyCaptureLike;
     config: ResolvedConfig;
+    eventClock?: EventClock;
     packageAssemblyDispatcher?: PackageAssemblyDispatcherLike | null;
     stateTrackerStatus?: StateTrackerStatusLike | null;
     deadLetterStore?: DeadLetterStore | null;
@@ -235,6 +239,9 @@ export class ErrorCapturer {
     this.encryption = deps.encryption ?? null;
     this.bodyCapture = deps.bodyCapture;
     this.config = deps.config;
+    // EventClock is optional for test ergonomics; the SDK composition root
+    // always passes one shared instance (module 19 contract).
+    this.eventClock = deps.eventClock ?? new EventClock();
     this.packageAssemblyDispatcher = deps.packageAssemblyDispatcher ?? null;
     this.stateTrackerStatus = deps.stateTrackerStatus ?? null;
     this.deadLetterStore = deps.deadLetterStore ?? null;
@@ -245,6 +252,11 @@ export class ErrorCapturer {
 
   public capture(error: Error, _options?: { isUncaught?: boolean }): ErrorPackage | null {
     const captureFailures: string[] = [];
+    // Stamp the error event at function entry — module 20 contract. Captured
+    // BEFORE the rate-limit check so the seq is consumed and observable as a
+    // gap downstream even when the capture itself is dropped.
+    const errorEventSeq = this.eventClock.tick();
+    const errorEventHrtimeNs = process.hrtime.bigint();
 
     try {
       debug(`capture() called for ${error.name}: ${error.message}`);
@@ -289,6 +301,8 @@ export class ErrorCapturer {
         stateReads.length > 0 || this.stateTrackerStatus?.isTrackingEnabled() === true;
       const fingerprint = computeFingerprint(error, localsResult.frames ?? []);
       const parts: ErrorPackageParts = {
+        errorEventSeq,
+        errorEventHrtimeNs,
         error: {
           type: serializedError.type,
           message: serializedError.message,

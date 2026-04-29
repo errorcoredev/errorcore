@@ -20,7 +20,7 @@ type WrappedTarget = Record<string | symbol, unknown> & {
 type Wrapper = (original: Function) => Function;
 
 interface IOEventBufferLike {
-  push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
+  push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
     slot: IOEventSlot;
     seq: number;
   };

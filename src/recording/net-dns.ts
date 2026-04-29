@@ -10,7 +10,7 @@ import { extractFd, pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
 
 interface IOEventBufferLike {
-  push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
+  push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
     slot: IOEventSlot;
     seq: number;
   };

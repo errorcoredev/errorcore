@@ -14,6 +14,7 @@ export type IODirection = 'inbound' | 'outbound';
 
 export interface IOEventSlot {
   seq: number;
+  hrtimeNs: bigint;
   phase: IOEventPhase;
   startTime: bigint;
   endTime: bigint | null;
@@ -64,6 +65,7 @@ export interface RequestContext {
 }
 
 export interface StateRead {
+  seq: number;
   container: string;
   operation: string;
   key: unknown;
@@ -170,6 +172,7 @@ export interface ErrorPackageRequestContextData {
 
 export interface IOEventSerialized {
   seq: number;
+  hrtimeNs: string;
   type: IOEventSlot['type'];
   direction: IOEventSlot['direction'];
   target: string;
@@ -203,6 +206,7 @@ export interface IOEventSerialized {
 }
 
 export interface StateReadSerialized {
+  seq: number;
   container: string;
   operation: string;
   key: unknown;
@@ -240,8 +244,11 @@ export interface ProcessMetadata {
 }
 
 export interface ErrorPackage {
-  schemaVersion: '1.0.0';
+  schemaVersion: '1.1.0';
   capturedAt: string;
+  errorEventSeq: number;
+  errorEventHrtimeNs: string;
+  eventClockRange: { min: number; max: number };
   fingerprint?: string;
   timeAnchor: TimeAnchor;
   error: {
@@ -283,6 +290,8 @@ export interface ErrorPackage {
 }
 
 export interface ErrorPackageParts {
+  errorEventSeq: number;
+  errorEventHrtimeNs: bigint;
   error: {
     type: string;
     message: string;

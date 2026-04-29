@@ -11,7 +11,7 @@ import { extractFd, pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
 
 interface IOEventBufferLike {
-  push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
+  push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
     slot: IOEventSlot;
     seq: number;
   };
@@ -215,7 +215,7 @@ export class HttpServerRecorder {
 
   private readonly finalizerPool: RequestFinalizer[] = [];
 
-  private readonly pushEventScratch = {} as Omit<IOEventSlot, 'seq' | 'estimatedBytes'>;
+  private readonly pushEventScratch = {} as Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>;
 
   private bindStoreSucceeded = false;
 

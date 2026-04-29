@@ -3,12 +3,15 @@ import path = require('node:path');
 import { createHash } from 'node:crypto';
 
 import type { CapturedFrame, ResolvedConfig } from '../types';
+import { EventClock } from '../context/event-clock';
 import { looksLikeHighEntropySecret } from '../pii/scrubber';
 
 export const ERRORCORE_CAPTURE_ID_SYMBOL = Symbol.for('errorcore.v1.captureId');
 
 export interface LocalsRingBufferEntry {
   id: string;
+  seq: number;
+  hrtimeNs: bigint;
   requestId: string | null;
   errorName: string;
   errorMessage: string;
@@ -189,6 +192,7 @@ interface PausedEventParams {
 
 interface InspectorManagerDeps {
   getRequestId?: () => string | undefined;
+  eventClock?: EventClock;
 }
 
 function getInspectorModule(): InspectorModule {
@@ -220,6 +224,8 @@ export class InspectorManager {
 
   private readonly getRequestId: () => string | undefined;
 
+  private readonly eventClock: EventClock;
+
   private available = false;
 
   private initialized = false;
@@ -246,6 +252,9 @@ export class InspectorManager {
     this.maxLocalsFrames = config.maxLocalsFrames;
     this.captureLocalVariables = config.captureLocalVariables;
     this.getRequestId = deps.getRequestId ?? (() => undefined);
+    // EventClock is optional for test ergonomics; the SDK composition root
+    // always passes one shared instance (module 19 contract).
+    this.eventClock = deps.eventClock ?? new EventClock();
     this.ringBuffer = new LocalsRingBuffer(config.maxCachedLocals);
 
     if (this.captureLocalVariables) {
@@ -584,6 +593,12 @@ export class InspectorManager {
   }
 
   private _onPaused(params: PausedEventParams): void {
+    // Stamp at entry — module 20 contract. Fires before any filtering, gating,
+    // or async I/O. Pause events that don't produce a ring-buffer entry still
+    // consume seq values; gaps in the seq stream from outside the inspector
+    // are observable downstream and indicate a pause we declined to record.
+    const stampedSeq = this.eventClock.tick();
+    const stampedHrtimeNs = process.hrtime.bigint();
     try {
       this.deactivateAfterIdle();
       this.pauseEventsReceived += 1;
@@ -686,6 +701,8 @@ export class InspectorManager {
 
           const entry: LocalsRingBufferEntry = {
             id: captureId,
+            seq: stampedSeq,
+            hrtimeNs: stampedHrtimeNs,
             requestId,
             errorName,
             errorMessage,

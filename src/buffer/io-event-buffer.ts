@@ -5,7 +5,7 @@ import type { AmbientEventContext, EvictionRecord, IOEventSlot } from '../types'
 // Accounts for serialized JSON field names and structure, not the in-memory null slot size.
 const METADATA_OVERHEAD = 256;
 
-type PushableIOEvent = Omit<IOEventSlot, 'seq' | 'estimatedBytes'>;
+type PushableIOEvent = Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>;
 
 const EMPTY_REQUEST_SLOTS: IOEventSlot[] = [];
 
@@ -323,6 +323,7 @@ export class IOEventBuffer {
     estimatedBytes: number
   ): void {
     slot.seq = seq;
+    slot.hrtimeNs = process.hrtime.bigint();
     slot.phase = event.phase;
     slot.startTime = event.startTime;
     slot.endTime = event.endTime;

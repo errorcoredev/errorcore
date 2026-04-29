@@ -1,5 +1,6 @@
 
 import { TIGHT_LIMITS, cloneAndLimit } from '../serialization/clone-and-limit';
+import { EventClock } from '../context/event-clock';
 import type { RequestContext, StateRead } from '../types';
 
 interface ALSManagerLike {
@@ -22,10 +23,15 @@ const MAX_STATE_READS_PER_CONTEXT = 50;
 export class StateTracker {
   private readonly als: ALSManagerLike;
 
+  private readonly eventClock: EventClock;
+
   private trackingEnabled = false;
 
-  public constructor(deps: { als: ALSManagerLike }) {
+  public constructor(deps: { als: ALSManagerLike; eventClock?: EventClock }) {
     this.als = deps.als;
+    // EventClock is optional for test ergonomics; the SDK composition root
+    // always passes one shared instance (module 19 contract).
+    this.eventClock = deps.eventClock ?? new EventClock();
   }
 
   public track<T extends Map<unknown, unknown> | Record<string, unknown>>(
@@ -204,6 +210,7 @@ export class StateTracker {
     }
 
     const stateRead: StateRead = {
+      seq: this.eventClock.tick(),
       container,
       operation,
       key: cloneAndLimit(key, TIGHT_LIMITS),

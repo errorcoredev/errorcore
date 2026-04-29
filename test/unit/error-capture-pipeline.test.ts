@@ -92,6 +92,7 @@ function withWorkerThreadsMock<T>(
 function createSlot(overrides: Partial<IOEventSlot> = {}): IOEventSlot {
   return {
     seq: 1,
+    hrtimeNs: 1n,
     phase: 'done',
     startTime: 1n,
     endTime: 2n,
@@ -159,6 +160,8 @@ function createPackageParts(
   overrides: Partial<ErrorPackageParts> = {}
 ): ErrorPackageParts {
   return {
+    errorEventSeq: 1,
+    errorEventHrtimeNs: process.hrtime.bigint(),
     error: {
       type: 'Error',
       message: 'boom',
@@ -430,6 +433,8 @@ describe('PackageBuilder', () => {
     });
 
     const pkg = builder.build({
+      errorEventSeq: 1,
+      errorEventHrtimeNs: 0n,
       error: {
         type: 'Error',
         message: 'password leaked',
@@ -492,7 +497,7 @@ describe('PackageBuilder', () => {
       usedAmbientEvents: false
     });
 
-    expect(pkg.schemaVersion).toBe('1.0.0');
+    expect(pkg.schemaVersion).toBe('1.1.0');
     expect(new Date(pkg.capturedAt).toISOString()).toBe(pkg.capturedAt);
     expect(pkg.error.properties.password).toBe('[REDACTED]');
     expect(pkg.localVariables?.[0]?.locals.apiKey).toBe('[REDACTED]');
@@ -520,8 +525,13 @@ describe('PackageBuilder', () => {
   });
 
   it('progressively sheds oversized payloads to stay under the UTF-8 byte size limit', () => {
+    // Bumped from 1100 -> 1300 in v1.1.0 to accommodate the new top-level
+    // package fields (errorEventSeq, errorEventHrtimeNs, eventClockRange,
+    // hrtimeNs on each IO event, seq on each state read). The test still
+    // demonstrates that the shedding pipeline brings an oversized package
+    // under any configured cap; only the absolute byte count moved.
     const config = resolveConfig({
-      serialization: { maxTotalPackageSize: 1100 }
+      serialization: { maxTotalPackageSize: 1300 }
     });
     const builder = new PackageBuilder({
       scrubber: new Scrubber(config),
@@ -531,6 +541,8 @@ describe('PackageBuilder', () => {
     const unicodePayload = '漢🙂'.repeat(512);
 
     const pkg = builder.build({
+      errorEventSeq: 1,
+      errorEventHrtimeNs: 0n,
       error: {
         type: 'Error',
         message: 'boom',
@@ -669,7 +681,7 @@ describe('PackageBuilder', () => {
 
     expect(result.packageObject.request?.id).toBe('req-dispatch');
     expect(JSON.parse(result.payload)).toMatchObject({
-      schemaVersion: '1.0.0'
+      schemaVersion: '1.1.0'
     });
 
     await dispatcher.shutdown();
@@ -966,7 +978,7 @@ describe('ErrorCapturer', () => {
     expect(pkg?.error.properties.code).toBe('E_BANG');
     expect(transport.send).toHaveBeenCalledTimes(1);
     expect(JSON.parse(decrypted)).toMatchObject({
-      schemaVersion: '1.0.0',
+      schemaVersion: '1.1.0',
       completeness: {
         encrypted: true
       }

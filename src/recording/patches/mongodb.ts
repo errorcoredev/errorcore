@@ -79,7 +79,7 @@ function resolveRowCount(result: unknown): number | null {
 function pushEvent(
   deps: PatchInstallDeps,
   context: RequestContext | undefined,
-  event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>
+  event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>
 ): void {
   const { slot } = deps.buffer.push(event);
   pushIOEvent(context, slot, deps.config.bufferSize);
@@ -96,7 +96,7 @@ function instrumentMethod(
       db?: { databaseName?: string };
     };
     const context = deps.als.getContext();
-    const event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'> = {
+    const event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'> = {
       phase: 'active',
       startTime: process.hrtime.bigint(),
       endTime: null,

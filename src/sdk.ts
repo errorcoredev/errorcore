@@ -619,7 +619,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     : null;
   const processMetadata = new ProcessMetadata(config);
   const inspector = new InspectorManager(config, {
-    getRequestId: () => als.getRequestId()
+    getRequestId: () => als.getRequestId(),
+    eventClock
   });
   const requestTracker = new RequestTracker({
     maxConcurrent: config.maxConcurrentRequests,
@@ -633,7 +634,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     bodyCaptureContentTypes: config.bodyCaptureContentTypes,
     scrubber
   });
-  const stateTracker = new StateTracker({ als });
+  const stateTracker = new StateTracker({ als, eventClock });
   const httpServerRecorder = new HttpServerRecorder({
     buffer,
     als,
@@ -736,6 +737,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     encryption,
     bodyCapture,
     config,
+    eventClock,
     packageAssemblyDispatcher,
     stateTrackerStatus: stateTracker,
     deadLetterStore,
