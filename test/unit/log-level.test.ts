@@ -73,3 +73,45 @@ describe('logLevel filter', () => {
     expect(error).toHaveBeenCalledOnce();
   });
 });
+
+import { resolveConfig } from '../../src/config';
+
+describe('logLevel applied via resolveConfig + setLogLevel', () => {
+  it('silent suppresses an ErrorCore warning emitted via safeConsole', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const resolved = resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        logLevel: 'silent',
+      });
+      setLogLevel(resolved.logLevel);
+      safeConsole.warn('[ErrorCore] hidden');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      __resetLogLevel();
+    }
+  });
+
+  it("'warn' emits warnings but suppresses info/debug", () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const resolved = resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        logLevel: 'warn',
+      });
+      setLogLevel(resolved.logLevel);
+      safeConsole.warn('[ErrorCore] visible');
+      safeConsole.log('[ErrorCore] startup-line');
+      expect(warn).toHaveBeenCalledOnce();
+      expect(log).not.toHaveBeenCalled();  // log is treated as 'info'
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+      __resetLogLevel();
+    }
+  });
+});

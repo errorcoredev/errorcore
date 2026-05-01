@@ -1,5 +1,6 @@
 
 import type { RequestContext } from '../types';
+import { safeConsole } from '../debug-log';
 
 export interface SDKInstanceLike {
   isActive(): boolean;
@@ -61,7 +62,7 @@ let middlewareWarningEmitted = false;
 export function warnIfUninitialized(source: string): void {
   if (!middlewareWarningEmitted) {
     middlewareWarningEmitted = true;
-    console.warn(
+    safeConsole.warn(
       `[errorcore] ${source} is active but init() was not called. ` +
       'Requests are not being tracked. Call errorcore.init() at the top of your application entry point.'
     );

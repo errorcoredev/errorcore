@@ -2,6 +2,7 @@
 import { homedir } from 'node:os';
 
 import type { ResolvedConfig, SerializationLimits } from '../types';
+import { safeConsole } from '../debug-log';
 import {
   AWS_ACCESS_KEY_REGEX,
   BASIC_AUTH_REGEX,
@@ -306,7 +307,7 @@ export class Scrubber {
       return this.config.piiScrubber?.(key, value) ?? value;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Custom PII scrubber failed: ${message}`);
+      safeConsole.warn(`[ErrorCore] Custom PII scrubber failed: ${message}`);
       return getFallback();
     }
   }

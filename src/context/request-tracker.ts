@@ -1,5 +1,6 @@
 
 import type { RequestContext, RequestSummary } from '../types';
+import { safeConsole } from '../debug-log';
 
 interface RequestTrackerConfig {
   maxConcurrent: number;
@@ -30,7 +31,7 @@ export class RequestTracker {
     if (this.contexts.size >= this.maxConcurrent) {
       if (!this.capacityWarningActive) {
         this.capacityWarningActive = true;
-        console.debug('[ErrorCore] RequestTracker at capacity; dropping tracked request');
+        safeConsole.debug('[ErrorCore] RequestTracker at capacity; dropping tracked request');
       }
       return;
     }

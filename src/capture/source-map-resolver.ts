@@ -3,6 +3,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { SourceMapConsumer } from 'source-map-js';
 
+import { safeConsole } from '../debug-log';
+
 type CacheEntry =
   | { type: 'consumer'; consumer: SourceMapConsumer; usedAt: number }
   | { type: 'missing'; cachedAt: number }
@@ -192,7 +194,7 @@ export class SourceMapResolver {
 
     if (!this.warnedNoMaps && resolvedCount === 0 && frameCount > 0) {
       this.warnedNoMaps = true;
-      console.warn(
+      safeConsole.warn(
         '[ErrorCore] No source maps found for captured stack traces. ' +
         'Stack frames will reference minified/bundled locations.\n' +
         'If you use a bundler (webpack, esbuild, Next.js, etc.), configure it to emit ' +

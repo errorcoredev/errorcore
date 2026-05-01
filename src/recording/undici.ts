@@ -3,6 +3,7 @@ import type { IOEventSlot, RequestContext } from '../types';
 import { isSdkInternalRequest } from './internal';
 import { pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
+import { safeConsole } from '../debug-log';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
@@ -130,7 +131,7 @@ export class UndiciRecorder {
       this.slots.set(message.request as object, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record undici request creation: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record undici request creation: ${messageText}`);
     }
   }
 
@@ -155,7 +156,7 @@ export class UndiciRecorder {
       );
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record undici response headers: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record undici response headers: ${messageText}`);
     }
   }
 
@@ -174,7 +175,7 @@ export class UndiciRecorder {
       void message.trailers;
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record undici request trailers: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record undici request trailers: ${messageText}`);
     }
   }
 
@@ -196,7 +197,7 @@ export class UndiciRecorder {
       this.slots.delete(message.request as object);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record undici request error: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record undici request error: ${messageText}`);
     }
   }
 

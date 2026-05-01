@@ -1,6 +1,6 @@
 
 import { resolveConfig } from './config';
-import { setLogLevel } from './debug-log';
+import { setLogLevel, safeConsole } from './debug-log';
 import {
   detectBundler,
   isNextJsNodeRuntime,
@@ -55,7 +55,7 @@ function parseDerivedKeyFromEnv(): Buffer | undefined {
   const hex = process.env.ERRORCORE_DERIVED_KEY;
   if (hex === undefined || hex === '') return undefined;
   if (!/^[0-9a-f]{64}$/i.test(hex)) {
-    console.warn(
+    safeConsole.warn(
       '[errorcore] ERRORCORE_DERIVED_KEY must be a 64-character hex string (32 bytes). Falling back to runtime key derivation.'
     );
     return undefined;
@@ -244,6 +244,10 @@ export class SDKInstance {
       nodeVersion: process.versions.node,
       recorders,
     });
+    // Startup diagnostic is gated by `silent` only (already short-circuited
+    // above when silent is true) -- bypass the logLevel gate so the
+    // documented one-line summary always prints when the user hasn't opted
+    // out via silent: true.
     console.log(line);
     const isNextJs = isNextJsNodeRuntime();
     for (const [name, state] of Object.entries(recorders)) {
@@ -276,7 +280,7 @@ export class SDKInstance {
 
     const max = this.config.maxDrainOnStartup;
     if (entries.length > max) {
-      console.warn(
+      safeConsole.warn(
         `[ErrorCore] Dead-letter store contains ${entries.length} payloads; ` +
         `draining only ${max} on startup. Run \`errorcore drain\` to flush the rest.`
       );
@@ -291,7 +295,7 @@ export class SDKInstance {
           processedLineCount = entry.lineNumber;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          console.warn(
+          safeConsole.warn(
             `[ErrorCore] Dead-letter retry failed after line ${processedLineCount}/${lineCount}: ${message}`
           );
           break;
@@ -316,7 +320,7 @@ export class SDKInstance {
 
     void sendAll().catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Dead-letter drain failed: ${message}`);
+      safeConsole.warn(`[ErrorCore] Dead-letter drain failed: ${message}`);
     });
   }
 
@@ -701,7 +705,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
   if (config.deadLetterPath !== undefined && deadLetterIntegrityKey === null) {
     // Design note: Disable automatic dead-letter replay when no stable secret
     // is configured because unsigned disk content cannot be trusted safely.
-    console.warn(
+    safeConsole.warn(
       '[ErrorCore] Dead-letter persistence is disabled because no encryptionKey or HTTP authorization secret is configured.'
     );
   }

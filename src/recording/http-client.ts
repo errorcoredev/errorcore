@@ -9,6 +9,7 @@ import {
 } from './internal';
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
+import { safeConsole } from '../debug-log';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
@@ -208,7 +209,7 @@ export class HttpClientRecorder {
       });
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record outbound HTTP request: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record outbound HTTP request: ${messageText}`);
     }
   }
 

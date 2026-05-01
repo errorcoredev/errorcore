@@ -4,6 +4,7 @@ import type { SDKConfig } from './types';
 import type { HealthSnapshot } from './health/types';
 import { SDKInstance, createSDK } from './sdk';
 import { resetMiddlewareWarning } from './middleware/common';
+import { safeConsole } from './debug-log';
 
 /**
  * Global singleton storage using Symbol.for() to survive webpack chunk boundaries.
@@ -73,7 +74,7 @@ export function init(config?: Partial<SDKConfig>): SDKInstance {
     if (!existing.isActive()) {
       setGlobalInstance(null);
     } else {
-      console.warn(
+      safeConsole.warn(
         '[errorcore] init() called while SDK is already active. Returning existing instance.'
       );
       return existing;
@@ -107,7 +108,7 @@ export function captureError(error: Error): void {
   if (instance === null) {
     if (!getCaptureWarningEmitted()) {
       setCaptureWarningEmitted(true);
-      console.warn(
+      safeConsole.warn(
         '[errorcore] captureError() called before init(). Errors are not being captured. ' +
         'Call errorcore.init() at the top of your application entry point.'
       );
@@ -125,7 +126,7 @@ export function trackState<T extends Map<unknown, unknown> | Record<string, unkn
   const instance = getGlobalInstance();
 
   if (instance === null) {
-    console.warn(
+    safeConsole.warn(
       '[errorcore] trackState() called before init(). Returning unproxied container.'
     );
     return container;

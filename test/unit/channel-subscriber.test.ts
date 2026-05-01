@@ -3,6 +3,7 @@ import Module = require('node:module');
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ChannelSubscriber } from '../../src/recording/channel-subscriber';
+import { setLogLevel, __resetLogLevel } from '../../src/debug-log';
 
 const originalRequire = Module.prototype.require;
 
@@ -145,26 +146,31 @@ describe('ChannelSubscriber', () => {
   });
 
   it('skips missing channels without throwing', () => {
+    setLogLevel('debug');
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
-    const diagnosticsChannel = {
-      subscribe: vi.fn((channelName: string) => {
-        if (channelName === 'net.client.socket') {
-          throw new Error('missing channel');
-        }
-      }),
-      unsubscribe: vi.fn()
-    };
+    try {
+      const diagnosticsChannel = {
+        subscribe: vi.fn((channelName: string) => {
+          if (channelName === 'net.client.socket') {
+            throw new Error('missing channel');
+          }
+        }),
+        unsubscribe: vi.fn()
+      };
 
-    expect(() =>
-      withDiagnosticsChannelMock(diagnosticsChannel, () => {
-        const subscriber = createSubscriber();
+      expect(() =>
+        withDiagnosticsChannelMock(diagnosticsChannel, () => {
+          const subscriber = createSubscriber();
 
-        subscriber.subscribeAll();
-      })
-    ).not.toThrow();
+          subscriber.subscribeAll();
+        })
+      ).not.toThrow();
 
-    expect(debug).toHaveBeenCalledTimes(1);
-    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(9);
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(9);
+    } finally {
+      __resetLogLevel();
+    }
   });
 
   it('is idempotent when subscribeAll is called twice', () => {

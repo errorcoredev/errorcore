@@ -109,6 +109,7 @@ describe('resolveConfig', () => {
       onInternalWarning: undefined,
       drivers: {},
       silent: false,
+      logLevel: 'warn',
       sourceMapSyncThresholdBytes: 2 * 1024 * 1024,
       captureMiddlewareStatusCodes: 'none',
       traceContext: { vendorKey: 'ec' },

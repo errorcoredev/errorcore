@@ -15,6 +15,8 @@ onInternalWarning?: (warning: {
 
 The callback MUST NOT throw into the SDK; any thrown error is swallowed. The same callback receives both per-event codes (the matrix below) and aggregate summaries (`errorcore_payloads_dropped`, `errorcore_payloads_dead_lettered`) emitted periodically at shutdown/flush.
 
+The `cause` field is `unknown` at the type level for back-compat. In practice the SDK emits `cause` as an object `{ name: string; message: string; stackHead?: string; code?: string }` whenever the underlying trigger was an `Error` instance. `code` is preserved when the error is an errno-typed `NodeJS.ErrnoException` (e.g. `ENOSPC`, `EACCES`). Non-Error triggers are passed through verbatim. Consumers that want the trigger's stack should read `cause.stackHead` (the first two lines of `Error.stack`); the full stack is intentionally not propagated to keep the warning channel small.
+
 ## Matrix
 
 | Condition | SDK behavior | Warning code | Data loss? |

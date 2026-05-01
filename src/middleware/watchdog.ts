@@ -1,5 +1,6 @@
 
 import type { ResolvedConfig } from '../types';
+import { safeConsole } from '../debug-log';
 
 interface WorkerLike {
   postMessage(message: unknown): void;
@@ -167,7 +168,7 @@ export class WatchdogManager {
         this.worker = null;
       });
     } catch {
-      console.warn('[ErrorCore] Watchdog worker thread init failed');
+      safeConsole.warn('[ErrorCore] Watchdog worker thread init failed');
       this.worker = null;
     }
   }

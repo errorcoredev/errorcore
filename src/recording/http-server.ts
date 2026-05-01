@@ -9,6 +9,7 @@ import type { IOEventSlot, RequestContext, ResolvedConfig } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
+import { safeConsole } from '../debug-log';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
@@ -336,7 +337,7 @@ export class HttpServerRecorder {
       response.on('close', handleResponseClose);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record inbound HTTP request: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record inbound HTTP request: ${messageText}`);
     }
   }
 
@@ -354,7 +355,7 @@ export class HttpServerRecorder {
       finalizer.finalize(false);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to finalize response via channel: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to finalize response via channel: ${messageText}`);
     }
   }
 
@@ -400,7 +401,7 @@ export class HttpServerRecorder {
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] bindStore unavailable, using emit patch (reason: ${reason})`);
+      safeConsole.warn(`[ErrorCore] bindStore unavailable, using emit patch (reason: ${reason})`);
       process.emit('errorcore:init' as never, { path: 'emit-patch', reason } as never);
     }
   }

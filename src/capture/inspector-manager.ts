@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import type { CapturedFrame, ResolvedConfig } from '../types';
 import { EventClock } from '../context/event-clock';
 import { looksLikeHighEntropySecret } from '../pii/scrubber';
+import { safeConsole } from '../debug-log';
 
 export const ERRORCORE_CAPTURE_ID_SYMBOL = Symbol.for('errorcore.v1.captureId');
 
@@ -279,7 +280,7 @@ export class InspectorManager {
     }
 
     if (inspectorModule.url()) {
-      console.warn('[ErrorCore] Debugger already attached; local variable capture disabled');
+      safeConsole.warn('[ErrorCore] Debugger already attached; local variable capture disabled');
       this.available = false;
       return false;
     }
@@ -507,17 +508,17 @@ export class InspectorManager {
           );
         }
       } catch (error) {
-        console.warn('[ErrorCore] Failed to reset pause-on-exceptions during shutdown:', error instanceof Error ? error.message : String(error));
+        safeConsole.warn('[ErrorCore] Failed to reset pause-on-exceptions during shutdown:', error instanceof Error ? error.message : String(error));
       }
       try {
         this.session.post('Debugger.disable', () => undefined);
       } catch (error) {
-        console.warn('[ErrorCore] Failed to disable debugger during shutdown:', error instanceof Error ? error.message : String(error));
+        safeConsole.warn('[ErrorCore] Failed to disable debugger during shutdown:', error instanceof Error ? error.message : String(error));
       }
       try {
         this.session.disconnect();
       } catch (error) {
-        console.warn('[ErrorCore] Failed to disconnect inspector session during shutdown:', error instanceof Error ? error.message : String(error));
+        safeConsole.warn('[ErrorCore] Failed to disconnect inspector session during shutdown:', error instanceof Error ? error.message : String(error));
       }
     }
 
@@ -765,7 +766,7 @@ export class InspectorManager {
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[ErrorCore] Inspector paused handler failed: ${message}`);
+        safeConsole.warn(`[ErrorCore] Inspector paused handler failed: ${message}`);
       }
     } finally {
       if (this.session !== null) {

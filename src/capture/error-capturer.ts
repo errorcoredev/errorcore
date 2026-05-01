@@ -1,6 +1,7 @@
 
 import { STANDARD_LIMITS, cloneAndLimit } from '../serialization/clone-and-limit';
 import { createDebug } from '../debug';
+import { safeConsole } from '../debug-log';
 import type { Encryption } from '../security/encryption';
 import type { RateLimiter } from '../security/rate-limiter';
 import type { ALSManager } from '../context/als-manager';
@@ -81,17 +82,38 @@ function classifyDlqWriteErrno(err: unknown): 'disk_full' | 'dead_letter_write_f
     : 'dead_letter_write_failed';
 }
 
+export function serializeCause(cause: unknown): unknown {
+  if (cause instanceof Error) {
+    const message = (cause.message ?? '').slice(0, 200);
+    const firstLine = (cause.stack ?? '').split('\n').slice(0, 2).join('\n');
+    const errnoCode = (cause as NodeJS.ErrnoException).code;
+    return {
+      name: cause.name || 'Error',
+      message,
+      ...(firstLine.length > 0 ? { stackHead: firstLine } : {}),
+      ...(typeof errnoCode === 'string' ? { code: errnoCode } : {}),
+    };
+  }
+  return cause;
+}
+
 function emitSafeWarning(
   config: ResolvedConfig,
   warning: InternalWarning & { code: InternalWarningCode }
 ): void {
-  // Preserve the human-readable console output so existing log-scraping
-  // and tests don't regress. The structured callback is the new channel.
-  console.warn(`[ErrorCore] ${warning.message}`);
+  // Preserve the human-readable console output but route through the
+  // logLevel filter. The structured callback is the unfiltered channel.
+  safeConsole.warn(`[ErrorCore] ${warning.message}`);
 
   if (config.onInternalWarning !== undefined) {
+    const enriched: InternalWarning = {
+      code: warning.code,
+      message: warning.message,
+      ...(warning.cause !== undefined ? { cause: serializeCause(warning.cause) } : {}),
+      ...(warning.context !== undefined ? { context: warning.context } : {}),
+    };
     try {
-      config.onInternalWarning(warning);
+      config.onInternalWarning(enriched);
     } catch {
       // onInternalWarning must never crash the host.
     }

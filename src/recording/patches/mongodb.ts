@@ -7,6 +7,7 @@ import { wrapMethod, unwrapMethod } from './patch-manager';
 import { pushIOEvent } from '../utils';
 import type { RecorderState } from '../../sdk-diagnostics';
 import { detectBundler } from '../../sdk-diagnostics';
+import { safeConsole } from '../../debug-log';
 
 const nodeRequire = createRequire(__filename);
 
@@ -212,7 +213,7 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
         state: { state: 'skip', reason: 'not-installed' }
       };
     }
-    console.warn('[ErrorCore] Failed to install mongodb patch');
+    safeConsole.warn('[ErrorCore] Failed to install mongodb patch');
     return {
       uninstall: () => undefined,
       state: { state: 'skip', reason: 'install-failed' }

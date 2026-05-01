@@ -5,6 +5,7 @@ import { createDebug } from '../debug';
 import { FileTransport } from './file-transport';
 import { HttpTransport } from './http-transport';
 import { StdoutTransport } from './stdout-transport';
+import { safeConsole } from '../debug-log';
 
 const debug = createDebug('transport');
 
@@ -357,7 +358,7 @@ export class TransportDispatcher implements Transport {
 
     if (isWebpackBundled()) {
       debug('Webpack environment detected, skipping worker threads (eval:true is unreliable in bundlers)');
-      console.warn('[ErrorCore] Bundled environment detected — using main-thread transport (worker threads disabled).');
+      safeConsole.warn('[ErrorCore] Bundled environment detected — using main-thread transport (worker threads disabled).');
       this.fallbackToMainThread();
       return;
     }
@@ -416,7 +417,7 @@ export class TransportDispatcher implements Transport {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       debug(`Worker init failed, falling back to main thread: ${message}`);
-      console.warn(`[ErrorCore] Worker thread init failed, using main-thread transport: ${message}`);
+      safeConsole.warn(`[ErrorCore] Worker thread init failed, using main-thread transport: ${message}`);
       this.fallbackToMainThread();
     }
   }

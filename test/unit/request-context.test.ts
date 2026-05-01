@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ALSManager } from '../../src/context/als-manager';
 import { RequestTracker } from '../../src/context/request-tracker';
 import type { RequestContext } from '../../src/types';
+import { setLogLevel, __resetLogLevel } from '../../src/debug-log';
 
 function createContext(
   requestId: string,
@@ -225,15 +226,20 @@ describe('RequestTracker', () => {
 
   it('enforces the maxConcurrent cap and logs a debug warning', () => {
     stubTrackerTimer();
+    setLogLevel('debug');
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
-    const tracker = new RequestTracker({ maxConcurrent: 1, ttlMs: 1000 });
+    try {
+      const tracker = new RequestTracker({ maxConcurrent: 1, ttlMs: 1000 });
 
-    tracker.add(createContext('req-1'));
-    tracker.add(createContext('req-2'));
+      tracker.add(createContext('req-1'));
+      tracker.add(createContext('req-2'));
 
-    expect(tracker.getCount()).toBe(1);
-    expect(tracker.getAll()[0]?.requestId).toBe('req-1');
-    expect(debug).toHaveBeenCalledTimes(1);
+      expect(tracker.getCount()).toBe(1);
+      expect(tracker.getAll()[0]?.requestId).toBe('req-1');
+      expect(debug).toHaveBeenCalledTimes(1);
+    } finally {
+      __resetLogLevel();
+    }
   });
 
   it('sweeps stale entries and unreferences the interval timer', () => {

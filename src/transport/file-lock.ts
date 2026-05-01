@@ -1,5 +1,7 @@
 import * as fs from 'node:fs';
 
+import { safeConsole } from '../debug-log';
+
 const SLEEP_MS = 50;
 export const MAX_RETRIES = 20;
 
@@ -72,7 +74,7 @@ export function releaseLock(lockPath: string): void {
     fs.unlinkSync(lockPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.warn(`[ErrorCore] Failed to release lock ${lockPath}: ${(err as Error).message}`);
+      safeConsole.warn(`[ErrorCore] Failed to release lock ${lockPath}: ${(err as Error).message}`);
     }
   }
 }

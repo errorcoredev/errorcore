@@ -250,12 +250,15 @@ uncaughtExceptionExitDelayMs: 1500,
 ```js
 useWorkerAssembly: false,                  // Assemble packages in a worker thread
 silent: false,                             // Suppress the startup diagnostic line
+logLevel: 'warn',                          // 'silent' | 'error' | 'warn' | 'info' | 'debug'
 allowPlainHttpTransport: false,            // Allow plain HTTP (not HTTPS) collectors
 allowInvalidCollectorCertificates: false,  // Skip TLS cert validation (dev only)
 deadLetterPath: undefined,                 // Custom path for dead-letter store
 maxDrainOnStartup: 200,                    // Max dead-letter payloads to re-send on init
 sourceMapSyncThresholdBytes: 2097152,      // 2 MB; maps larger than this resolve asynchronously. Set to 0 to restore fully-async behavior.
 ```
+
+`logLevel` controls which internal SDK messages reach `console.warn` / `console.error` / `console.info` / `console.debug`. It does NOT affect the `onInternalWarning` callback -- that is a separate, structured event channel. Default `'warn'` lets warnings and errors through and suppresses info/debug. Set `'silent'` to suppress every `[ErrorCore]` line that goes through the gate. The legacy `silent: true` flag is unchanged and still suppresses only the one-line startup diagnostic; `logLevel` is the broader gate for everything else.
 
 You can also subscribe to internal SDK warnings (transport failures, rate-limit drops, dead-letter overflow, encryption misconfiguration, and aggregate drop summaries):
 

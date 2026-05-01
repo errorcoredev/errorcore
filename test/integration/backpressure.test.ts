@@ -197,7 +197,10 @@ describe('backpressure contract', () => {
 
       const transportWarning = warnings.find((w) => w.code === 'transport_failed');
       expect(transportWarning).toBeDefined();
-      expect(transportWarning?.cause).toBeInstanceOf(Error);
+      expect(transportWarning?.cause).toMatchObject({
+        name: expect.any(String),
+        message: expect.any(String),
+      });
       // Dead-letter file should contain the payload (DLQ accepted).
       expect(fs.existsSync(dlqPath)).toBe(true);
       const dlqContents = fs.readFileSync(dlqPath, 'utf8');
@@ -236,8 +239,10 @@ describe('backpressure contract', () => {
 
       const timeout = warnings.find((w) => w.code === 'transport_timeout');
       expect(timeout).toBeDefined();
-      expect(timeout?.cause).toBeInstanceOf(Error);
-      expect((timeout?.cause as Error).message).toContain('HTTP transport timeout');
+      expect(timeout?.cause).toMatchObject({
+        name: expect.any(String),
+        message: expect.stringContaining('HTTP transport timeout'),
+      });
     } finally {
       await closeTcp(tarpit, sockets);
       cleanupTempDir(dir);

@@ -1,4 +1,6 @@
 
+import { safeConsole } from '../debug-log';
+
 interface DiagnosticsChannelModule {
   subscribe: (channelName: string, handler: (message: unknown, name: string) => void) => void;
   unsubscribe: (channelName: string, handler: (message: unknown, name: string) => void) => void;
@@ -126,7 +128,7 @@ export class ChannelSubscriber {
           entry.handler(message);
         } catch (error) {
           const messageText = error instanceof Error ? error.message : String(error);
-          console.warn(
+          safeConsole.warn(
             `[ErrorCore] diagnostics_channel handler failed for ${name}: ${messageText}`
           );
         }
@@ -139,7 +141,7 @@ export class ChannelSubscriber {
           handler: wrappedHandler
         });
       } catch {
-        console.debug(
+        safeConsole.debug(
           `[ErrorCore] diagnostics_channel not available: ${entry.channelName}`
         );
       }

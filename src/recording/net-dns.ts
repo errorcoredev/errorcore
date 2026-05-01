@@ -8,6 +8,7 @@ import { installOwnedWrapper } from './patches/patch-manager';
 import { isInternalCallActive, runAsInternal } from './internal';
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
+import { safeConsole } from '../debug-log';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
@@ -120,7 +121,7 @@ export class NetDnsRecorder {
       pushIOEvent(context, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record TCP connect: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record TCP connect: ${messageText}`);
     }
   }
 
@@ -168,7 +169,7 @@ export class NetDnsRecorder {
       pushIOEvent(context, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record DNS lookup: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record DNS lookup: ${messageText}`);
     }
   }
 

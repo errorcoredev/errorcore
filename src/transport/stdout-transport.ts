@@ -1,6 +1,8 @@
 
 import fs = require('node:fs');
 
+import { safeConsole } from '../debug-log';
+
 let warnedAboutStdoutTransport = false;
 
 function warnAboutStdoutTransport(): void {
@@ -9,7 +11,7 @@ function warnAboutStdoutTransport(): void {
   }
 
   warnedAboutStdoutTransport = true;
-  console.warn(
+  safeConsole.warn(
     '[ErrorCore] Stdout transport writes captured payloads to application logs; use it only for local development or controlled pipelines.'
   );
 }

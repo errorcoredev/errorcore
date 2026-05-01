@@ -8,12 +8,13 @@ import type {
   SDKConfig,
   SerializationLimits
 } from './types';
+import { safeConsole } from './debug-log';
 
 let legacyInsecureTransportWarned = false;
 function warnLegacyInsecureTransportOnce(): void {
   if (legacyInsecureTransportWarned) return;
   legacyInsecureTransportWarned = true;
-  console.warn(
+  safeConsole.warn(
     '[ErrorCore] allowInsecureTransport is deprecated and ignored. ' +
     'Remove it from your config. (Deprecated in 0.2.0, will be removed in 1.0.0.) ' +
     'Use allowPlainHttpTransport to enable plain-http collector URLs.'
@@ -454,7 +455,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     (serverless ? false : true);
 
   if (userConfig.useWorkerAssembly === true && isWebpackBundled()) {
-    console.warn(
+    safeConsole.warn(
       '[ErrorCore] useWorkerAssembly is enabled but a bundled environment was detected. ' +
       'Worker threads may not function correctly in bundlers — the SDK will fall back to main-thread processing at runtime.'
     );
@@ -478,7 +479,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
       const dir = path.dirname(deadLetterPath);
       fs.accessSync(dir, fs.constants.W_OK);
     } catch {
-      console.warn(
+      safeConsole.warn(
         `[ErrorCore] Dead-letter directory is not writable: ${path.dirname(deadLetterPath)}. ` +
         'Dead-letter persistence will fail unless the directory is created before the first transport failure.'
       );
@@ -486,7 +487,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   }
 
   if (serverless && transport.type === 'file') {
-    console.warn(
+    safeConsole.warn(
       '[ErrorCore] File transport in a serverless environment writes to ephemeral disk. Consider using HTTP transport instead.'
     );
   }

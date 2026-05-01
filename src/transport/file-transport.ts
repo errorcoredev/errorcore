@@ -2,6 +2,8 @@
 import fs = require('node:fs');
 import path = require('node:path');
 
+import { safeConsole } from '../debug-log';
+
 interface FileTransportConfig {
   path: string;
   maxSizeBytes?: number;
@@ -49,7 +51,7 @@ export class FileTransport {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] File transport dropped payload: ${message}`);
+      safeConsole.warn(`[ErrorCore] File transport dropped payload: ${message}`);
       throw error;
     }
   }
@@ -101,7 +103,7 @@ export class FileTransport {
       fs.writeFileSync(this.path, `${payload}\n`, { flag: 'a' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] File transport sync write failed: ${message}`);
+      safeConsole.warn(`[ErrorCore] File transport sync write failed: ${message}`);
     }
   }
 

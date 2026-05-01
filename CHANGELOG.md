@@ -38,6 +38,28 @@ ship in any minor release and are called out under the BREAKING heading.
   `src/capture/package-assembly-worker.ts` (worker-thread entry,
   mocked in tests).
 
+### Added
+
+- `logLevel: 'silent' | 'error' | 'warn' | 'info' | 'debug'` config knob.
+  Default `'warn'`. Filters which internal SDK messages reach `console.*`.
+  Does NOT affect `onInternalWarning` -- that channel remains separate
+  and unfiltered. Set `'silent'` to suppress every `[ErrorCore]` line
+  that goes through the gate. The legacy `silent: true` flag still works
+  and continues to gate only the one-line startup diagnostic; `logLevel`
+  is the broader gate for warnings, info, and debug messages emitted
+  throughout the SDK.
+
+### Fixed
+
+- `onInternalWarning(warning).cause` is now a structured `{ name, message,
+  stackHead?, code? }` object whenever the underlying trigger was an
+  `Error`. `code` is preserved on errno-typed errors so consumers can
+  distinguish `ENOSPC` from `EACCES` at the dead-letter callsite without
+  parsing message text. Previously `cause` was the raw `Error` instance,
+  which serialised poorly through structured-clone and JSON paths.
+  Non-Error triggers (strings, falsy values) still pass through verbatim
+  for back-compat.
+
 ### Docs
 
 - README links to a new "Dashboard (UI)" section in OPERATIONS.md.

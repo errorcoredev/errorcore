@@ -3,6 +3,8 @@ import fs = require('node:fs');
 import path = require('node:path');
 
 import { withLockSync } from './file-lock';
+import { safeConsole } from '../debug-log';
+import { serializeCause } from '../capture/error-capturer';
 import type { InternalWarning, InternalWarningCode } from '../types';
 
 const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
@@ -130,8 +132,14 @@ export class DeadLetterStore {
     warning: InternalWarning & { code: InternalWarningCode | string }
   ): void {
     if (this.onInternalWarning !== undefined) {
+      const enriched: InternalWarning = {
+        code: warning.code as InternalWarningCode,
+        message: warning.message,
+        ...(warning.cause !== undefined ? { cause: serializeCause(warning.cause) } : {}),
+        ...(warning.context !== undefined ? { context: warning.context } : {}),
+      };
       try {
-        this.onInternalWarning(warning as InternalWarning);
+        this.onInternalWarning(enriched);
       } catch { /* never break on telemetry */ }
     }
   }
@@ -141,13 +149,13 @@ export class DeadLetterStore {
   // matrix — they're ops-level hints.
   private reportError(code: string, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[ErrorCore] Dead-letter store ${code}: ${message}`);
+    safeConsole.warn(`[ErrorCore] Dead-letter store ${code}: ${message}`);
   }
 
   public appendPayloadSync(payload: string): boolean {
     const payloadBytes = getUtf8ByteLength(payload);
     if (payloadBytes > this.maxPayloadBytes) {
-      console.warn('[ErrorCore] Dead-letter payload exceeds maximum size; dropping payload');
+      safeConsole.warn('[ErrorCore] Dead-letter payload exceeds maximum size; dropping payload');
       this.reportWarning({
         code: 'dead_letter_full',
         message: `Dead-letter payload exceeds maximum size (${payloadBytes} > ${this.maxPayloadBytes} bytes); dropping payload.`,
@@ -192,7 +200,7 @@ export class DeadLetterStore {
 
       const stats = fs.statSync(this.filePath);
       if (stats.size > 10 * 1024 * 1024) {
-        console.warn(
+        safeConsole.warn(
           `[ErrorCore] Dead-letter store is ${Math.round(stats.size / 1024 / 1024)}MB; ` +
           'skipping automatic drain at startup. Run `errorcore drain` to process manually.'
         );
@@ -208,7 +216,7 @@ export class DeadLetterStore {
         const envelope = this.parseEnvelope(line);
 
         if (envelope === null) {
-          console.warn('[ErrorCore] Rejected malformed dead-letter entry');
+          safeConsole.warn('[ErrorCore] Rejected malformed dead-letter entry');
           continue;
         }
 
@@ -225,7 +233,7 @@ export class DeadLetterStore {
       return { entries, lineCount: lines.length };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Dead-letter store drain failed: ${message}`);
+      safeConsole.warn(`[ErrorCore] Dead-letter store drain failed: ${message}`);
       return { entries: [], lineCount: 0 };
     }
   }
@@ -240,7 +248,7 @@ export class DeadLetterStore {
       this.pendingPayloadCount = 0;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Dead-letter store clear failed: ${message}`);
+      safeConsole.warn(`[ErrorCore] Dead-letter store clear failed: ${message}`);
     }
   }
 
@@ -358,7 +366,7 @@ export class DeadLetterStore {
 
       return withLockSync(this.lockPath, () => {
         if (this.exceedsMaxSize()) {
-          console.warn('[ErrorCore] Dead-letter store at capacity; dropping payload');
+          safeConsole.warn('[ErrorCore] Dead-letter store at capacity; dropping payload');
           this.reportWarning({
             code: 'dead_letter_full',
             message: `Dead-letter store at capacity (>= ${this.maxSizeBytes} bytes); dropping payload.`,
@@ -386,7 +394,7 @@ export class DeadLetterStore {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Dead-letter store append failed: ${message}`);
+      safeConsole.warn(`[ErrorCore] Dead-letter store append failed: ${message}`);
       const code = classifyDlqWriteErrno(error);
       this.reportWarning({
         code,
