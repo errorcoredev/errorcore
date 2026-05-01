@@ -70,6 +70,7 @@ describe('resolveConfig', () => {
       ],
       envBlocklist: [/key|secret|token|password|credential|auth|private/i],
       encryptionKey: undefined,
+      previousEncryptionKeys: [],
       allowUnencrypted: true, // set explicitly by resolveTestConfig
       transport: { type: 'stdout' },
       captureLocalVariables: false,
