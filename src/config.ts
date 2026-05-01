@@ -336,6 +336,19 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     throw new Error('silent must be a boolean');
   }
 
+  const logLevel = userConfig.logLevel ?? 'warn';
+  if (
+    logLevel !== 'silent' &&
+    logLevel !== 'error' &&
+    logLevel !== 'warn' &&
+    logLevel !== 'info' &&
+    logLevel !== 'debug'
+  ) {
+    throw new Error(
+      "logLevel must be one of 'silent' | 'error' | 'warn' | 'info' | 'debug'"
+    );
+  }
+
   const sourceMapSyncThresholdBytes =
     userConfig.sourceMapSyncThresholdBytes ?? 2 * 1024 * 1024;
   if (
@@ -524,6 +537,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     onInternalWarning: userConfig.onInternalWarning,
     drivers,
     silent,
+    logLevel,
     sourceMapSyncThresholdBytes,
     captureMiddlewareStatusCodes,
     traceContext: { vendorKey },

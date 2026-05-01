@@ -436,6 +436,21 @@ export interface InternalWarning {
   context?: Record<string, unknown>;
 }
 
+/** Console verbosity gate for internal SDK messages. Does not affect onInternalWarning. */
+export type LogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
+
+/**
+ * Structured representation of an underlying error that triggered an
+ * InternalWarning. Always emitted as `cause` when an Error caused the
+ * warning. When the trigger is not an Error (e.g. a string, a falsy
+ * value), `cause` falls back to the original raw value for back-compat.
+ */
+export interface SerializedCause {
+  name: string;
+  message: string;
+  stackHead?: string;
+}
+
 export interface SDKConfig {
   bufferSize?: number;
   bufferMaxBytes?: number;
@@ -480,6 +495,7 @@ export interface SDKConfig {
     ioredis?: unknown;
   };
   silent?: boolean;
+  logLevel?: LogLevel;
   sourceMapSyncThresholdBytes?: number;
   captureMiddlewareStatusCodes?: number[] | 'none' | 'all';
   traceContext?: {
@@ -535,6 +551,7 @@ export interface ResolvedConfig {
     ioredis?: unknown;
   };
   silent: boolean;
+  logLevel: LogLevel;
   sourceMapSyncThresholdBytes: number;
   captureMiddlewareStatusCodes: number[] | 'none' | 'all';
   traceContext: {

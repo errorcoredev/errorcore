@@ -1,5 +1,6 @@
 
 import { resolveConfig } from './config';
+import { setLogLevel } from './debug-log';
 import {
   detectBundler,
   isNextJsNodeRuntime,
@@ -600,6 +601,7 @@ export class SDKInstance {
 
 export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
   const config = resolveConfig(userConfig);
+  setLogLevel(config.logLevel);
   const transportAuthorization = getTransportAuthorization(userConfig.transport);
   const eventClock = new EventClock();
   const buffer = new IOEventBuffer({

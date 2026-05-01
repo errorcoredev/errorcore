@@ -699,3 +699,35 @@ describe('Completeness schema — 0.2.0 additions', () => {
     expect(c.sourceMapResolution?.framesResolved).toBe(3);
   });
 });
+
+describe('logLevel resolution', () => {
+  it("defaults to 'warn'", () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+    });
+    expect(resolved.logLevel).toBe('warn');
+  });
+
+  it('accepts every documented value', () => {
+    for (const level of ['silent', 'error', 'warn', 'info', 'debug'] as const) {
+      const resolved = resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        logLevel: level,
+      });
+      expect(resolved.logLevel).toBe(level);
+    }
+  });
+
+  it('rejects unknown values', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        // @ts-expect-error testing runtime validation
+        logLevel: 'verbose',
+      })
+    ).toThrow(/logLevel/);
+  });
+});
