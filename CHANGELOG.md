@@ -48,7 +48,25 @@ ship in any minor release and are called out under the BREAKING heading.
 
 ### Tests
 
-- `npm run coverage` (new script) produces a coverage report via
+- New `test/integration/db-drivers/` suite covering mongodb, ioredis,
+  pg, and mysql2 against real driver code paths. Each driver gets at
+  least three tests covering basic query recording, bind-parameter
+  redaction (`captureDbBindParams: false`), and the corresponding
+  capture mode. The ioredis suite specifically asserts AUTH and HELLO
+  credential redaction in `dbMeta` against an in-process RESP-2 stub
+  server. The mongodb suite uses `mongodb-memory-server` (in-process,
+  no docker). The pg and mysql2 suites are gated behind
+  `EC_INTEGRATION_PG=1` / `EC_INTEGRATION_MYSQL=1` because they need
+  reachable databases — CI does not run them; CONTRIBUTING.md
+  documents the local docker / podman / native one-liners.
+- `tmp-nextjs-smoke/run-smoke.mjs` is now wired into `npm test` when
+  `EC_SMOKE_NEXTJS=1` is set and `tmp-nextjs-smoke/node_modules` is
+  installed. A non-zero exit fails the test suite. The harness itself
+  was already assertion-based; this commit makes regressions visible
+  through the main test runner instead of only `npm run smoke:nextjs`.
+- vitest's global `testTimeout` and `hookTimeout` raised to 90 s to
+  accommodate `mongodb-memory-server` cold-start on the first run.
+- `npm run coverage` (existing script) produces a coverage report via
   `@vitest/coverage-v8`. Reporters: text, html, lcov. The report excludes
   `dist/`, `bin/`, `tmp-*/`, `benchmark-harness/`, `perf/`,
   `config-template/`, `scripts/`, `node_modules/`, the test files
@@ -60,6 +78,15 @@ ship in any minor release and are called out under the BREAKING heading.
   `src/ui/frontend.ts` (dashboard frontend), and
   `src/capture/package-assembly-worker.ts` (worker-thread entry,
   mocked in tests).
+
+### Fixed
+
+- mongodb patch records `dbMeta.rowCount: 1` for an acknowledged
+  `InsertOneResult`. The mongodb v6 driver dropped the `insertedCount`
+  field from single-insert results in favour of `{ acknowledged,
+  insertedId }`, so single-document inserts had been recording
+  `rowCount: null` since the driver upgrade. Surfaced by the new
+  driver-level integration test.
 
 ### Added
 
