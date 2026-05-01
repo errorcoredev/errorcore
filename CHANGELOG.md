@@ -22,16 +22,6 @@ ship in any minor release and are called out under the BREAKING heading.
 - `errorcore drain --rotate` — one-shot CLI flag that re-signs every
   valid dead-letter entry with the primary key. Reports counts of
   re-signed payloads, kept markers, and dropped (unverifiable) entries.
-
-### Security
-
-- Encryption key rotation is no longer a documented limitation. README's
-  "rotation not supported" warning has been removed. The DeadLetterStore's
-  HMAC integrity check now accepts a verifier object instead of a raw
-  string key, opening the path to rotation-aware draining.
-
-### Added
-
 - `errorcore.getHealth()` and `SDKInstance.getHealth()` return a
   `HealthSnapshot` POJO for `/healthz`-style endpoints. The snapshot
   reports monotonic counters (`captured`, `dropped` with a per-bucket
@@ -45,6 +35,38 @@ ship in any minor release and are called out under the BREAKING heading.
   counted as dropped; only errors that will never reach a collector
   (rate-limited, capture-failed, dead-letter write failed) increment
   `dropped`.
+- `logLevel: 'silent' | 'error' | 'warn' | 'info' | 'debug'` config knob.
+  Default `'warn'`. Filters which internal SDK messages reach `console.*`.
+  Does NOT affect `onInternalWarning` -- that channel remains separate
+  and unfiltered. Set `'silent'` to suppress every `[ErrorCore]` line
+  that goes through the gate. The legacy `silent: true` flag still works
+  and continues to gate only the one-line startup diagnostic; `logLevel`
+  is the broader gate for warnings, info, and debug messages emitted
+  throughout the SDK.
+
+### Fixed
+
+- `onInternalWarning(warning).cause` is now a structured `{ name, message,
+  stackHead?, code? }` object whenever the underlying trigger was an
+  `Error`. `code` is preserved on errno-typed errors so consumers can
+  distinguish `ENOSPC` from `EACCES` at the dead-letter callsite without
+  parsing message text. Previously `cause` was the raw `Error` instance,
+  which serialised poorly through structured-clone and JSON paths.
+  Non-Error triggers (strings, falsy values) still pass through verbatim
+  for back-compat.
+- mongodb patch records `dbMeta.rowCount: 1` for an acknowledged
+  `InsertOneResult`. The mongodb v6 driver dropped the `insertedCount`
+  field from single-insert results in favour of `{ acknowledged,
+  insertedId }`, so single-document inserts had been recording
+  `rowCount: null` since the driver upgrade. Surfaced by the new
+  driver-level integration test.
+
+### Security
+
+- Encryption key rotation is no longer a documented limitation. README's
+  "rotation not supported" warning has been removed. The DeadLetterStore's
+  HMAC integrity check now accepts a verifier object instead of a raw
+  string key, opening the path to rotation-aware draining.
 
 ### Tests
 
@@ -66,7 +88,7 @@ ship in any minor release and are called out under the BREAKING heading.
   through the main test runner instead of only `npm run smoke:nextjs`.
 - vitest's global `testTimeout` and `hookTimeout` raised to 90 s to
   accommodate `mongodb-memory-server` cold-start on the first run.
-- `npm run coverage` (existing script) produces a coverage report via
+- `npm run coverage` (new script) produces a coverage report via
   `@vitest/coverage-v8`. Reporters: text, html, lcov. The report excludes
   `dist/`, `bin/`, `tmp-*/`, `benchmark-harness/`, `perf/`,
   `config-template/`, `scripts/`, `node_modules/`, the test files
@@ -78,37 +100,6 @@ ship in any minor release and are called out under the BREAKING heading.
   `src/ui/frontend.ts` (dashboard frontend), and
   `src/capture/package-assembly-worker.ts` (worker-thread entry,
   mocked in tests).
-
-### Fixed
-
-- mongodb patch records `dbMeta.rowCount: 1` for an acknowledged
-  `InsertOneResult`. The mongodb v6 driver dropped the `insertedCount`
-  field from single-insert results in favour of `{ acknowledged,
-  insertedId }`, so single-document inserts had been recording
-  `rowCount: null` since the driver upgrade. Surfaced by the new
-  driver-level integration test.
-
-### Added
-
-- `logLevel: 'silent' | 'error' | 'warn' | 'info' | 'debug'` config knob.
-  Default `'warn'`. Filters which internal SDK messages reach `console.*`.
-  Does NOT affect `onInternalWarning` -- that channel remains separate
-  and unfiltered. Set `'silent'` to suppress every `[ErrorCore]` line
-  that goes through the gate. The legacy `silent: true` flag still works
-  and continues to gate only the one-line startup diagnostic; `logLevel`
-  is the broader gate for warnings, info, and debug messages emitted
-  throughout the SDK.
-
-### Fixed
-
-- `onInternalWarning(warning).cause` is now a structured `{ name, message,
-  stackHead?, code? }` object whenever the underlying trigger was an
-  `Error`. `code` is preserved on errno-typed errors so consumers can
-  distinguish `ENOSPC` from `EACCES` at the dead-letter callsite without
-  parsing message text. Previously `cause` was the raw `Error` instance,
-  which serialised poorly through structured-clone and JSON paths.
-  Non-Error triggers (strings, falsy values) still pass through verbatim
-  for back-compat.
 
 ### Docs
 
