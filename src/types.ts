@@ -451,6 +451,15 @@ export interface SerializedCause {
   stackHead?: string;
 }
 
+/**
+ * Result of verifying an HMAC or decrypting a payload against a key
+ * chain (primary + previous keys). `keyIndex` is 0 for the primary
+ * key and 1+ for previous keys (in declaration order).
+ */
+export type EncryptionVerifyResult =
+  | { ok: true; keyIndex: number }
+  | { ok: false };
+
 export interface SDKConfig {
   bufferSize?: number;
   bufferMaxBytes?: number;
@@ -463,6 +472,7 @@ export interface SDKConfig {
   envAllowlist?: string[];
   envBlocklist?: RegExp[];
   encryptionKey?: string;
+  previousEncryptionKeys?: string[];
   allowUnencrypted?: boolean;
   transport: TransportConfig;
   captureLocalVariables?: boolean;
@@ -519,6 +529,7 @@ export interface ResolvedConfig {
   envAllowlist: string[];
   envBlocklist: RegExp[];
   encryptionKey: string | undefined;
+  previousEncryptionKeys: string[];
   allowUnencrypted: boolean;
   transport: PublicTransportConfig;
   captureLocalVariables: boolean;
