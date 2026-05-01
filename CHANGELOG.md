@@ -23,6 +23,21 @@ ship in any minor release and are called out under the BREAKING heading.
   (rate-limited, capture-failed, dead-letter write failed) increment
   `dropped`.
 
+### Tests
+
+- `npm run coverage` (new script) produces a coverage report via
+  `@vitest/coverage-v8`. Reporters: text, html, lcov. The report excludes
+  `dist/`, `bin/`, `tmp-*/`, `benchmark-harness/`, `perf/`,
+  `config-template/`, `scripts/`, `node_modules/`, the test files
+  themselves, and `.d.ts` files. Baseline at this commit:
+  73.9% statements, 64.52% branches, 80.94% functions, 74.95% lines.
+  No threshold is enforced — the change is observability-only; a hard
+  gate may follow once the number stabilises. Notable 0% gaps surfaced
+  by the baseline: `src/ui/terminal/*` (terminal renderer untested),
+  `src/ui/frontend.ts` (dashboard frontend), and
+  `src/capture/package-assembly-worker.ts` (worker-thread entry,
+  mocked in tests).
+
 ## 0.2.0 (2026-04-21)
 
 Coordinated P0+P1+P2 production readiness pass. Several defaults tightened,

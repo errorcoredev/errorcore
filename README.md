@@ -136,6 +136,15 @@ errorcore.init({
 - [Operations guide](OPERATIONS.md)
 - [Data structures](DB.md)
 
+## Running tests
+
+```bash
+npm test                                    # run the full test suite
+npm run coverage                            # produce a coverage/ report
+```
+
+Coverage baseline (recorded 2026-05-01): 73.9% statements, 64.52% branches, 80.94% functions, 74.95% lines. The threshold is intentionally not enforced; the report is observability-only. Run `npm run coverage` and open `coverage/index.html` for the per-file breakdown.
+
 ## Security
 
 Report vulnerabilities via issues or privately.
