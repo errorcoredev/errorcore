@@ -140,9 +140,22 @@ errorcore.init({
 ## Running tests
 
 ```bash
-npm test                                    # run the full test suite
+npm test                                    # unit + always-on integration
 npm run coverage                            # produce a coverage/ report
+EC_INTEGRATION_PG=1    npm test             # add real-pg suite (needs Postgres)
+EC_INTEGRATION_MYSQL=1 npm test             # add real-mysql suite (needs MySQL)
+EC_SMOKE_NEXTJS=1      npm test             # run the Next.js smoke harness too
 ```
+
+The `mongodb` integration suite uses `mongodb-memory-server` and runs
+unconditionally — the binary is downloaded once and cached at
+`~/.cache/mongodb-binaries`. The `ioredis` suite runs against an
+in-process RESP-2 stub so it always runs too.
+
+The `pg` and `mysql2` suites are gated behind environment variables
+because they need a reachable database. CI does not run them; see
+[CONTRIBUTING.md](CONTRIBUTING.md#opt-in-database-driver-tests) for
+the local docker / podman one-liners.
 
 Coverage baseline (recorded 2026-05-01): 73.9% statements, 64.52% branches, 80.94% functions, 74.95% lines. The threshold is intentionally not enforced; the report is observability-only. Run `npm run coverage` and open `coverage/index.html` for the per-file breakdown.
 
