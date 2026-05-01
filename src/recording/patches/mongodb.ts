@@ -59,6 +59,10 @@ function resolveRowCount(result: unknown): number | null {
         insertedCount?: unknown;
         modifiedCount?: unknown;
         deletedCount?: unknown;
+        // mongodb v6+ InsertOneResult is { acknowledged, insertedId }
+        // with no count field. Treat acknowledged singletons as rowCount=1.
+        acknowledged?: unknown;
+        insertedId?: unknown;
       }
     | undefined;
 
@@ -72,6 +76,10 @@ function resolveRowCount(result: unknown): number | null {
 
   if (typeof candidate?.deletedCount === 'number') {
     return candidate.deletedCount;
+  }
+
+  if (candidate?.acknowledged === true && candidate.insertedId !== undefined) {
+    return 1;
   }
 
   return null;
