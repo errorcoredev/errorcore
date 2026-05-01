@@ -304,6 +304,40 @@ npx errorcore validate
 
 This loads and resolves the config, reports any issues, and prints all resolved values. If the config is invalid, it exits with an error message.
 
+## Dashboard
+
+The CLI ships a small read-only HTTP dashboard (`errorcore ui`) for browsing captured error packages from a `file` transport or a populated dead-letter store.
+
+```bash
+npx errorcore ui                       # binds 127.0.0.1:4400, no auth
+npx errorcore ui --port 5500           # custom port
+EC_DASHBOARD_TOKEN=$(node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))") \
+  npx errorcore ui                     # require Bearer token on /api/*
+```
+
+Configuration sources:
+
+| Source | Effect |
+|---|---|
+| `--port <n>` flag | Listening port. Default `4400`. |
+| `EC_DASHBOARD_TOKEN` env var | When set, `/api/*` requires `Authorization: Bearer <token>`. The token must be 16+ characters and contain only `[A-Za-z0-9_-]`. |
+| Config file `transport.type` or `deadLetterPath` | The dashboard reads NDJSON from `transport.path` (when `transport.type === 'file'`) or `deadLetterPath` otherwise. If neither is set, the command refuses to start. |
+
+Security defaults:
+
+- The server binds to `127.0.0.1` by default. The previous behavior of binding `0.0.0.0` whenever a token was set was removed in 0.2.0 because operators using a token still expected loopback-only by default.
+- Binding to a non-loopback hostname requires an explicit `hostname` argument and a configured token; the server throws on startup otherwise.
+- POST endpoints require both `x-errorcore-action: true` and a same-origin `Origin` header. This is a two-layer CSRF guard -- browsers block cross-origin JS from setting custom headers without a preflight, and the Origin check covers misconfigurations that allow the preflight.
+- Bearer tokens are compared with `crypto.timingSafeEqual`; the comparison runs in constant time regardless of the prefix length.
+
+The dashboard requires `hono` and `@hono/node-server` at runtime; both are listed as optional peer dependencies. If they are not installed, the CLI prints a one-line install hint and exits.
+
+### `--allow-external-config`
+
+By default, all CLI subcommands (`validate`, `status`, `drain`, `ui`) refuse to load a `--config <path>` that resolves outside the current working directory. This blocks accidental or hostile invocations from running arbitrary JavaScript whose path is controlled only by the process cwd at startup.
+
+Pass `--allow-external-config` to load a config from an absolute path or a path with `..` segments. Use this when the config lives in a shared mount point (`/etc/errorcore.config.js`) or in a directory above the CLI's cwd in a monorepo. Do not pass it in CI without auditing the path.
+
 ## Verification
 
 After initializing the SDK, you can confirm it is working by:

@@ -38,6 +38,17 @@ ship in any minor release and are called out under the BREAKING heading.
   `src/capture/package-assembly-worker.ts` (worker-thread entry,
   mocked in tests).
 
+### Docs
+
+- README links to a new "Dashboard (UI)" section in OPERATIONS.md.
+  SETUP.md now has a `## Dashboard` section covering the
+  `errorcore ui` subcommand, port configuration, `EC_DASHBOARD_TOKEN`,
+  and the `--allow-external-config` flag's threat model. OPERATIONS.md
+  has an operator-facing walkthrough for incident triage, deploy
+  validation, and dead-letter recovery, plus the security defaults
+  (loopback-only bind, two-layer CSRF guard, constant-time bearer
+  compare).
+
 ## 0.2.0 (2026-04-21)
 
 Coordinated P0+P1+P2 production readiness pass. Several defaults tightened,

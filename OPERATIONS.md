@@ -276,6 +276,64 @@ When `encryptionKey` is set, error packages are encrypted with AES-256-GCM befor
 - Output format: JSON object with `salt`, `iv`, `ciphertext`, and `authTag` fields.
 - The encrypted payload is what gets sent to the transport and stored in the dead-letter file.
 
+## Dashboard (UI)
+
+`errorcore ui` is the operator-facing companion to the SDK runtime. It serves a small HTTP UI that reads the on-disk NDJSON file produced by the file transport (or the dead-letter store) and renders captured error packages with their I/O timeline, locals, and request context. It does not write to the file and never re-encrypts on the wire -- clients receive the decrypted error package directly when an `encryptionKey` is configured.
+
+When operators reach for the dashboard:
+
+1. **Triage during an incident.** Tail the latest entries to see what is currently failing in production without round-tripping through the collector.
+2. **Validate a deploy.** Hit the dashboard immediately after rollout to confirm errors look like normal volume rather than a regression class.
+3. **Recover a dead-lettered batch.** Use the dashboard to inspect dead-letter contents before deciding whether to run `errorcore drain --force`.
+
+### Starting the dashboard
+
+```bash
+npx errorcore ui                                  # 127.0.0.1:4400, no auth
+EC_DASHBOARD_TOKEN=<32-char-secret> npx errorcore ui --port 5500
+```
+
+The dashboard auto-detects which file to read:
+
+- If `transport.type === 'file'`, it reads `transport.path`.
+- Otherwise it falls back to `deadLetterPath`.
+- If neither is configured, the CLI exits with a helpful message.
+
+### Authentication
+
+The dashboard supports a single Bearer token via the `EC_DASHBOARD_TOKEN` environment variable. The token MUST be at least 16 characters and match `[A-Za-z0-9_-]+`. Generate one with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+```
+
+When the variable is set, every `/api/*` request requires `Authorization: Bearer <token>`. Token comparison is constant-time. The HTML shell at `/` is unauthenticated so operators can copy a token from a password manager into the in-page prompt.
+
+### Network exposure
+
+The default bind address is `127.0.0.1` (loopback only). To bind to another interface (e.g. inside a private VPC), the operator must call `startDashboard()` programmatically and pass `hostname` explicitly -- the CLI does not expose a host flag. Binding to a non-loopback host without `EC_DASHBOARD_TOKEN` set will throw at startup. This is deliberate: the dashboard renders captured PII (request bodies, headers, locals) and is not safe to expose without authentication.
+
+POST endpoints (e.g. `/api/refresh`) require BOTH:
+
+- `Origin` header equal to the request's own origin (same-origin CSRF guard), and
+- `x-errorcore-action: true` (custom-header CSRF guard -- browsers cannot set this on a cross-origin request without a preflight).
+
+### Threat model for `--allow-external-config`
+
+All errorcore CLI subcommands resolve `--config <path>` relative to the current working directory and refuse paths that escape it (`../foo`, `/etc/errorcore.config.js`, dangling symlinks, directories). The flag `--allow-external-config` opts out of that guard.
+
+The risk: errorcore evaluates a config file by `require()`-ing it. Anyone who can control the CLI's cwd at invocation time can trigger arbitrary JS execution if the CLI is willing to load a config outside cwd. This was a real CVE-shaped surface in pre-0.2.0 builds, where `init()` would auto-load `./errorcore.config.js` from cwd at SDK init time; the 0.2.0 release closed that path and tightened the CLI alongside.
+
+Use `--allow-external-config` when:
+
+- The config is genuinely outside cwd (shared mount, monorepo parent, deployment template) and you control the path.
+- You are running the CLI under a known operator identity, not from automation that takes a path from user input.
+
+Do NOT use `--allow-external-config` when:
+
+- The config path is interpolated from a tag, branch name, request, or other untrusted source.
+- The CLI is invoked from a CI step where the cwd is something an attacker can manipulate (e.g. an unprivileged container with a writable working directory).
+
 ## Worker thread assembly
 
 When `useWorkerAssembly: true`, the package assembly step (serialization, PII scrubbing, encryption) runs in a separate worker thread. This keeps the main thread responsive during capture. The worker communicates via `postMessage`. Custom `piiScrubber` functions cannot be used with worker assembly (they are not serializable).

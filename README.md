@@ -133,6 +133,7 @@ errorcore.init({
 - [SDK documentation](https://errorcore.dev/docs)
 - [Configuration reference](SETUP.md)
 - [CLI usage](SETUP.md#validation)
+- [Dashboard (UI)](OPERATIONS.md#dashboard-ui)
 - [Operations guide](OPERATIONS.md)
 - [Data structures](DB.md)
 
