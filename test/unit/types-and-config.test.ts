@@ -732,3 +732,66 @@ describe('logLevel resolution', () => {
     ).toThrow(/logLevel/);
   });
 });
+
+describe('previousEncryptionKeys resolution', () => {
+  const PRIMARY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const PREV1   = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
+  const PREV2   = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0';
+
+  it('defaults to empty array when not provided', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+    });
+    expect(resolved.previousEncryptionKeys).toEqual([]);
+  });
+
+  it('accepts a list of hex keys and preserves order', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      encryptionKey: PRIMARY,
+      previousEncryptionKeys: [PREV1, PREV2],
+    });
+    expect(resolved.previousEncryptionKeys).toEqual([PREV1, PREV2]);
+  });
+
+  it('rejects entries that are not 64-hex', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: ['not-hex'],
+      })
+    ).toThrow(/previousEncryptionKeys/);
+  });
+
+  it('rejects low-entropy entries', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: ['0'.repeat(64)],
+      })
+    ).toThrow(/insufficient character diversity/);
+  });
+
+  it('rejects an entry equal to the primary key', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: [PRIMARY],
+      })
+    ).toThrow(/must not include the primary key/);
+  });
+
+  it('rejects more than 5 entries', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: [PREV1, PREV2, PREV1.replace('f', 'e'), PREV2.replace('0', '1'), PRIMARY.replace('0', '2'), PRIMARY.replace('0', '3')],
+      })
+    ).toThrow(/at most 5/);
+  });
+});

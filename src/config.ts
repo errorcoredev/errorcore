@@ -313,6 +313,31 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     }
   }
 
+  const previousEncryptionKeys = userConfig.previousEncryptionKeys ?? [];
+  if (!Array.isArray(previousEncryptionKeys)) {
+    throw new Error('previousEncryptionKeys must be an array of 64-character hex strings');
+  }
+  if (previousEncryptionKeys.length > 5) {
+    throw new Error('previousEncryptionKeys must contain at most 5 entries');
+  }
+  for (const prev of previousEncryptionKeys) {
+    if (typeof prev !== 'string' || !/^[0-9a-f]{64}$/i.test(prev)) {
+      throw new Error(
+        'previousEncryptionKeys entries must each be a 64-character hex string (32 bytes)'
+      );
+    }
+    if (hexKeyEntropy(prev) < 3.5) {
+      throw new Error(
+        'previousEncryptionKeys entry has insufficient character diversity'
+      );
+    }
+    if (userConfig.encryptionKey !== undefined && prev === userConfig.encryptionKey) {
+      throw new Error(
+        'previousEncryptionKeys must not include the primary key (encryptionKey)'
+      );
+    }
+  }
+
   if (
     userConfig.piiScrubber !== undefined &&
     typeof userConfig.piiScrubber !== 'function'
@@ -504,6 +529,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     envAllowlist: [...(userConfig.envAllowlist ?? DEFAULT_ENV_ALLOWLIST)],
     envBlocklist: [...(userConfig.envBlocklist ?? DEFAULT_ENV_BLOCKLIST)],
     encryptionKey: userConfig.encryptionKey,
+    previousEncryptionKeys: [...previousEncryptionKeys],
     // Default matches the transport default above (isProduction() gate): in
     // development (NODE_ENV !== 'production') plaintext is allowed and the
     // stdout transport is injected automatically; in production encryption
