@@ -276,6 +276,20 @@ When `encryptionKey` is set, error packages are encrypted with AES-256-GCM befor
 - Output format: JSON object with `salt`, `iv`, `ciphertext`, and `authTag` fields.
 - The encrypted payload is what gets sent to the transport and stored in the dead-letter file.
 
+### Key rotation runbook
+
+1. Generate a new key. `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
+2. Update the config to set `encryptionKey` to the NEW key and `previousEncryptionKeys: [OLD_KEY]`.
+3. Roll the workload. New error packages are produced with the new key; existing dead-letter entries continue to verify under either.
+4. Wait for in-flight DLQ entries to drain naturally (or run `npx errorcore drain` to drain via the configured transport).
+5. Once DLQ depth is 0, run `npx errorcore drain --rotate` for safety. The command is a no-op when DLQ is empty.
+6. Optionally run with non-empty DLQ to force re-signing of all remaining entries with the new key. The output reports counts: `<n> payload(s) re-signed, <m> marker(s) kept, <k> unverifiable entry(ies) dropped`.
+7. Update the config to remove the previous key from `previousEncryptionKeys`. Roll the workload one more time to take the dropped previous key out of memory.
+
+`drain --rotate` is also useful as a recovery operation if the on-disk DLQ has accumulated entries under several legacy keys; declare every key the entries might have been written with under `previousEncryptionKeys` and run the command in one shot.
+
+If `drain --rotate` reports `dropped > 0`, those entries do not verify under any key in the chain — likely the originating key is not declared. Either add it to `previousEncryptionKeys` and re-run, or accept the loss (the entries cannot be trusted anyway).
+
 ## Dashboard (UI)
 
 `errorcore ui` is the operator-facing companion to the SDK runtime. It serves a small HTTP UI that reads the on-disk NDJSON file produced by the file transport (or the dead-letter store) and renders captured error packages with their I/O timeline, locals, and request context. It does not write to the file and never re-encrypts on the wire -- clients receive the decrypted error package directly when an `encryptionKey` is configured.

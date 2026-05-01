@@ -109,6 +109,25 @@ If you want to run without encryption (development only):
 allowUnencrypted: true,
 ```
 
+### Key rotation
+
+To rotate the encryption key without losing dead-letter entries written under the previous key, declare the prior key(s) under `previousEncryptionKeys`:
+
+```js
+encryptionKey: process.env.ERRORCORE_ENCRYPTION_KEY_NEW,
+previousEncryptionKeys: [process.env.ERRORCORE_ENCRYPTION_KEY_OLD],
+```
+
+The list accepts up to 5 entries. New error packages are encrypted and signed with the primary key only. Existing dead-letter entries verify against the primary first, then each previous key in declaration order. Entries that verify under a previous key continue to drain successfully through the SDK runtime.
+
+After every workload has rolled to the new key, run:
+
+```bash
+npx errorcore drain --rotate
+```
+
+This force-re-signs every valid entry in one pass and drops entries that no longer verify under any chain key. After the next deploy you can remove the previous key from the config.
+
 ### Capture options
 
 ```js

@@ -150,7 +150,7 @@ Coverage baseline (recorded 2026-05-01): 73.9% statements, 64.52% branches, 80.9
 
 Report vulnerabilities via issues or privately.
 
-Encryption key rotation is not yet supported in 0.2.x. Use a single stable `encryptionKey`. Changing the key invalidates HMAC integrity checks on existing dead-letter entries. Rotation is tracked for a later release.
+Encryption key rotation is supported via `previousEncryptionKeys` in the config. See the [Key rotation runbook](OPERATIONS.md#key-rotation-runbook) for the operational sequence.
 
 ## License
 

@@ -61,13 +61,6 @@ Items explicitly deferred during the 0.2.0 design and implementation pass. Each 
 
 - **1.0.0 release.** Reserved for concurrent release with the ingestion-backend's commercial availability. Pre-1.0 semver allows breaking changes at minor bumps. Do not bump to 1.0.0 until the ingestion API contract is stable for paying users. The `CHANGELOG` "Breaking (pre-1.0 semver window)" heading signals this explicitly to consumers.
 
-## Scheduled for 0.2
-
-- Encryption key rotation. Accept a `previousEncryptionKey` (or list) so
-  existing dead-letter entries encrypted/HMAC'd with the prior key can still
-  be verified and drained after a rotation. Documented in README Security as
-  a 0.1.x limitation.
-
 ## Business and operational
 
 - Package name `errorcore` squat check and trademark clearance before first

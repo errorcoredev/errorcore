@@ -9,6 +9,29 @@ ship in any minor release and are called out under the BREAKING heading.
 
 ### Added
 
+- `previousEncryptionKeys: string[]` config — declare prior `encryptionKey`
+  values so dead-letter entries written under the old key still verify,
+  decrypt, and drain after rotation. Validated with the same length /
+  hex-format / Shannon-entropy / non-equal-to-primary rules as the
+  primary key. Maximum 5 entries.
+- `Encryption.verify(payload, mac)` and `Encryption.tryDecrypt(envelope)`
+  walk the key chain (primary -> previous -> previous, in declaration
+  order) and return the index of the matching key. The single-key
+  `decrypt(envelope)` and `sign(payload)` shapes are unchanged for
+  back-compat.
+- `errorcore drain --rotate` — one-shot CLI flag that re-signs every
+  valid dead-letter entry with the primary key. Reports counts of
+  re-signed payloads, kept markers, and dropped (unverifiable) entries.
+
+### Security
+
+- Encryption key rotation is no longer a documented limitation. README's
+  "rotation not supported" warning has been removed. The DeadLetterStore's
+  HMAC integrity check now accepts a verifier object instead of a raw
+  string key, opening the path to rotation-aware draining.
+
+### Added
+
 - `errorcore.getHealth()` and `SDKInstance.getHealth()` return a
   `HealthSnapshot` POJO for `/healthz`-style endpoints. The snapshot
   reports monotonic counters (`captured`, `dropped` with a per-bucket
