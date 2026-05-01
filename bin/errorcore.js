@@ -107,6 +107,8 @@ function parseArgs(argv) {
       flags.full = true;
     } else if (arg === '--quickstart') {
       flags.quickstart = true;
+    } else if (arg === '--rotate') {
+      flags.rotate = true;
     } else if (arg === '--allow-external-config') {
       flags.allowExternalConfig = true;
     } else if (arg === '--port' && i + 1 < argv.length) {
@@ -152,7 +154,7 @@ ${bold('Commands:')}
   ${cyan('validate')} [--config <path>]    Validate config and print resolved values
   ${cyan('status')}   [--config <path>]    Show dead-letter store status
   ${cyan('drain')}    [--config <path>]    Re-send dead-letter payloads
-             [--dry-run] [--force]
+             [--dry-run] [--force] [--rotate]
   ${cyan('ui')}       [--config <path>]    Open the error dashboard
              [--port <number>]
   ${cyan('help')}                          Show this help message
@@ -169,6 +171,7 @@ ${bold('Examples:')}
   errorcore drain --dry-run
   errorcore drain --force
   errorcore drain
+  errorcore drain --rotate           # one-shot: re-sign all entries with the new key
   errorcore init --quickstart
   errorcore init --full
 `.trimStart();
@@ -383,7 +386,11 @@ async function cmdDrain(flags) {
   }
 
   if (!fs.existsSync(deadLetterPath)) {
-    process.stdout.write(green('Dead-letter store is empty — nothing to drain.') + '\n');
+    if (flags.rotate) {
+      process.stdout.write(green('Dead-letter store is empty — nothing to re-sign.') + '\n');
+    } else {
+      process.stdout.write(green('Dead-letter store is empty — nothing to drain.') + '\n');
+    }
     return;
   }
 
@@ -395,10 +402,43 @@ async function cmdDrain(flags) {
     die('Cannot drain: no encryptionKey or transport authorization configured (needed for HMAC verification).');
   }
 
-  const { DeadLetterStore } = requireDist(path.join('transport', 'dead-letter-store.js'));
+  const { DeadLetterStore, createHmacVerifier } = requireDist(path.join('transport', 'dead-letter-store.js'));
   const { withLockSync } = requireDist(path.join('transport', 'file-lock.js'));
   const lockPath = deadLetterPath + '.lock';
-  const store = new DeadLetterStore(deadLetterPath, { integrityKey });
+
+  // Build the verifier with multi-key support if previousEncryptionKeys
+  // is configured. Required for --rotate to verify entries written
+  // under prior keys.
+  let verifier;
+  if (resolved.encryptionKey !== undefined) {
+    const { Encryption } = requireDist(path.join('security', 'encryption.js'));
+    const enc = new Encryption(resolved.encryptionKey, {
+      previousEncryptionKeys: resolved.previousEncryptionKeys || []
+    });
+    verifier = {
+      sign: (p) => enc.sign(p),
+      verifyKeyIndex: (p, m) => {
+        const r = enc.verify(p, m);
+        return r.ok ? r.keyIndex : null;
+      }
+    };
+  } else {
+    verifier = createHmacVerifier(integrityKey);
+  }
+
+  const store = new DeadLetterStore(deadLetterPath, { verifier });
+
+  if (flags.rotate) {
+    const result = store.reSignAll();
+    process.stdout.write(
+      green('Rotated dead-letter signatures: ') +
+      `${result.resigned} payload(s) re-signed, ` +
+      `${result.markersKept} marker(s) kept, ` +
+      `${result.dropped} unverifiable entry(ies) dropped.\n`
+    );
+    return;
+  }
+
   const { entries, lineCount: snapshotLineCount } = store.drain();
 
   const payloads = entries.map((e) => e.payload);
