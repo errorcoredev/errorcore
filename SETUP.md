@@ -119,6 +119,37 @@ captureBodyDigest: false,         // Include SHA-256 digest of bodies
 captureDbBindParams: false,       // Include database query bind parameters
 ```
 
+### Middleware capture
+
+Control whether non-2xx responses returned by Next.js middleware (Clerk-style auth rejections, rewrites, custom guards) are captured. Applies only when middleware is wrapped with `withNextMiddleware`.
+
+```js
+captureMiddlewareStatusCodes: 'none',
+```
+
+| Value | Behavior |
+|-------|----------|
+| `'none'` (default) | Only thrown errors are captured. Status-driven rejections pass through silently. |
+| `'all'` | Every non-2xx middleware response is captured. |
+| `number[]` | Only listed status codes are captured. Each entry must be an integer 100-599, e.g. `[401, 403, 500]`. |
+
+`undefined` returns (pass-through middleware) are never captured regardless of this setting.
+
+### Database driver references
+
+In bundled environments (Next.js, Vite SSR, esbuild), `require()` may not reach the same module instance the application uses, so the SDK's monkey-patches silently miss queries. Pass the driver references explicitly to install patches against the application's actual module graph:
+
+```js
+drivers: {
+  pg: require('pg'),
+  mongodb: require('mongodb'),
+  mysql2: require('mysql2'),
+  ioredis: require('ioredis'),
+}
+```
+
+Only include the drivers your application uses; each entry is optional. For Next.js App Router specifically, prefer the `serverExternalPackages` approach documented in the README -- it externalizes drivers from the webpack bundle and makes the explicit reference unnecessary. The startup diagnostic line reports `warn(bundled-unpatched)` for any driver that was found but could not be patched.
+
 ### Body capture content types
 
 Controls which content types are eligible for body capture:
@@ -166,6 +197,31 @@ piiScrubber: (key, value) => {
 replaceDefaultScrubber: false,  // true = use only your scrubber; false = run both
 ```
 
+### State tracking
+
+Records reads (always) and writes (`set`/`delete` on tracked Maps and plain objects) on values registered via `trackState()`. Reads and writes appear as separate streams (`stateReads`, `stateWrites`) on the shipped error package.
+
+```js
+stateTracking: {
+  captureWrites: true,         // false to record reads only
+  maxWritesPerContext: 50,     // overflow drops are silent; surfaced in completeness.stateWritesDropped
+}
+```
+
+`maxWritesPerContext` must be a non-negative integer. Set `captureWrites: false` to disable write recording without removing the proxy wrapper -- reads continue to be captured.
+
+### Trace context
+
+Configures the W3C `tracestate` vendor key used for cross-service Lamport-clock propagation.
+
+```js
+traceContext: {
+  vendorKey: 'ec',  // default; 1-256 chars matching [a-z0-9_\-*\/]
+}
+```
+
+Pick a short identifier -- outbound `tracestate` is capped at 512 characters total, and longer keys leave less room for the actual state value. Invalid keys are rejected at `init()`.
+
 ### Limits and tuning
 
 ```js
@@ -193,11 +249,24 @@ uncaughtExceptionExitDelayMs: 1500,
 
 ```js
 useWorkerAssembly: false,                  // Assemble packages in a worker thread
+silent: false,                             // Suppress the startup diagnostic line
 allowPlainHttpTransport: false,            // Allow plain HTTP (not HTTPS) collectors
 allowInvalidCollectorCertificates: false,  // Skip TLS cert validation (dev only)
 deadLetterPath: undefined,                 // Custom path for dead-letter store
-maxDrainOnStartup: 200,                   // Max dead-letter payloads to re-send on init
+maxDrainOnStartup: 200,                    // Max dead-letter payloads to re-send on init
+sourceMapSyncThresholdBytes: 2097152,      // 2 MB; maps larger than this resolve asynchronously. Set to 0 to restore fully-async behavior.
 ```
+
+You can also subscribe to internal SDK warnings (transport failures, rate-limit drops, dead-letter overflow, encryption misconfiguration, and aggregate drop summaries):
+
+```js
+onInternalWarning: (warning) => {
+  // warning: { code, message, cause?, context? }
+  metrics.increment('errorcore.warning', { code: warning.code });
+}
+```
+
+The full callback signature, the warning-code matrix, and the rate-limit / aggregation rules are documented in [docs/BACKPRESSURE.md](docs/BACKPRESSURE.md).
 
 ## Running locally
 
