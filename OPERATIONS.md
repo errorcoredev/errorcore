@@ -173,6 +173,65 @@ The rate limiter tracks captures per window (default: 60 per 60 seconds). When t
 - Writes the serialized JSON payload to `process.stdout`.
 - Intended for local development and debugging only.
 
+## Monitoring and alerting
+
+The SDK exposes two complementary surfaces for production monitoring: a snapshot endpoint (`getHealth()`) for periodic scraping, and a callback (`onInternalWarning`) for event-driven alerting.
+
+### Health snapshot
+
+`errorcore.getHealth()` (and `SDKInstance.getHealth()`) returns a `HealthSnapshot` POJO suitable for `/healthz`-style endpoints. Counters are cumulative since `init()` and never reset by `getHealth()` -- operators scrape on an interval and compute rates by differencing, matching the Prometheus counter convention. The top-level export returns `null` when the SDK has not been initialized.
+
+```js
+const errorcore = require('errorcore');
+
+app.get('/healthz', (req, res) => {
+  const health = errorcore.getHealth();
+  if (health === null) return res.status(503).send('SDK not initialized');
+  res.json(health);
+});
+```
+
+The snapshot fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `captured` | `number` | Cumulative count of errors successfully assembled into a package (counter). |
+| `dropped` | `number` | Cumulative count of errors that will never reach a collector (counter). Sum of the breakdown below. |
+| `droppedBreakdown.rateLimited` | `number` | Errors dropped because the rate limit was already exceeded. |
+| `droppedBreakdown.captureFailed` | `number` | Errors that could not be captured (Inspector timeout, fallback failure). |
+| `droppedBreakdown.deadLetterWriteFailed` | `number` | Errors that failed transport AND failed the dead-letter write (true loss). |
+| `transportFailures` | `number` | Cumulative count of transport send failures (counter). |
+| `transportQueueDepth` | `number` | Current depth of the in-flight transport queue (gauge). |
+| `deadLetterDepth` | `number` | Current pending payload count in the dead-letter store (gauge). |
+| `ioBufferDepth` | `number` | Current slot count in the I/O event buffer (gauge). |
+| `flushLatencyP50` | `number` | Rolling P50 of per-payload transport latency in milliseconds. |
+| `flushLatencyP99` | `number` | Rolling P99 of per-payload transport latency in milliseconds. |
+| `lastFailureReason` | `string` or `null` | Most recent transport-failure reason. |
+| `lastFailureAt` | `number` or `null` | Unix-millisecond timestamp of the most recent transport failure. |
+
+Dead-lettered payloads are NOT counted as `dropped` -- they are recoverable. Only payloads that will never reach a collector increment `dropped`.
+
+### Internal warnings callback
+
+`onInternalWarning(warning)` is called whenever the SDK encounters a problem worth surfacing -- transport failures, rate-limit drops, dead-letter exhaustion, encryption misconfiguration, and aggregate drop summaries. Wire it in your config:
+
+```js
+module.exports = {
+  // ...
+  onInternalWarning: (warning) => {
+    // warning: { code, message, cause?, context? }
+    metrics.increment('errorcore.warning', { code: warning.code });
+    if (warning.code === 'dead_letter_full' || warning.code === 'disk_full') {
+      pager.alert(warning);
+    }
+  },
+};
+```
+
+The full callback signature, the warning-code matrix (individual codes such as `rate_limited`, `transport_failed`, `dead_letter_full`, `disk_full`, `encryption_key_invalid`; aggregate codes `errorcore_payloads_dropped`, `errorcore_payloads_dead_lettered`), and the rate-limit / aggregation rules are documented in [docs/BACKPRESSURE.md](docs/BACKPRESSURE.md).
+
+Wire `onInternalWarning` to your alerting platform; scrape `getHealth()` for dashboards.
+
 ## Dead-letter store
 
 When transport delivery fails, the payload is written to a dead-letter file.
