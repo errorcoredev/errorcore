@@ -20,6 +20,7 @@ The top-level structure sent to the collector when an error is captured. Schema 
 | `evictionLog` | `EvictionRecordSerialized[]` | Records of I/O events that were evicted from the buffer before capture. |
 | `ambientContext` | `AmbientEventContext` or absent | Metadata about non-request-scoped events used when no request context was available. |
 | `stateReads` | `StateReadSerialized[]` | State reads from tracked containers. |
+| `stateWrites` | `StateWriteSerialized[]` | State writes (`set`/`delete`) on tracked containers. Cap is `stateTracking.maxWritesPerContext`; overflow appears as `completeness.stateWritesDropped`. |
 | `concurrentRequests` | `RequestSummary[]` | Summary of other in-flight requests at capture time. |
 | `processMetadata` | `ProcessMetadata` | Process-level information. |
 | `codeVersion` | `object` | Contains `gitSha` (string, optional) and `packageVersion` (string, optional). |
@@ -46,6 +47,7 @@ In-memory representation of a single I/O event. Stored in the circular buffer.
 | Field | Type | Description |
 |-------|------|-------------|
 | `seq` | `number` | Monotonically increasing sequence number. |
+| `hrtimeNs` | `bigint` | High-resolution event timestamp (`process.hrtime.bigint()`), used for global event ordering across the I/O timeline and state streams. |
 | `phase` | `'active'` or `'done'` | Whether the I/O operation is in progress or completed. |
 | `startTime` | `bigint` | High-resolution start time (`process.hrtime.bigint()`). |
 | `endTime` | `bigint` or `null` | High-resolution end time, null if still active. |
@@ -78,7 +80,7 @@ In-memory representation of a single I/O event. Stored in the circular buffer.
 
 The serialized form of `IOEventSlot` sent in the `ioTimeline` array. Same fields as `IOEventSlot` except:
 
-- `startTime` and `endTime` are strings (nanosecond timestamps as decimal strings) instead of `bigint`.
+- `startTime`, `endTime`, and `hrtimeNs` are strings (nanosecond timestamps as decimal strings) instead of `bigint`.
 - `requestBody` and `responseBody` are deserialized values (`unknown`) instead of `Buffer`.
 
 ## RequestContext
@@ -96,6 +98,8 @@ Tracks the state of a single inbound HTTP request. Stored in AsyncLocalStorage.
 | `bodyTruncated` | `boolean` | Whether the body was truncated. |
 | `ioEvents` | `IOEventSlot[]` | I/O events scoped to this request. |
 | `stateReads` | `StateRead[]` | State reads that occurred during this request. |
+| `stateWrites` | `StateWrite[]` | State writes (`set`, `delete`) that occurred during this request. |
+| `completenessOverflow` | `object` or absent | Internal scratch (`{ stateWritesDropped: number }`) -- not serialized; surfaced into `Completeness` at package time. |
 
 ## StateRead
 
@@ -108,6 +112,21 @@ Records a single read operation on a tracked container.
 | `key` | `unknown` | The key that was read. |
 | `value` | `unknown` | The value that was returned. |
 | `timestamp` | `bigint` | High-resolution time of the read. Serialized as decimal string in `StateReadSerialized`. |
+
+## StateWrite
+
+Records a single write operation (`set` or `delete`) on a tracked container.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `seq` | `number` | Monotonically increasing sequence number; shares the same Lamport clock as `IOEventSlot.seq` and `StateRead.seq`. |
+| `hrtimeNs` | `bigint` | High-resolution event timestamp (`process.hrtime.bigint()`). Serialized as decimal string in `StateWriteSerialized`. |
+| `container` | `string` | Name of the tracked container (as passed to `trackState()`). |
+| `operation` | `'set'` or `'delete'` | The mutation type. |
+| `key` | `unknown` | The key that was written or deleted. |
+| `value` | `unknown` | The new value (`set`) or the value that was removed (`delete`). |
+
+Writes are recorded only when `stateTracking.captureWrites` is enabled (default `true`). The recording cap is `stateTracking.maxWritesPerContext` (default 50). Overflow is silent and surfaced via `completeness.stateWritesDropped`.
 
 ## EvictionRecord
 
@@ -200,6 +219,7 @@ Describes what the ErrorPackage contains and what was dropped or truncated.
 | `encrypted` | `boolean` | Whether the package was encrypted. |
 | `captureFailures` | `string[]` | List of failures encountered during capture. |
 | `rateLimiterDrops` | `object` or absent | If captures were rate-limited: `droppedCount`, `firstDropMs`, `lastDropMs`. |
+| `stateWritesDropped` | `number` or absent | Number of state writes dropped because the per-request cap (`stateTracking.maxWritesPerContext`) was hit. Absent if no overflow occurred. |
 
 ## TimeAnchor
 
