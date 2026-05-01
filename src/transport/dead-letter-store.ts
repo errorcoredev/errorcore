@@ -7,6 +7,48 @@ import { safeConsole } from '../debug-log';
 import { serializeCause } from '../capture/error-capturer';
 import type { InternalWarning, InternalWarningCode } from '../types';
 
+/**
+ * Pluggable signer/verifier. The default implementation
+ * (createHmacVerifier) is a single-key HMAC-SHA256, identical to the
+ * pre-rotation behavior. Multi-key verification (for rotation) is
+ * supplied by a caller that knows about the key chain — see
+ * deriveDeadLetterVerifier in src/sdk.ts.
+ */
+export interface IntegrityVerifier {
+  /** Returns base64 HMAC over the input using the primary key. */
+  sign(payload: string): string;
+  /**
+   * Returns the index of the matching key in the chain (0 = primary,
+   * 1+ = previous keys), or null if no key matched.
+   */
+  verifyKeyIndex(payload: string, mac: string): number | null;
+}
+
+export function createHmacVerifier(integrityKey: string): IntegrityVerifier {
+  return {
+    sign(payload) {
+      return createHmac('sha256', integrityKey).update(payload).digest('base64');
+    },
+    verifyKeyIndex(payload, mac) {
+      try {
+        const expected = createHmac('sha256', integrityKey)
+          .update(payload)
+          .digest();
+        const actual = Buffer.from(mac, 'base64');
+        if (
+          expected.length === actual.length &&
+          timingSafeEqual(expected, actual)
+        ) {
+          return 0;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }
+  };
+}
+
 const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
 
 function classifyDlqWriteErrno(
@@ -49,7 +91,17 @@ interface DeadLetterMarkerEnvelope extends DeadLetterEnvelopeBase {
 type DeadLetterEnvelope = DeadLetterPayloadEnvelope | DeadLetterMarkerEnvelope;
 
 interface DeadLetterStoreOptions {
-  integrityKey: string;
+  /**
+   * Single-key HMAC integrity secret. Either this or `verifier` must
+   * be provided. When both are provided, `verifier` wins.
+   */
+  integrityKey?: string;
+  /**
+   * Pre-built signer/verifier. Required for multi-key rotation; the
+   * caller (sdk.ts or the CLI) wraps an `Encryption` instance with
+   * primary + previous keys.
+   */
+  verifier?: IntegrityVerifier;
   maxSizeBytes?: number;
   maxPayloadBytes?: number;
   requireEncryptedPayload?: boolean;
@@ -96,7 +148,7 @@ export class DeadLetterStore {
 
   private readonly lockPath: string;
 
-  private readonly integrityKey: string;
+  private readonly verifier: IntegrityVerifier;
 
   private readonly maxSizeBytes: number;
 
@@ -121,7 +173,15 @@ export class DeadLetterStore {
   public constructor(filePath: string, options: DeadLetterStoreOptions) {
     this.filePath = filePath;
     this.lockPath = filePath + '.lock';
-    this.integrityKey = options.integrityKey;
+    if (options.verifier !== undefined) {
+      this.verifier = options.verifier;
+    } else if (options.integrityKey !== undefined) {
+      this.verifier = createHmacVerifier(options.integrityKey);
+    } else {
+      throw new Error(
+        'DeadLetterStore requires either integrityKey (string) or verifier (object)'
+      );
+    }
     this.maxSizeBytes = options.maxSizeBytes ?? DEFAULT_MAX_SIZE_BYTES;
     this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.requireEncryptedPayload = options.requireEncryptedPayload ?? false;
@@ -487,9 +547,7 @@ export class DeadLetterStore {
       | Omit<DeadLetterPayloadEnvelope, 'mac'>
       | Omit<DeadLetterMarkerEnvelope, 'mac'>
   ): string {
-    return createHmac('sha256', this.integrityKey)
-      .update(JSON.stringify(envelope))
-      .digest('base64');
+    return this.verifier.sign(JSON.stringify(envelope));
   }
 
   private verifyMac(
@@ -498,14 +556,21 @@ export class DeadLetterStore {
       | Omit<DeadLetterMarkerEnvelope, 'mac'>,
     mac: string
   ): boolean {
-    try {
-      const expected = Buffer.from(this.signEnvelope(envelope), 'base64');
-      const actual = Buffer.from(mac, 'base64');
+    return this.verifier.verifyKeyIndex(JSON.stringify(envelope), mac) !== null;
+  }
 
-      return expected.length === actual.length && timingSafeEqual(expected, actual);
-    } catch {
-      return false;
-    }
+  /**
+   * Like verifyMac but returns the matching key's index in the chain
+   * (or null on failure). Used by reSignAll to detect entries written
+   * under previous keys.
+   */
+  private verifyMacWithIndex(
+    envelope:
+      | Omit<DeadLetterPayloadEnvelope, 'mac'>
+      | Omit<DeadLetterMarkerEnvelope, 'mac'>,
+    mac: string
+  ): number | null {
+    return this.verifier.verifyKeyIndex(JSON.stringify(envelope), mac);
   }
 
   private exceedsMaxSize(): boolean {
@@ -516,4 +581,114 @@ export class DeadLetterStore {
       return false;
     }
   }
+
+  /**
+   * One-shot maintenance pass. Re-signs every valid entry with the
+   * primary key. Used by `errorcore drain --rotate`. Lines that fail
+   * verification under any key in the chain are dropped (they are not
+   * recoverable). Returns counts so the CLI can report.
+   */
+  public reSignAll(): { resigned: number; dropped: number; markersKept: number } {
+    return withLockSync(this.lockPath, () => {
+      let resigned = 0;
+      let dropped = 0;
+      let markersKept = 0;
+
+      if (!fs.existsSync(this.filePath)) {
+        return { resigned, dropped, markersKept };
+      }
+      const content = fs.readFileSync(this.filePath, 'utf8');
+      const lines = content.split('\n').filter((l) => l.length > 0);
+      const out: string[] = [];
+
+      for (const line of lines) {
+        const parsed = parseRawEnvelope(line);
+        if (parsed === null) {
+          dropped += 1;
+          continue;
+        }
+        const unsigned = stripMac(parsed);
+        const idx = this.verifyMacWithIndex(unsigned, parsed.mac);
+        if (idx === null) {
+          dropped += 1;
+          continue;
+        }
+        // Re-sign with the primary key (always index 0 of the chain).
+        const newMac = this.verifier.sign(JSON.stringify(unsigned));
+        const reSigned = JSON.stringify({ ...unsigned, mac: newMac });
+        out.push(reSigned);
+        if (parsed.kind === 'marker') {
+          markersKept += 1;
+        } else {
+          resigned += 1;
+        }
+      }
+
+      const tempPath = this.filePath + '.rotating';
+      fs.writeFileSync(tempPath, out.join('\n') + (out.length > 0 ? '\n' : ''), {
+        encoding: 'utf8',
+        mode: 0o600
+      });
+      fs.renameSync(tempPath, this.filePath);
+      this.pendingPayloadCount = resigned;
+      return { resigned, dropped, markersKept };
+    });
+  }
+}
+
+function parseRawEnvelope(line: string): DeadLetterEnvelope | null {
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    if (!isRecordObject(parsed) || parsed.version !== 1) return null;
+    if (parsed.kind === 'payload') {
+      if (
+        typeof parsed.payload !== 'string' ||
+        typeof parsed.mac !== 'string' ||
+        typeof parsed.storedAt !== 'string'
+      ) return null;
+      return {
+        version: 1,
+        kind: 'payload',
+        storedAt: parsed.storedAt,
+        payload: parsed.payload,
+        mac: parsed.mac
+      };
+    }
+    if (parsed.kind === 'marker') {
+      if (
+        typeof parsed.code !== 'string' ||
+        typeof parsed.mac !== 'string' ||
+        typeof parsed.storedAt !== 'string'
+      ) return null;
+      return {
+        version: 1,
+        kind: 'marker',
+        storedAt: parsed.storedAt,
+        code: parsed.code,
+        mac: parsed.mac
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function stripMac(
+  env: DeadLetterEnvelope
+): Omit<DeadLetterPayloadEnvelope, 'mac'> | Omit<DeadLetterMarkerEnvelope, 'mac'> {
+  if (env.kind === 'payload') {
+    return {
+      version: 1,
+      kind: 'payload',
+      storedAt: env.storedAt,
+      payload: env.payload
+    };
+  }
+  return {
+    version: 1,
+    kind: 'marker',
+    storedAt: env.storedAt,
+    code: env.code
+  };
 }

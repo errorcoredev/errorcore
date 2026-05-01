@@ -193,11 +193,20 @@ describe('SDK composition', () => {
     );
     const encryptionKey =
       'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
-    const payload = JSON.stringify(
-      new Encryption(encryptionKey).encrypt('{"ok":true}')
-    );
+    const enc = new Encryption(encryptionKey);
+    const payload = JSON.stringify(enc.encrypt('{"ok":true}'));
+    // The SDK reads the dead-letter file with an Encryption-derived HMAC
+    // (PBKDF2 of encryptionKey under the hmac-key salt). Sign the fixture
+    // through the same Encryption instance so verification succeeds when
+    // the SDK replays it.
     const store = new DeadLetterStore(deadLetterPath, {
-      integrityKey: encryptionKey,
+      verifier: {
+        sign: (p) => enc.sign(p),
+        verifyKeyIndex: (p, m) => {
+          const r = enc.verify(p, m);
+          return r.ok ? r.keyIndex : null;
+        }
+      },
       requireEncryptedPayload: true
     });
 

@@ -28,7 +28,11 @@ import { PatchManager } from './recording/patches/patch-manager';
 import { ChannelSubscriber } from './recording/channel-subscriber';
 import { PackageBuilder } from './capture/package-builder';
 import { TransportDispatcher } from './transport/transport';
-import { DeadLetterStore } from './transport/dead-letter-store';
+import {
+  DeadLetterStore,
+  createHmacVerifier,
+  type IntegrityVerifier
+} from './transport/dead-letter-store';
 import { ErrorCapturer } from './capture/error-capturer';
 import { PackageAssemblyDispatcher } from './capture/package-assembly-dispatcher';
 import { SourceMapResolver } from './capture/source-map-resolver';
@@ -63,19 +67,27 @@ function parseDerivedKeyFromEnv(): Buffer | undefined {
   return Buffer.from(hex, 'hex');
 }
 
-function deriveDeadLetterIntegrityKey(
+function deriveDeadLetterVerifier(
+  encryption: Encryption | null,
   config: ResolvedConfig,
   transportAuthorization: string | undefined
-): string | null {
-  if (config.encryptionKey !== undefined) {
-    return config.encryptionKey;
+): IntegrityVerifier | null {
+  if (encryption !== null) {
+    // The Encryption instance carries the multi-key chain; wrap it.
+    return {
+      sign: (payload) => encryption.sign(payload),
+      verifyKeyIndex: (payload, mac) => {
+        const r = encryption.verify(payload, mac);
+        return r.ok ? r.keyIndex : null;
+      }
+    };
   }
-
-  if (transportAuthorization !== undefined) {
-    return transportAuthorization;
-  }
-
-  return null;
+  // Fallback path: no encryption configured, but transport auth or
+  // string key may still be available. Single-key HMAC, no rotation
+  // chain (rotation only applies to encryptionKey).
+  const fallback = config.encryptionKey ?? transportAuthorization;
+  if (fallback === undefined) return null;
+  return createHmacVerifier(fallback);
 }
 
 export class SDKInstance {
@@ -621,7 +633,10 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     windowMs: config.rateLimitWindowMs
   });
   const encryption = config.encryptionKey
-    ? new Encryption(config.encryptionKey, { derivedKey: parseDerivedKeyFromEnv() })
+    ? new Encryption(config.encryptionKey, {
+        derivedKey: parseDerivedKeyFromEnv(),
+        previousEncryptionKeys: config.previousEncryptionKeys
+      })
     : null;
   const processMetadata = new ProcessMetadata(config);
   const inspector = new InspectorManager(config, {
@@ -678,16 +693,17 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     encryption,
     transportAuthorization
   });
-  const deadLetterIntegrityKey = deriveDeadLetterIntegrityKey(
+  const deadLetterVerifier = deriveDeadLetterVerifier(
+    encryption,
     config,
     transportAuthorization
   );
   const deadLetterStore =
     config.deadLetterPath !== undefined
-      ? deadLetterIntegrityKey === null
+      ? deadLetterVerifier === null
         ? null
         : new DeadLetterStore(config.deadLetterPath, {
-            integrityKey: deadLetterIntegrityKey,
+            verifier: deadLetterVerifier,
             maxPayloadBytes: config.serialization.maxTotalPackageSize + 16384,
             requireEncryptedPayload: config.encryptionKey !== undefined,
             onInternalWarning: config.onInternalWarning === undefined
@@ -702,7 +718,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
           })
       : null;
 
-  if (config.deadLetterPath !== undefined && deadLetterIntegrityKey === null) {
+  if (config.deadLetterPath !== undefined && deadLetterVerifier === null) {
     // Design note: Disable automatic dead-letter replay when no stable secret
     // is configured because unsigned disk content cannot be trusted safely.
     safeConsole.warn(
