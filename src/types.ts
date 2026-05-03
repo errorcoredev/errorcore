@@ -59,7 +59,7 @@ export interface RequestContext {
   method: string;
   url: string;
   headers: Record<string, string>;
-  body: Buffer | null;
+  body: string | Buffer | null;
   bodyTruncated: boolean;
   ioEvents: IOEventSlot[];
   stateReads: StateRead[];
@@ -203,7 +203,7 @@ export interface ErrorPackageRequestContextData {
   method: string;
   url: string;
   headers: Record<string, string>;
-  body: Buffer | null;
+  body: string | Buffer | null;
   bodyTruncated: boolean;
 }
 

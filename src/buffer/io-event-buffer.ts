@@ -24,8 +24,8 @@ interface IOEventBufferStats {
 }
 
 function estimateBytes(event: {
-  requestBody: Buffer | null;
-  responseBody: Buffer | null;
+  requestBody: string | Buffer | null;
+  responseBody: string | Buffer | null;
 }): number {
   return (
     METADATA_OVERHEAD +
