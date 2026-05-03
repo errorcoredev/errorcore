@@ -686,9 +686,38 @@ export class InspectorManager {
           return;
         }
 
-        let appFrames = params.callFrames
-          .filter((frame) => this._isAppFrame(frame.url))
-          .slice(0, this.maxLocalsFrames);
+        // Frame selection: we want the engineer to see BOTH the throw site
+        // (often a library) and at least one app frame (where their own
+        // variables live). The previous behavior took only app frames and
+        // dropped library context entirely; if no app frames existed in
+        // the deepest N frames the capture had no user-relevant context.
+        const appFrameIndices: number[] = [];
+        for (let i = 0; i < params.callFrames.length; i += 1) {
+          if (this._isAppFrame(params.callFrames[i].url)) {
+            appFrameIndices.push(i);
+          }
+        }
+
+        let appFrames: typeof params.callFrames;
+        if (appFrameIndices.length > 0) {
+          const indicesToKeep = new Set<number>();
+          // Always include the throw-site frame (deepest), even if it's a
+          // library frame, so engineers see "the error originated in pg
+          // at this line" alongside their own context.
+          indicesToKeep.add(0);
+          // Always include the deepest app frame so the engineer's variables
+          // are present, even if it's beyond maxLocalsFrames.
+          indicesToKeep.add(appFrameIndices[0]);
+          // Then fill remaining budget with additional app frames.
+          for (let i = 1; i < appFrameIndices.length && indicesToKeep.size < this.maxLocalsFrames; i += 1) {
+            indicesToKeep.add(appFrameIndices[i]);
+          }
+          appFrames = Array.from(indicesToKeep)
+            .sort((a, b) => a - b)
+            .map((idx) => params.callFrames[idx]);
+        } else {
+          appFrames = [];
+        }
 
         if (appFrames.length === 0) {
           // Fallback 1: webpack-internal:// hints present but the top frames
