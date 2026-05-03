@@ -136,6 +136,52 @@ const STRING_LIMIT = 2048;
 const DEBUGGER_IDLE_TIMEOUT_MS = 30000;
 const SDK_ROOT = path.resolve(__dirname, '..').replace(/\\/g, '/');
 
+const FUNCTION_NAME_MAX = 80;
+
+// Per-class allowlists of properties worth surfacing in a captured local.
+// Keep these tight so we don't accidentally surface PII (e.g. req.body
+// goes through the existing body-capture path, not here). Empty/undefined
+// = surface every preview property.
+const INTERESTING_KEYS_BY_CLASS: Record<string, string[]> = {
+  IncomingMessage: ['method', 'url', 'statusCode', 'statusMessage', 'httpVersion', 'complete'],
+  ServerResponse: ['statusCode', 'statusMessage', 'headersSent', 'finished', 'writableEnded'],
+  ClientRequest: ['method', 'path', 'host', 'protocol', 'finished', 'writableEnded'],
+  Layer: ['name', 'method', 'regexp', 'path'],
+  Route: ['path', 'methods'],
+  Socket: ['readyState', 'remoteAddress', 'remotePort', 'localPort']
+};
+
+function extractFunctionName(description: string): string {
+  if (description === '') {
+    return '<anonymous>';
+  }
+
+  // V8 RemoteObject.description for a function may be:
+  //   "function fooBar(a, b) { … }"        (named function)
+  //   "(req, res) => { … }"                (anonymous arrow)
+  //   "async function* gen() { … }"        (async generator)
+  //   "[Function: foo]"                    (already pre-stringified)
+  // We want just the identifier — never the body.
+  const namedMatch = /^(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/.exec(description);
+  if (namedMatch !== null) {
+    return namedMatch[1].slice(0, FUNCTION_NAME_MAX);
+  }
+
+  const bracketMatch = /^\[Function:\s*([^\]]+)\]/.exec(description);
+  if (bracketMatch !== null) {
+    return bracketMatch[1].trim().slice(0, FUNCTION_NAME_MAX);
+  }
+
+  // Anonymous arrow / unnamed expression — describe by signature shape only.
+  const arrowMatch = /^\s*(\([^)]*\))\s*=>/.exec(description);
+  if (arrowMatch !== null) {
+    return `<anonymous>${arrowMatch[1]}`.slice(0, FUNCTION_NAME_MAX);
+  }
+
+  // Fallback: the head of the description, stripped of newlines.
+  return description.replace(/\s+/g, ' ').slice(0, FUNCTION_NAME_MAX);
+}
+
 interface InspectorModule {
   url(): string | undefined;
   Session: new () => InspectorSession;
@@ -156,6 +202,22 @@ interface InspectorSession {
   on(event: 'Debugger.paused', handler: (event: { params: PausedEventParams }) => void): void;
 }
 
+interface PropertyPreview {
+  name: string;
+  type: string;
+  subtype?: string;
+  value?: string;
+  valuePreview?: ObjectPreview;
+}
+
+interface ObjectPreview {
+  type: string;
+  subtype?: string;
+  description?: string;
+  overflow?: boolean;
+  properties?: PropertyPreview[];
+}
+
 interface RemoteObject {
   type: string;
   subtype?: string;
@@ -163,6 +225,7 @@ interface RemoteObject {
   value?: unknown;
   description?: string;
   objectId?: string;
+  preview?: ObjectPreview;
 }
 
 interface PropertyDescriptor {
@@ -731,7 +794,11 @@ export class InspectorManager {
             'Runtime.getProperties',
             {
               objectId: localScope.object.objectId,
-              ownProperties: true
+              ownProperties: true,
+              // Request previews so _serializeRemoteObject can surface a
+              // useful subset for known classes (IncomingMessage etc.)
+              // instead of just the className placeholder.
+              generatePreview: true
             },
             (error, result) => {
               pendingCollections -= 1;
@@ -835,7 +902,16 @@ export class InspectorManager {
     }
 
     if (object.type === 'function') {
-      return `[Function: ${object.description ?? 'anonymous'}]`;
+      // V8's RemoteObject.description for functions can carry the entire
+      // source body on some Node versions / inspector configurations,
+      // which inflates the capture by KB per frame for zero debugging
+      // value (the source is in the codebase). Extract only the function
+      // name and arity-relevant metadata.
+      return {
+        _type: 'Function',
+        name: extractFunctionName(object.description ?? ''),
+        className: object.className ?? null
+      };
     }
 
     if (object.subtype === 'array') {
@@ -852,6 +928,40 @@ export class InspectorManager {
 
     if (object.subtype === 'set') {
       return `[Set(${object.description ?? ''})]`;
+    }
+
+    // For object locals with a className we recognize, project a useful
+    // subset from the V8 preview rather than collapsing to "[ClassName]".
+    // The preview is fetched at getProperties time via generatePreview.
+    if (object.preview !== undefined && object.preview.properties !== undefined) {
+      const className = object.className ?? 'Object';
+      const projected: Record<string, unknown> = { _type: className };
+      const interesting = INTERESTING_KEYS_BY_CLASS[className];
+
+      for (const prop of object.preview.properties) {
+        if (interesting !== undefined && !interesting.includes(prop.name)) {
+          continue;
+        }
+        if (SENSITIVE_VAR_RE.test(prop.name)) {
+          projected[prop.name] = '[REDACTED]';
+          continue;
+        }
+        if (prop.type === 'string' || prop.type === 'number' || prop.type === 'boolean') {
+          projected[prop.name] = prop.value;
+        } else if (prop.value !== undefined) {
+          projected[prop.name] = `[${prop.type}${prop.subtype ? `:${prop.subtype}` : ''}]`;
+        }
+      }
+
+      if (object.preview.overflow === true) {
+        projected._overflow = true;
+      }
+
+      // Only return the projection if we actually projected something
+      // useful; otherwise fall through to the className placeholder.
+      if (Object.keys(projected).length > 1) {
+        return projected;
+      }
     }
 
     return `[${object.className ?? 'Object'}]`;

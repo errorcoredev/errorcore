@@ -696,8 +696,14 @@ describe('InspectorManager', () => {
         manager._serializeRemoteObject({ type: 'symbol', description: 'Symbol(x)' })
       ).toEqual({ _type: 'Symbol', description: 'Symbol(x)' });
       expect(
-        manager._serializeRemoteObject({ type: 'function', description: 'fn()' })
-      ).toBe('[Function: fn()]');
+        manager._serializeRemoteObject({ type: 'function', description: 'function fn() {}' })
+      ).toEqual({ _type: 'Function', name: 'fn', className: null });
+      expect(
+        manager._serializeRemoteObject({
+          type: 'function',
+          description: '(req, res) => { /* 35 lines of source */ }'
+        })
+      ).toEqual({ _type: 'Function', name: '<anonymous>(req, res)', className: null });
       expect(
         manager._serializeRemoteObject({ type: 'object', subtype: 'null' })
       ).toBeNull();
@@ -743,6 +749,30 @@ describe('InspectorManager', () => {
           description: 'Object'
         })
       ).toBe('[Object]');
+      // IncomingMessage with preview projects useful subset rather than
+      // collapsing to "[IncomingMessage]".
+      expect(
+        manager._serializeRemoteObject({
+          type: 'object',
+          className: 'IncomingMessage',
+          description: 'IncomingMessage',
+          preview: {
+            type: 'object',
+            properties: [
+              { name: 'method', type: 'string', value: 'POST' },
+              { name: 'url', type: 'string', value: '/checkout' },
+              { name: 'statusCode', type: 'object', subtype: 'null' },
+              { name: 'complete', type: 'boolean', value: 'false' },
+              { name: '_readableState', type: 'object', subtype: 'object' }
+            ]
+          }
+        })
+      ).toEqual({
+        _type: 'IncomingMessage',
+        method: 'POST',
+        url: '/checkout',
+        complete: 'false'
+      });
       manager.shutdown();
     });
   });
