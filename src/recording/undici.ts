@@ -19,7 +19,7 @@ interface BodyCaptureLike {
     seq: number,
     body: unknown,
     onBytesChanged: (oldBytes: number, newBytes: number) => void
-  ): void;
+  ): AsyncGenerator<unknown> | undefined;
 }
 
 interface ALSManagerLike {
@@ -146,7 +146,11 @@ export class UndiciRecorder {
       this.slots.set(message.request as object, slot);
 
       if (this.bodyCapture !== undefined) {
-        this.bodyCapture.captureClientRequestBody(
+        // For AsyncIterable bodies (undici wraps fetch JSON bodies as
+        // AsyncGenerators), captureClientRequestBody returns a tee'd
+        // generator. Swap it onto the request so undici sends the tee'd
+        // chunks instead of consuming the source twice.
+        const replacement = this.bodyCapture.captureClientRequestBody(
           slot,
           seq,
           (request as { body?: unknown }).body,
@@ -154,6 +158,9 @@ export class UndiciRecorder {
             this.buffer.updatePayloadBytes(oldBytes, newBytes);
           }
         );
+        if (replacement !== undefined) {
+          (request as { body?: unknown }).body = replacement;
+        }
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);

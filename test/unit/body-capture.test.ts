@@ -653,4 +653,207 @@ describe('BodyCapture', () => {
     expect(context.body?.toString()).toBe('latest');
     expect(context.bodyTruncated).toBe(true);
   });
+
+  describe('captureClientRequestBody — AsyncGenerator coercion', () => {
+    async function* asyncGenFromStrings(parts: string[]): AsyncGenerator<Buffer> {
+      for (const p of parts) {
+        yield Buffer.from(p);
+      }
+    }
+
+    async function drainGenerator(
+      gen: AsyncGenerator<unknown> | undefined
+    ): Promise<Buffer> {
+      const chunks: Buffer[] = [];
+      if (gen === undefined) return Buffer.alloc(0);
+      for await (const chunk of gen) {
+        if (Buffer.isBuffer(chunk)) {
+          chunks.push(chunk);
+        } else if (chunk instanceof Uint8Array) {
+          chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        } else if (typeof chunk === 'string') {
+          chunks.push(Buffer.from(chunk));
+        }
+      }
+      return Buffer.concat(chunks);
+    }
+
+    it('returns a tee\'d generator for AsyncIterable bodies and decodes JSON', async () => {
+      const capture = createBodyCapture({
+        maxPayloadSize: 1024,
+        captureRequestBodies: true
+      });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+      capture.materializeSlotBodies(slot);
+
+      const source = asyncGenFromStrings(['{"a":1', ',"b":2}']);
+      const replacement = capture.captureClientRequestBody(slot, slot.seq, source, () => undefined);
+
+      expect(replacement).toBeDefined();
+      const sentBytes = await drainGenerator(replacement);
+
+      // The application's view of the body bytes is unchanged.
+      expect(sentBytes.toString('utf8')).toBe('{"a":1,"b":2}');
+
+      // Capture finalizes after the consumer drains the generator.
+      capture.materializeSlotBodies(slot);
+      expect(typeof slot.requestBody).toBe('string');
+      expect(slot.requestBody).toBe('{"a":1,"b":2}');
+      expect(slot.requestBodyTruncated).toBe(false);
+    });
+
+    it('does not return a generator for sync Buffer bodies', () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        Buffer.from('{"x":1}'),
+        () => undefined
+      );
+
+      expect(replacement).toBeUndefined();
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBody).toBe('{"x":1}');
+    });
+
+    it('does not return a generator for string bodies', () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        '{"y":2}',
+        () => undefined
+      );
+
+      expect(replacement).toBeUndefined();
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBody).toBe('{"y":2}');
+    });
+
+    it('captures Uint8Array chunks via the AsyncGenerator branch', async () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      async function* uintGen(): AsyncGenerator<Uint8Array> {
+        yield new TextEncoder().encode('{"u":');
+        yield new TextEncoder().encode('"v"}');
+      }
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        uintGen(),
+        () => undefined
+      );
+
+      const sentBytes = await drainGenerator(replacement);
+      expect(sentBytes.toString('utf8')).toBe('{"u":"v"}');
+
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBody).toBe('{"u":"v"}');
+    });
+
+    it('marks truncated when AsyncGenerator output exceeds maxPayloadSize', async () => {
+      const capture = createBodyCapture({
+        maxPayloadSize: 8,
+        captureRequestBodies: true
+      });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const source = asyncGenFromStrings(['1234567890', 'AAAAA']);
+      const replacement = capture.captureClientRequestBody(slot, slot.seq, source, () => undefined);
+
+      const sentBytes = await drainGenerator(replacement);
+      // Application still receives the full body — the tee yields each chunk
+      // unchanged regardless of the capture's truncation.
+      expect(sentBytes.toString('utf8')).toBe('1234567890AAAAA');
+
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBodyTruncated).toBe(true);
+      expect(slot.requestBodyOriginalSize).toBeGreaterThan(8);
+    });
+
+    it('returns a Readable as truncated without tee\'ing (existing pipe-shape branch)', () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      // Synthesize a Readable-like with both `pipe` and `Symbol.asyncIterator`.
+      // The pipe-shape branch must come first and short-circuit the
+      // AsyncIterable branch, otherwise we would try to consume a node stream
+      // through the tee.
+      const fakeReadable = {
+        pipe: () => undefined,
+        async *[Symbol.asyncIterator]() {
+          yield Buffer.from('hi');
+        }
+      };
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        fakeReadable,
+        () => undefined
+      );
+
+      expect(replacement).toBeUndefined();
+      expect(slot.requestBodyTruncated).toBe(true);
+      expect(slot.requestBodyOriginalSize).toBeNull();
+    });
+
+    it('finalizes the capture even when the consumer aborts mid-stream', async () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const source = asyncGenFromStrings(['{"k":"v1', '","k2":"v2"}']);
+      const replacement = capture.captureClientRequestBody(slot, slot.seq, source, () => undefined);
+      expect(replacement).toBeDefined();
+
+      // Consume one chunk then break — for-await calls .return() on the
+      // generator on early exit, which fires our `finally` and finalizes.
+      let firstChunk: Buffer | undefined;
+      for await (const chunk of replacement!) {
+        firstChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+        break;
+      }
+
+      expect(firstChunk?.toString('utf8')).toBe('{"k":"v1');
+
+      capture.materializeSlotBodies(slot);
+      // Whatever was consumed before the abort lands in the capture.
+      expect(typeof slot.requestBody).toBe('string');
+      expect(slot.requestBody).toBe('{"k":"v1');
+    });
+  });
 });

@@ -530,21 +530,33 @@ export class BodyCapture {
     req.end = BodyCapture.handleClientRequestEnd as ClientRequest['end'];
   }
 
+  /**
+   * Capture a client request body. For sync bodies (Buffer/Uint8Array/string)
+   * the capture is finalized inline. For AsyncIterable bodies — undici wraps
+   * `fetch(url, { body })` payloads as an AsyncGenerator — returns a tee'd
+   * async generator that yields the source chunks unchanged while
+   * accumulating them into the slot's capture state. The caller MUST swap
+   * the request's body with the returned generator so undici sends the
+   * tee'd chunks instead of the original (otherwise the source iterator
+   * gets consumed twice). Returns `undefined` when no swap is needed.
+   */
   public captureClientRequestBody(
     slot: IOEventSlot,
     seq: number,
     body: unknown,
     onBytesChanged: (oldBytes: number, newBytes: number) => void
-  ): void {
+  ): AsyncGenerator<unknown> | undefined {
     if (!this.isRequestCaptureEnabled() || !this.shouldCaptureHeaders(slot.requestHeaders)) {
-      return;
+      return undefined;
     }
     if (body === null || body === undefined) {
-      return;
+      return undefined;
     }
     // Streams (Readable) cannot be consumed here without breaking the
     // outbound send. Surface that the request had a streaming body but
-    // we did not capture its content.
+    // we did not capture its content. This branch must come BEFORE the
+    // AsyncIterable branch — Readables also implement Symbol.asyncIterator
+    // but are not safely tee-able through a wrapping generator.
     if (
       typeof body === 'object' &&
       body !== null &&
@@ -552,7 +564,28 @@ export class BodyCapture {
     ) {
       slot.requestBodyTruncated = true;
       slot.requestBodyOriginalSize = null;
-      return;
+      return undefined;
+    }
+
+    // AsyncIterable / AsyncGenerator: undici wraps fetch() bodies into one.
+    // Tee through a wrapping generator: each chunk lands in the capture
+    // state AND flows out to undici unchanged. The previous fallback
+    // (`Buffer.from(String(chunk))`) produced the literal "[object
+    // AsyncGenerator]" string in captures.
+    if (
+      typeof body === 'object' &&
+      body !== null &&
+      typeof (body as AsyncIterable<unknown>)[Symbol.asyncIterator] === 'function'
+    ) {
+      const state = this.createState(slot.requestHeaders);
+      this.setState(slot, 'request', state);
+      return this.teeAsyncIterableForCapture(
+        body as AsyncIterable<unknown>,
+        slot,
+        seq,
+        state,
+        onBytesChanged
+      );
     }
 
     const state = this.createState(slot.requestHeaders);
@@ -578,6 +611,58 @@ export class BodyCapture {
       headers: slot.requestHeaders,
       onBytesChanged
     });
+
+    return undefined;
+  }
+
+  private async *teeAsyncIterableForCapture(
+    source: AsyncIterable<unknown>,
+    slot: IOEventSlot,
+    seq: number,
+    state: AccumulatorState,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): AsyncGenerator<unknown> {
+    let finalized = false;
+    const finalize = (): void => {
+      if (finalized) return;
+      finalized = true;
+      this.finalizeCapture({
+        slot,
+        seq,
+        bodyKey: 'requestBody',
+        digestKey: 'requestBodyDigest',
+        truncatedKey: 'requestBodyTruncated',
+        originalSizeKey: 'requestBodyOriginalSize',
+        state,
+        headers: slot.requestHeaders,
+        onBytesChanged
+      });
+    };
+
+    try {
+      for await (const chunk of source) {
+        try {
+          this.captureChunk(
+            state,
+            slot,
+            'requestBody',
+            'requestBodyTruncated',
+            'requestBodyOriginalSize',
+            chunk
+          );
+        } catch {
+          // Capture errors must never break the application's request.
+          // Skip this chunk's accumulation; keep yielding to undici.
+        }
+        yield chunk;
+      }
+    } finally {
+      // Runs on natural exhaustion, generator.return() (e.g., undici aborts
+      // mid-stream and breaks the for-await), or thrown errors. The slot.seq
+      // check inside finalizeCapture handles slot recycling between the
+      // request kicking off and the generator settling.
+      finalize();
+    }
   }
 
   public captureClientResponse(
