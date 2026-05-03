@@ -14,6 +14,7 @@ interface IOEventBufferLike {
 
 interface ALSManagerLike {
   getContext(): RequestContext | undefined;
+  formatTraceparent(): string | null;
   formatOutboundTracestate?(): string | null;
 }
 
@@ -85,9 +86,9 @@ export class UndiciRecorder {
       const context = this.als.getContext();
 
       if (context !== undefined) {
-        const traceparent = `00-${context.traceId}-${context.spanId}-01`;
+        const traceparent = this.als.formatTraceparent();
         try {
-          if (typeof (request as any).addHeader === 'function') {
+          if (traceparent !== null && typeof (request as any).addHeader === 'function') {
             (request as any).addHeader('traceparent', traceparent);
             // Module 21: emit ec=clk:<n> alongside traceparent.
             const tracestate = this.als.formatOutboundTracestate?.() ?? null;

@@ -668,6 +668,92 @@ describe('Module 08 recorders', () => {
     recorder.shutdown();
   });
 
+  it('propagates inbound traceFlags byte on undici outbound traceparent (sampled-out)', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter: new HeaderFilter(config)
+    });
+    const inboundTraceparent = '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00';
+    const context = als.createRequestContext({
+      method: 'GET',
+      url: '/origin',
+      headers: { host: 'localhost' },
+      traceparent: inboundTraceparent
+    });
+    const addedHeaders: Array<{ name: string; value: string }> = [];
+    const request = {
+      method: 'POST',
+      origin: 'https://undici.example.com',
+      path: '/items',
+      headers: {},
+      addHeader(name: string, value: string) {
+        addedHeaders.push({ name, value });
+        return this;
+      }
+    };
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestCreate({ request });
+    });
+
+    const traceparentHeader = addedHeaders.find((h) => h.name === 'traceparent');
+    expect(traceparentHeader).toBeDefined();
+    expect(traceparentHeader?.value).toMatch(/-00$/);
+    expect(traceparentHeader?.value.endsWith('-01')).toBe(false);
+    recorder.shutdown();
+  });
+
+  it('propagates inbound traceFlags byte on http-client outbound traceparent (sampled-out)', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true
+    });
+    const als = new ALSManager();
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter: new HeaderFilter(config)
+    });
+    const inboundTraceparent = '00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-00';
+    const context = als.createRequestContext({
+      method: 'GET',
+      url: '/origin',
+      headers: { host: 'localhost' },
+      traceparent: inboundTraceparent
+    });
+    const setHeaderCalls: Array<{ name: string; value: string }> = [];
+    const request = Object.assign(new EventEmitter(), {
+      method: 'POST',
+      host: 'svc.example.com',
+      port: 443,
+      path: '/charge',
+      protocol: 'https:',
+      socket: { _handle: { fd: 21 } },
+      getHeaders: () => ({}),
+      getHeader: () => undefined,
+      setHeader(name: string, value: string) {
+        setHeaderCalls.push({ name, value });
+      }
+    });
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    const traceparentSetHeader = setHeaderCalls.find((c) => c.name === 'traceparent');
+    expect(traceparentSetHeader).toBeDefined();
+    expect(traceparentSetHeader?.value).toMatch(/-00$/);
+    expect(traceparentSetHeader?.value.endsWith('-01')).toBe(false);
+  });
+
   it('ignores SDK-internal undici requests', () => {
     const config = createConfig();
     const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });

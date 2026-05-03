@@ -21,6 +21,7 @@ interface IOEventBufferLike {
 
 interface ALSManagerLike {
   getContext(): RequestContext | undefined;
+  formatTraceparent(): string | null;
   formatOutboundTracestate?(): string | null;
 }
 
@@ -122,9 +123,11 @@ export class HttpClientRecorder {
       const target = buildTarget(request);
 
       if (context !== undefined) {
-        const traceparent = `00-${context.traceId}-${context.spanId}-01`;
+        const traceparent = this.als.formatTraceparent();
         try {
-          request.setHeader('traceparent', traceparent);
+          if (traceparent !== null) {
+            request.setHeader('traceparent', traceparent);
+          }
           // Module 21: prepend our ec=clk:<n> entry to inherited vendor
           // entries from ingress and emit alongside traceparent.
           const tracestate = this.als.formatOutboundTracestate?.() ?? null;
