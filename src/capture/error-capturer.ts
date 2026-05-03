@@ -120,6 +120,18 @@ function emitSafeWarning(
   }
 }
 
+// Properties on Error subclasses whose values may contain raw payload
+// fragments — most notably express body-parser's SyntaxError which
+// carries `body` with the prefix of the failing JSON. The full-payload
+// scrubber runs later via the package builder, but it operates on
+// regex matches of complete patterns (CC with Luhn, JWT shape).
+// Partial PII fragments slip through the regex AND the prior cap was
+// 1024 chars, large enough for a credit card and PII context to land
+// verbatim in the capture. Truncate these keys aggressively as a
+// defense-in-depth measure.
+const PAYLOAD_FRAGMENT_KEYS = new Set(['body', 'payload', 'request', 'response', 'data']);
+const PAYLOAD_FRAGMENT_MAX_LENGTH = 200;
+
 function extractCustomProperties(error: Error): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
 
@@ -129,7 +141,16 @@ function extractCustomProperties(error: Error): Record<string, unknown> {
     }
 
     try {
-      properties[key] = (error as unknown as Record<string, unknown>)[key];
+      const value = (error as unknown as Record<string, unknown>)[key];
+      if (
+        PAYLOAD_FRAGMENT_KEYS.has(key) &&
+        typeof value === 'string' &&
+        value.length > PAYLOAD_FRAGMENT_MAX_LENGTH
+      ) {
+        properties[key] = `${value.slice(0, PAYLOAD_FRAGMENT_MAX_LENGTH)}[...truncated for safety, ${value.length} chars]`;
+      } else {
+        properties[key] = value;
+      }
     } catch (propertyError) {
       properties[key] =
         propertyError instanceof Error
@@ -230,6 +251,15 @@ export class ErrorCapturer {
     dropped: 0
   };
 
+  // Defense-in-depth dedup: when two captureError calls produce the same
+  // (traceId, requestId, fingerprint) within DEDUP_WINDOW_NS, suppress
+  // the second. Catches user-side double-capture mistakes (e.g. when an
+  // error path is wired both into express's default-error and into
+  // process.on('unhandledRejection', captureError)).
+  private readonly recentCaptures = new Map<string, bigint>();
+  private static readonly DEDUP_WINDOW_NS = 50_000_000n; // 50ms
+  private static readonly DEDUP_MAX_ENTRIES = 64;
+
   public constructor(deps: {
     buffer: IOEventBufferLike;
     als: ALSManager;
@@ -323,6 +353,29 @@ export class ErrorCapturer {
       const stateTrackingEnabled =
         stateReads.length > 0 || this.stateTrackerStatus?.isTrackingEnabled() === true;
       const fingerprint = computeFingerprint(error, localsResult.frames ?? []);
+      // Defense-in-depth fingerprint dedup. See recentCaptures field doc.
+      // Only dedup when we have full request context — without traceId +
+      // requestId, captures are typically background/scheduled-job errors
+      // where the user genuinely wants every occurrence counted.
+      if (context !== undefined && fingerprint !== undefined && fingerprint !== '') {
+        const dedupKey = `${context.traceId}|${context.requestId}|${fingerprint}`;
+        const previousNs = this.recentCaptures.get(dedupKey);
+        if (
+          previousNs !== undefined &&
+          errorEventHrtimeNs - previousNs < ErrorCapturer.DEDUP_WINDOW_NS
+        ) {
+          this.healthMetrics?.recordDroppedRateLimited?.();
+          debug(`capture() deduplicated by fingerprint within window: ${dedupKey}`);
+          return null;
+        }
+        this.recentCaptures.set(dedupKey, errorEventHrtimeNs);
+        if (this.recentCaptures.size > ErrorCapturer.DEDUP_MAX_ENTRIES) {
+          const oldestKey = this.recentCaptures.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.recentCaptures.delete(oldestKey);
+          }
+        }
+      }
       const parts: ErrorPackageParts = {
         errorEventSeq,
         errorEventHrtimeNs,
