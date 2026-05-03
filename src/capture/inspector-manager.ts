@@ -69,6 +69,48 @@ export class LocalsRingBuffer {
     return undefined;
   }
 
+  /**
+   * When findByIdentity misses, this returns a one-word reason
+   * describing the closest disagreement in the ring buffer. Used to
+   * surface granular cache_miss reasons in completeness instead of
+   * the bare "cache_miss" bucket.
+   */
+  public diagnoseIdentityMiss(key: {
+    requestId: string | null;
+    errorName: string;
+    errorMessage: string;
+    frameCount: number;
+    structuralHash: string;
+  }): 'cache_empty' | 'requestId_mismatch' | 'name_mismatch' | 'message_mismatch' | 'frame_count_mismatch' | 'hash_mismatch' {
+    if (this.entries.length === 0) return 'cache_empty';
+
+    // Walk newest-to-oldest. Score each entry by how many key components
+    // match; the closest match wins and reports its first disagreement.
+    let best: { entry: LocalsRingBufferEntry; score: number } | null = null;
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const e = this.entries[i];
+      let score = 0;
+      if (e.requestId === key.requestId) score += 16;
+      if (e.errorName === key.errorName) score += 8;
+      if (e.errorMessage === key.errorMessage) score += 4;
+      if (e.frameCount === key.frameCount) score += 2;
+      if (e.structuralHash === key.structuralHash) score += 1;
+      if (best === null || score > best.score) {
+        best = { entry: e, score };
+        if (score === 31) break;
+      }
+    }
+
+    if (best === null) return 'cache_empty';
+    const e = best.entry;
+    // Report the FIRST disagreement in identity-tuple order (most-significant first).
+    if (e.requestId !== key.requestId) return 'requestId_mismatch';
+    if (e.errorName !== key.errorName) return 'name_mismatch';
+    if (e.errorMessage !== key.errorMessage) return 'message_mismatch';
+    if (e.frameCount !== key.frameCount) return 'frame_count_mismatch';
+    return 'hash_mismatch';
+  }
+
   public findByDegradedKey(key: {
     requestId: string | null;
     errorName: string;
@@ -515,9 +557,16 @@ export class InspectorManager {
     }
 
     const recentMissSummary = this.buildMissSummary();
+    const lookupReason = this.ringBuffer.diagnoseIdentityMiss({
+      requestId,
+      errorName,
+      errorMessage,
+      frameCount,
+      structuralHash
+    });
     return {
       frames: null,
-      missReason: `cache_miss (pauses=${this.pauseEventsReceived}${recentMissSummary})`
+      missReason: `cache_miss (reason=${lookupReason}, pauses=${this.pauseEventsReceived}${recentMissSummary})`
     };
   }
 
