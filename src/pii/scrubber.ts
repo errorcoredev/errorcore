@@ -283,19 +283,33 @@ export class Scrubber {
       return Buffer.from(MULTIPART_REDACTED, 'utf8');
     }
 
-    if (!isTextualContentType(contentType)) {
-      return buffer;
+    if (isTextualContentType(contentType)) {
+      const encoding = detectBodyEncoding(contentType);
+      const decoded = buffer.toString(encoding);
+      const scrubbed = this.scrubString(decoded);
+
+      if (scrubbed === decoded) {
+        return buffer;
+      }
+
+      return Buffer.from(scrubbed, encoding);
     }
 
-    const encoding = detectBodyEncoding(contentType);
-    const decoded = buffer.toString(encoding);
-    const scrubbed = this.scrubString(decoded);
-
-    if (scrubbed === decoded) {
+    // Non-textual content (octet-stream, image/*, application/pdf, etc.)
+    // is mostly binary, but may carry ASCII subsequences containing PII
+    // (a credit card number embedded in a multipart-disguised payload, a
+    // JWT in a binary protocol's metadata, etc.). The previous "secure
+    // by accident" behavior was relying on the byte-sample cap to
+    // truncate before reaching such patterns. Now: if the lossy UTF-8
+    // decode of the buffer matches a high-confidence PII pattern (CC
+    // with Luhn-check, JWT-shape), redact those bytes in place. Other
+    // binary content remains untouched.
+    const lossyDecoded = buffer.toString('utf8');
+    const scrubbed = this.scrubString(lossyDecoded);
+    if (scrubbed === lossyDecoded) {
       return buffer;
     }
-
-    return Buffer.from(scrubbed, encoding);
+    return Buffer.from(scrubbed, 'utf8');
   }
 
   private applyCustomScrubber(
