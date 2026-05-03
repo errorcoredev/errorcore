@@ -136,10 +136,13 @@ class MockClientRequest extends EventEmitter {
     }
   };
 
+  public sentChunks: Buffer[] = [];
+
   private readonly headers: Record<string, string> = {
     host: 'api.example.com',
     authorization: 'top-secret',
-    'user-agent': 'test-client'
+    'user-agent': 'test-client',
+    'content-type': 'application/json'
   };
 
   public getHeaders(): Record<string, string> {
@@ -148,6 +151,22 @@ class MockClientRequest extends EventEmitter {
 
   public getHeader(name: string): string | undefined {
     return this.headers[name];
+  }
+
+  public setHeader(name: string, value: string): void {
+    this.headers[name] = value;
+  }
+
+  public write(chunk: unknown, _encoding?: unknown, _cb?: unknown): boolean {
+    this.sentChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    return true;
+  }
+
+  public end(chunk?: unknown, _encoding?: unknown, _cb?: unknown): this {
+    if (chunk !== undefined && chunk !== null) {
+      this.sentChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    }
+    return this;
   }
 }
 
@@ -501,6 +520,136 @@ describe('Module 08 recorders', () => {
     } finally {
       await sdk.shutdown();
     }
+  });
+
+  it('captures outbound HTTP client request body via wrapped write/end', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const context = createRequestContext(als);
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: [
+        'application/json',
+        'application/x-www-form-urlencoded',
+        'text/plain',
+        'application/xml'
+      ]
+    });
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter: new HeaderFilter(config)
+    });
+    const request = new MockClientRequest();
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    request.write(Buffer.from('{"order":42}'));
+    request.end();
+
+    const [slot] = buffer.drain();
+    if (slot) {
+      bodyCapture.materializeSlotBodies(slot);
+    }
+
+    expect(slot?.requestBody?.toString()).toBe('{"order":42}');
+    expect(slot?.requestBodyTruncated).toBe(false);
+    expect(request.sentChunks.length).toBeGreaterThan(0);
+  });
+
+  it('captures synchronous undici outbound request body string/Buffer', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: [
+        'application/json',
+        'application/x-www-form-urlencoded',
+        'text/plain',
+        'application/xml'
+      ]
+    });
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter: new HeaderFilter(config),
+      bodyCapture
+    });
+    const context = createRequestContext(als, 'req-undici-body');
+    const undiciRequest = {
+      method: 'POST',
+      origin: 'https://api.example.com',
+      path: '/v1/charge',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': 'undici-test'
+      },
+      body: '{"amount":100}'
+    };
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestCreate({ request: undiciRequest });
+    });
+
+    const [slot] = buffer.drain();
+    if (slot) {
+      bodyCapture.materializeSlotBodies(slot);
+    }
+
+    expect(slot?.requestBody?.toString()).toBe('{"amount":100}');
+    expect(slot?.requestBodyTruncated).toBe(false);
+    recorder.shutdown();
+  });
+
+  it('marks undici streaming body truncated without consuming the stream', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: ['application/json']
+    });
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter: new HeaderFilter(config),
+      bodyCapture
+    });
+    const context = createRequestContext(als, 'req-undici-stream');
+    let pipeCalled = false;
+    const streamingBody = {
+      pipe(): void {
+        pipeCalled = true;
+      }
+    };
+    const undiciRequest = {
+      method: 'POST',
+      origin: 'https://api.example.com',
+      path: '/upload',
+      headers: { 'content-type': 'application/json' },
+      body: streamingBody
+    };
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestCreate({ request: undiciRequest });
+    });
+
+    const [slot] = buffer.drain();
+    expect(slot?.requestBody).toBeNull();
+    expect(slot?.requestBodyTruncated).toBe(true);
+    expect(pipeCalled).toBe(false);
+    recorder.shutdown();
   });
 
   it('records outbound HTTP client requests and response metadata', () => {

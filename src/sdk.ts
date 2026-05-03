@@ -674,7 +674,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
   const undiciRecorder = new UndiciRecorder({
     buffer,
     als,
-    headerFilter
+    headerFilter,
+    bodyCapture
   });
   const netDnsRecorder = new NetDnsRecorder({
     buffer,

@@ -10,6 +10,16 @@ interface IOEventBufferLike {
     slot: IOEventSlot;
     seq: number;
   };
+  updatePayloadBytes(oldBytes: number, newBytes: number): void;
+}
+
+interface BodyCaptureLike {
+  captureClientRequestBody(
+    slot: IOEventSlot,
+    seq: number,
+    body: unknown,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void;
 }
 
 interface ALSManagerLike {
@@ -59,16 +69,20 @@ export class UndiciRecorder {
 
   private readonly headerFilter: HeaderFilterLike;
 
+  private readonly bodyCapture: BodyCaptureLike | undefined;
+
   private readonly slots = new WeakMap<object, IOEventSlot>();
 
   public constructor(deps: {
     buffer: IOEventBufferLike;
     als: ALSManagerLike;
     headerFilter: HeaderFilterLike;
+    bodyCapture?: BodyCaptureLike;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
     this.headerFilter = deps.headerFilter;
+    this.bodyCapture = deps.bodyCapture;
   }
 
   public handleRequestCreate(message: { request: unknown }): void {
@@ -102,7 +116,7 @@ export class UndiciRecorder {
       }
 
       const extracted = extractTarget(request);
-      const { slot } = this.buffer.push({
+      const { slot, seq } = this.buffer.push({
         phase: 'active',
         startTime: process.hrtime.bigint(),
         endTime: null,
@@ -130,6 +144,17 @@ export class UndiciRecorder {
 
       pushIOEvent(context, slot);
       this.slots.set(message.request as object, slot);
+
+      if (this.bodyCapture !== undefined) {
+        this.bodyCapture.captureClientRequestBody(
+          slot,
+          seq,
+          (request as { body?: unknown }).body,
+          (oldBytes, newBytes) => {
+            this.buffer.updatePayloadBytes(oldBytes, newBytes);
+          }
+        );
+      }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       safeConsole.warn(`[ErrorCore] Failed to record undici request creation: ${messageText}`);

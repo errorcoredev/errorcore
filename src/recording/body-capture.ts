@@ -1,6 +1,6 @@
 
 import { createHash } from 'node:crypto';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http';
 
 import type { IOEventSlot, RequestContext } from '../types';
 
@@ -9,6 +9,7 @@ const MAX_STATE_POOL_SIZE = 200;
 const BODY_CAPTURE_STATE = Symbol('errorcore.bodyCaptureState');
 const INBOUND_REQUEST_CAPTURE = Symbol('errorcore.inboundRequestCapture');
 const OUTBOUND_RESPONSE_CAPTURE = Symbol('errorcore.outboundResponseCapture');
+const CLIENT_REQUEST_CAPTURE = Symbol('errorcore.clientRequestCapture');
 
 interface BodyCaptureConfig {
   maxPayloadSize: number;
@@ -58,6 +59,16 @@ interface OutboundResponseCaptureHandler {
   state: AccumulatorState;
   originalWrite: ServerResponse['write'];
   originalEnd: ServerResponse['end'];
+  onBytesChanged: (oldBytes: number, newBytes: number) => void;
+}
+
+interface ClientRequestCaptureHandler {
+  capture: BodyCapture;
+  slot: IOEventSlot;
+  seq: number;
+  state: AccumulatorState;
+  originalWrite: ClientRequest['write'];
+  originalEnd: ClientRequest['end'];
   onBytesChanged: (oldBytes: number, newBytes: number) => void;
 }
 
@@ -320,6 +331,96 @@ export class BodyCapture {
     );
   }
 
+  private static handleClientRequestWrite(
+    this: ClientRequest,
+    chunk: unknown,
+    encoding?: unknown,
+    callback?: unknown
+  ): boolean {
+    const request = this as ClientRequest & {
+      [CLIENT_REQUEST_CAPTURE]?: ClientRequestCaptureHandler;
+    };
+    const handler = request[CLIENT_REQUEST_CAPTURE];
+
+    if (handler === undefined) {
+      return true;
+    }
+
+    const normalizedEncoding =
+      typeof encoding === 'string' ? (encoding as BufferEncoding) : undefined;
+
+    handler.capture.captureChunk(
+      handler.state,
+      handler.slot,
+      'requestBody',
+      'requestBodyTruncated',
+      'requestBodyOriginalSize',
+      chunk,
+      normalizedEncoding
+    );
+
+    return handler.originalWrite.call(
+      this,
+      chunk as never,
+      encoding as never,
+      callback as never
+    );
+  }
+
+  private static handleClientRequestEnd(
+    this: ClientRequest,
+    chunk?: unknown,
+    encoding?: unknown,
+    callback?: unknown
+  ): ClientRequest {
+    const request = this as ClientRequest & {
+      [CLIENT_REQUEST_CAPTURE]?: ClientRequestCaptureHandler;
+    };
+    const handler = request[CLIENT_REQUEST_CAPTURE];
+
+    if (handler === undefined) {
+      return this;
+    }
+
+    const normalizedEncoding =
+      typeof encoding === 'string' ? (encoding as BufferEncoding) : undefined;
+
+    if (chunk !== undefined && chunk !== null) {
+      handler.capture.captureChunk(
+        handler.state,
+        handler.slot,
+        'requestBody',
+        'requestBodyTruncated',
+        'requestBodyOriginalSize',
+        chunk,
+        normalizedEncoding
+      );
+    }
+
+    handler.capture.finalizeCapture({
+      slot: handler.slot,
+      seq: handler.seq,
+      bodyKey: 'requestBody',
+      digestKey: 'requestBodyDigest',
+      truncatedKey: 'requestBodyTruncated',
+      originalSizeKey: 'requestBodyOriginalSize',
+      state: handler.state,
+      headers: handler.slot.requestHeaders,
+      onBytesChanged: handler.onBytesChanged
+    });
+
+    request.write = handler.originalWrite;
+    request.end = handler.originalEnd;
+    delete request[CLIENT_REQUEST_CAPTURE];
+
+    return handler.originalEnd.call(
+      this,
+      chunk as never,
+      encoding as never,
+      callback as never
+    );
+  }
+
   public captureInboundRequest(
     req: IncomingMessage,
     slot: IOEventSlot,
@@ -396,6 +497,86 @@ export class BodyCapture {
     res.on('finish', BodyCapture.handleOutboundResponseFinish);
     res.write = BodyCapture.handleOutboundResponseWrite as ServerResponse['write'];
     res.end = BodyCapture.handleOutboundResponseEnd as ServerResponse['end'];
+  }
+
+  public captureClientRequest(
+    req: ClientRequest,
+    slot: IOEventSlot,
+    seq: number,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void {
+    if (!this.isRequestCaptureEnabled() || !this.shouldCaptureHeaders(slot.requestHeaders)) {
+      return;
+    }
+
+    const state = this.createState(slot.requestHeaders);
+    this.setState(slot, 'request', state);
+    const request = req as ClientRequest & {
+      [CLIENT_REQUEST_CAPTURE]?: ClientRequestCaptureHandler;
+    };
+
+    request[CLIENT_REQUEST_CAPTURE] = {
+      capture: this,
+      slot,
+      seq,
+      state,
+      originalWrite: req.write,
+      originalEnd: req.end,
+      onBytesChanged
+    };
+
+    req.write = BodyCapture.handleClientRequestWrite as ClientRequest['write'];
+    req.end = BodyCapture.handleClientRequestEnd as ClientRequest['end'];
+  }
+
+  public captureClientRequestBody(
+    slot: IOEventSlot,
+    seq: number,
+    body: unknown,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void {
+    if (!this.isRequestCaptureEnabled() || !this.shouldCaptureHeaders(slot.requestHeaders)) {
+      return;
+    }
+    if (body === null || body === undefined) {
+      return;
+    }
+    // Streams (Readable) cannot be consumed here without breaking the
+    // outbound send. Surface that the request had a streaming body but
+    // we did not capture its content.
+    if (
+      typeof body === 'object' &&
+      body !== null &&
+      typeof (body as { pipe?: unknown }).pipe === 'function'
+    ) {
+      slot.requestBodyTruncated = true;
+      slot.requestBodyOriginalSize = null;
+      return;
+    }
+
+    const state = this.createState(slot.requestHeaders);
+    this.setState(slot, 'request', state);
+
+    this.captureChunk(
+      state,
+      slot,
+      'requestBody',
+      'requestBodyTruncated',
+      'requestBodyOriginalSize',
+      body
+    );
+
+    this.finalizeCapture({
+      slot,
+      seq,
+      bodyKey: 'requestBody',
+      digestKey: 'requestBodyDigest',
+      truncatedKey: 'requestBodyTruncated',
+      originalSizeKey: 'requestBodyOriginalSize',
+      state,
+      headers: slot.requestHeaders,
+      onBytesChanged
+    });
   }
 
   public captureClientResponse(

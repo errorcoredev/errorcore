@@ -26,6 +26,12 @@ interface ALSManagerLike {
 }
 
 interface BodyCaptureLike {
+  captureClientRequest(
+    req: ClientRequest,
+    slot: IOEventSlot,
+    seq: number,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void;
   captureClientResponse(
     res: IncomingMessage,
     slot: IOEventSlot,
@@ -166,6 +172,10 @@ export class HttpClientRecorder {
       });
 
       pushIOEvent(context, slot);
+
+      this.bodyCapture.captureClientRequest(request, slot, seq, (oldBytes, newBytes) => {
+        this.buffer.updatePayloadBytes(oldBytes, newBytes);
+      });
 
       let finalized = false;
       const finalize = (input?: { aborted?: boolean; error?: Error }): void => {
