@@ -665,6 +665,59 @@ export class BodyCapture {
     }
   }
 
+  /**
+   * Capture an already-buffered outbound response body. Used by the fetch
+   * wrapper, which obtains the full body via `response.clone().arrayBuffer()`
+   * and hands it to BodyCapture in one shot — no incremental stream.
+   * Reuses the same materialize path as stream-based capture so the body
+   * lands in slot.responseBody with the same shape (decoded string for
+   * textual content, Buffer for binary, scrubbed via the configured PII
+   * scrubber).
+   */
+  public captureUndiciResponseBuffer(
+    slot: IOEventSlot,
+    body: Buffer,
+    headers: Record<string, string> | null,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void {
+    if (!this.isResponseCaptureEnabled()) {
+      return;
+    }
+    if (!this.shouldCaptureHeaders(headers)) {
+      return;
+    }
+
+    const state = this.createState(headers);
+    this.setState(slot, 'response', state);
+
+    this.captureChunk(
+      state,
+      slot,
+      'responseBody',
+      'responseBodyTruncated',
+      'responseBodyOriginalSize',
+      body
+    );
+
+    this.finalizeCapture({
+      slot,
+      seq: slot.seq,
+      bodyKey: 'responseBody',
+      digestKey: 'responseBodyDigest',
+      truncatedKey: 'responseBodyTruncated',
+      originalSizeKey: 'responseBodyOriginalSize',
+      state,
+      headers,
+      onBytesChanged
+    });
+
+    // Materialize immediately so the body lands as a decoded string for
+    // textual content. The stream-based response path waits for the
+    // outer materializeSlotBodies call, but for the fetch wrapper there's
+    // no further capture activity on this slot — finalize fully here.
+    this.materializeBody(slot, 'responseBody', 'responseBodyDigest', headers);
+  }
+
   public captureClientResponse(
     res: IncomingMessage,
     slot: IOEventSlot,

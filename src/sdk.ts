@@ -23,6 +23,7 @@ import { StateTracker } from './state/state-tracker';
 import { HttpServerRecorder } from './recording/http-server';
 import { HttpClientRecorder } from './recording/http-client';
 import { UndiciRecorder } from './recording/undici';
+import { installFetchWrapper } from './recording/fetch-wrapper';
 import { NetDnsRecorder } from './recording/net-dns';
 import { PatchManager } from './recording/patches/patch-manager';
 import { ChannelSubscriber } from './recording/channel-subscriber';
@@ -109,6 +110,10 @@ export class SDKInstance {
 
   private readonly netDnsRecorder: NetDnsRecorder;
 
+  private fetchWrapperUninstall: (() => void) | null = null;
+
+  private readonly bodyCapture: BodyCapture;
+
   readonly config: ResolvedConfig;
 
   readonly buffer: IOEventBuffer;
@@ -156,6 +161,7 @@ export class SDKInstance {
     httpClientRecorder: HttpClientRecorder;
     undiciRecorder: UndiciRecorder;
     netDnsRecorder: NetDnsRecorder;
+    bodyCapture: BodyCapture;
     deadLetterStore: DeadLetterStore | null;
     watchdog: WatchdogManager | null;
     healthMetrics: HealthMetrics;
@@ -176,6 +182,7 @@ export class SDKInstance {
     this.httpClientRecorder = input.httpClientRecorder;
     this.undiciRecorder = input.undiciRecorder;
     this.netDnsRecorder = input.netDnsRecorder;
+    this.bodyCapture = input.bodyCapture;
     this.deadLetterStore = input.deadLetterStore;
     this.watchdog = input.watchdog;
     this.healthMetrics = input.healthMetrics;
@@ -198,6 +205,16 @@ export class SDKInstance {
 
     this.httpServerRecorder.install();
     this.channelSubscriber.subscribeAll();
+    // Install the global fetch wrapper for outbound response-body capture.
+    // No-op when captureResponseBodies is disabled, when fetch isn't a
+    // function, or when the wrapper is already installed in this process.
+    const fetchHandle = installFetchWrapper({
+      bodyCapture: this.bodyCapture,
+      buffer: this.buffer,
+      headerFilter: this.headerFilter,
+      captureResponseBodies: this.config.captureResponseBodies
+    });
+    this.fetchWrapperUninstall = fetchHandle.uninstall;
     this.patchManager.installAll();
     this.registerProcessHandlers();
 
@@ -446,6 +463,10 @@ export class SDKInstance {
   private async performShutdown(): Promise<void> {
     try {
       this.channelSubscriber.unsubscribeAll();
+      if (this.fetchWrapperUninstall !== null) {
+        this.fetchWrapperUninstall();
+        this.fetchWrapperUninstall = null;
+      }
       this.patchManager.unwrapAll();
       this.httpServerRecorder.shutdown();
       this.httpClientRecorder.shutdown();
@@ -786,6 +807,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     httpClientRecorder,
     undiciRecorder,
     netDnsRecorder,
+    bodyCapture,
     deadLetterStore,
     watchdog,
     healthMetrics

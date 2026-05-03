@@ -22,6 +22,23 @@ interface BodyCaptureLike {
   ): AsyncGenerator<unknown> | undefined;
 }
 
+// Symbol-keyed slot reference attached directly to the undici Request. The
+// previous WeakMap<request, slot> lookup failed when message.request in
+// undici:request:headers wasn't the same JS reference as in
+// undici:request:create — a known undici-version-dependent pitfall. A
+// Symbol property travels with the Request regardless of how the
+// diagnostics_channel payload wraps it.
+const UNDICI_SLOT_REF = Symbol.for('errorcore.undiciSlotRef');
+
+// FIFO of pending fetch wrappers waiting for a slot to attach to. A fetch()
+// call's synchronous prelude includes the dispatcher dispatch, so the
+// queue is drained one-to-one with the diagnostics_channel slot creation.
+// Documented caveat: this assumes no async work between fetch entry and
+// dispatch — currently true for undici's fetch implementation. Direct
+// undici.request() / client.request() calls bypass this queue and don't
+// get response-body capture.
+export const pendingFetchResolvers: Array<(slot: IOEventSlot) => void> = [];
+
 interface ALSManagerLike {
   getContext(): RequestContext | undefined;
   formatTraceparent(): string | null;
@@ -71,6 +88,9 @@ export class UndiciRecorder {
 
   private readonly bodyCapture: BodyCaptureLike | undefined;
 
+  // Fallback WeakMap kept for the rare case where the Request object refuses
+  // Symbol property writes (frozen / Proxy-trapped). Primary lookup is the
+  // UNDICI_SLOT_REF Symbol on the request itself.
   private readonly slots = new WeakMap<object, IOEventSlot>();
 
   public constructor(deps: {
@@ -144,6 +164,14 @@ export class UndiciRecorder {
 
       pushIOEvent(context, slot);
       this.slots.set(message.request as object, slot);
+      // Primary slot lookup: Symbol-keyed property survives across the
+      // various ways undici may wrap or re-reference the request between
+      // diagnostics events. The WeakMap above is the fallback path.
+      try {
+        (message.request as Record<symbol, unknown>)[UNDICI_SLOT_REF] = slot;
+      } catch {
+        // Request is frozen — ignore, fall back to WeakMap.
+      }
 
       if (this.bodyCapture !== undefined) {
         // For AsyncIterable bodies (undici wraps fetch JSON bodies as
@@ -161,6 +189,15 @@ export class UndiciRecorder {
         if (replacement !== undefined) {
           (request as { body?: unknown }).body = replacement;
         }
+      }
+
+      // Notify any pending fetch wrappers that a slot is now available for
+      // this dispatch. The fetch wrapper FIFO-pops the resolver and uses it
+      // to attach the captured response body once the response settles. See
+      // src/recording/fetch-wrapper.ts.
+      const resolver = pendingFetchResolvers.shift();
+      if (resolver !== undefined) {
+        resolver(slot);
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
@@ -257,8 +294,16 @@ export class UndiciRecorder {
   }
 
   private getSlot(request: unknown): IOEventSlot | undefined {
-    return typeof request === 'object' && request !== null
-      ? this.slots.get(request)
-      : undefined;
+    if (typeof request !== 'object' || request === null) {
+      return undefined;
+    }
+    // Primary path: Symbol-keyed property. Falls back to WeakMap when the
+    // Symbol wasn't writable (frozen request) or when the request object
+    // here is a different reference than the one in handleRequestCreate.
+    const symbolSlot = (request as Record<symbol, unknown>)[UNDICI_SLOT_REF];
+    if (symbolSlot !== undefined && symbolSlot !== null) {
+      return symbolSlot as IOEventSlot;
+    }
+    return this.slots.get(request);
   }
 }
