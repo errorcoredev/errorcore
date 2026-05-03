@@ -132,11 +132,46 @@ function emitSafeWarning(
 const PAYLOAD_FRAGMENT_KEYS = new Set(['body', 'payload', 'request', 'response', 'data']);
 const PAYLOAD_FRAGMENT_MAX_LENGTH = 200;
 
-function extractCustomProperties(error: Error): Record<string, unknown> {
+// Properties on pg's DatabaseError that contain raw row values verbatim.
+// `detail` for a constraint violation is "Failing row contains (uuid, email,
+// ...)" — every column value in column order. Forwarding it leaks PII for
+// any table with sensitive columns. `hint`, `internalQuery`, and `where`
+// can also carry user-supplied query fragments. The non-PII fields
+// (code/severity/schema/table/constraint/routine/column/file/line) remain
+// captured because they're load-bearing for debugging.
+const PG_SENSITIVE_PROPS = new Set(['detail', 'hint', 'internalQuery', 'where']);
+
+// Why gated to pg DatabaseError specifically and not applied to every error
+// that happens to have a `detail` property: custom error classes legitimately
+// use `detail: 'human-readable explanation'` (express-validator, ajv,
+// react-hook-form internals). Stripping `detail` universally would lose
+// debugging context on those errors. The pg case is the only one where
+// `detail` is structurally a row dump.
+function isLikelyPgDatabaseError(error: Error): boolean {
+  if (error.constructor?.name === 'DatabaseError') {
+    return true;
+  }
+  // Some bundlers strip class names. Fingerprint by the constellation of
+  // pg-specific fields that DatabaseError exposes.
+  const e = error as unknown as Record<string, unknown>;
+  return (
+    typeof e.severity === 'string' &&
+    typeof e.code === 'string' &&
+    (typeof e.routine === 'string' || typeof e.constraint === 'string')
+  );
+}
+
+/** @internal exported for unit tests */
+export function extractCustomProperties(error: Error): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
+  const isPgError = isLikelyPgDatabaseError(error);
 
   for (const key of Object.getOwnPropertyNames(error)) {
     if (key === 'name' || key === 'message' || key === 'stack' || key === 'cause') {
+      continue;
+    }
+
+    if (isPgError && PG_SENSITIVE_PROPS.has(key)) {
       continue;
     }
 
