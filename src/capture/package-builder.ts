@@ -303,6 +303,7 @@ export class PackageBuilder {
 
     const packageObject: ErrorPackage = {
       schemaVersion: '1.1.0',
+      service: this.config.service,
       capturedAt: new Date().toISOString(),
       errorEventSeq: parts.errorEventSeq,
       errorEventHrtimeNs: parts.errorEventHrtimeNs.toString(),

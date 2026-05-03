@@ -584,7 +584,21 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     captureMiddlewareStatusCodes,
     traceContext: { vendorKey },
     stateTracking: { captureWrites, maxWritesPerContext },
+    service: resolveServiceName(userConfig.service)
   };
+}
+
+function resolveServiceName(explicit: string | undefined): string {
+  if (typeof explicit === 'string' && explicit.length > 0) {
+    return explicit;
+  }
+  if (typeof process.env.OTEL_SERVICE_NAME === 'string' && process.env.OTEL_SERVICE_NAME.length > 0) {
+    return process.env.OTEL_SERVICE_NAME;
+  }
+  if (typeof process.env.npm_package_name === 'string' && process.env.npm_package_name.length > 0) {
+    return process.env.npm_package_name;
+  }
+  return 'unknown-service';
 }
 
 function resolveDeadLetterPath(

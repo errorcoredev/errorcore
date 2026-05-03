@@ -127,7 +127,8 @@ describe('resolveConfig', () => {
       sourceMapSyncThresholdBytes: 2 * 1024 * 1024,
       captureMiddlewareStatusCodes: 'none',
       traceContext: { vendorKey: 'ec' },
-      stateTracking: { captureWrites: true, maxWritesPerContext: 50 }
+      stateTracking: { captureWrites: true, maxWritesPerContext: 50 },
+      service: 'errorcore'
     });
   });
 

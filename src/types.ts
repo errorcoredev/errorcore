@@ -275,6 +275,13 @@ export interface ProcessMetadata {
 
 export interface ErrorPackage {
   schemaVersion: '1.1.0';
+  /**
+   * Application/service name that produced this capture. Resolved from
+   * config.service, falling back to OTEL_SERVICE_NAME, then
+   * npm_package_name, then "unknown-service". Lets a backend attribute a
+   * capture without inferring from the transport's filename or hostname.
+   */
+  service: string;
   capturedAt: string;
   errorEventSeq: number;
   errorEventHrtimeNs: string;
@@ -519,6 +526,12 @@ export interface SDKConfig {
     captureWrites?: boolean;
     maxWritesPerContext?: number;
   };
+  /**
+   * Application/service name attributed to every captured ErrorPackage.
+   * If unset: resolved from process.env.OTEL_SERVICE_NAME, then
+   * process.env.npm_package_name, then the literal "unknown-service".
+   */
+  service?: string;
 }
 
 export interface ResolvedConfig {
@@ -576,6 +589,8 @@ export interface ResolvedConfig {
     captureWrites: boolean;
     maxWritesPerContext: number;
   };
+  /** Resolved service name. Always set after resolveConfig. */
+  service: string;
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {
