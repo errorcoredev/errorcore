@@ -1,5 +1,6 @@
 
 import { createRequire } from 'node:module';
+import * as path from 'node:path';
 
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
@@ -9,7 +10,10 @@ import type { RecorderState } from '../../sdk-diagnostics';
 import { detectBundler } from '../../sdk-diagnostics';
 import { safeConsole } from '../../debug-log';
 
-const nodeRequire = createRequire(__filename);
+// Resolve drivers from the application's require root rather than the
+// SDK's own node_modules — the latter walks the SDK's devDependency
+// tree and reports drivers as patched even when the app doesn't use them.
+const appRequire = createRequire(path.join(process.cwd(), 'noop.js'));
 
 const COLLECTION_METHODS = [
   'find',
@@ -194,7 +198,7 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
     };
   }
   try {
-    const mongodb = (deps.explicitDriver ?? nodeRequire('mongodb')) as {
+    const mongodb = (deps.explicitDriver ?? appRequire('mongodb')) as {
       Collection?: { prototype?: object };
     };
 

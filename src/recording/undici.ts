@@ -217,6 +217,20 @@ export class UndiciRecorder {
         type: message.error.name,
         message: message.error.message
       };
+      // AbortSignal.timeout(...) fires a TimeoutError that is semantically
+      // an aborted request even though the SDK only flagged aborted=true
+      // for explicit req.abort() calls. Treat both timeout-class and
+      // undici's UND_ERR_ABORTED as aborted so the IO event surface
+      // doesn't mislead engineers reading "aborted: false" on a request
+      // that was clearly cut off.
+      const errCode = (message.error as { code?: unknown }).code;
+      if (
+        message.error.name === 'TimeoutError' ||
+        message.error.name === 'AbortError' ||
+        errCode === 'UND_ERR_ABORTED'
+      ) {
+        slot.aborted = true;
+      }
       slot.endTime = process.hrtime.bigint();
       slot.durationMs = toDurationMs(slot.startTime, slot.endTime);
       slot.phase = 'done';

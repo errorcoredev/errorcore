@@ -1,5 +1,6 @@
 
 import { createRequire } from 'node:module';
+import * as path from 'node:path';
 
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
@@ -9,7 +10,11 @@ import type { RecorderState } from '../../sdk-diagnostics';
 import { detectBundler } from '../../sdk-diagnostics';
 import { safeConsole } from '../../debug-log';
 
-const nodeRequire = createRequire(__filename);
+// Resolve drivers from the *application's* require root, not the SDK's
+// own node_modules. Otherwise drivers that exist only as the SDK's
+// devDependencies (mongodb, ioredis) get patched in services that
+// don't actually use them, producing phantom "ok" diagnostics.
+const appRequire = createRequire(path.join(process.cwd(), 'noop.js'));
 
 function toDurationMs(startTime: bigint, endTime: bigint): number {
   return Number(endTime - startTime) / 1_000_000;
@@ -47,7 +52,7 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
     };
   }
   try {
-    const Redis = (deps.explicitDriver ?? nodeRequire('ioredis')) as { prototype?: object };
+    const Redis = (deps.explicitDriver ?? appRequire('ioredis')) as { prototype?: object };
 
     if (Redis.prototype !== undefined) {
       wrapMethod(Redis.prototype, 'sendCommand', (original) => {

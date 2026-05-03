@@ -26,6 +26,25 @@ const REDACTED = '[REDACTED]';
 const DEPTH_LIMIT = '[DEPTH_LIMIT]';
 const MULTIPART_REDACTED = '[MULTIPART BODY OMITTED]';
 
+function isPrivateOrInfrastructureIp(ip: string): boolean {
+  const parts = ip.split('.').map((p) => Number.parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
+    return false;
+  }
+  const [a, b] = parts;
+  // 0.0.0.0/8 (this network), 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+  // 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 multicast, 100.64.0.0/10 CGNAT.
+  if (a === 0) return true;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a >= 224 && a <= 239) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
 function replacePattern(value: string, pattern: RegExp): string {
   // .replace() with a /g regex resets lastIndex internally per ECMAScript spec.
   return value.replace(pattern, REDACTED);
@@ -596,7 +615,13 @@ export class Scrubber {
     scrubbed = replacePattern(scrubbed, STRIPE_KEY_REGEX);
     scrubbed = replacePattern(scrubbed, GENERIC_SK_KEY_REGEX);
     scrubbed = replacePattern(scrubbed, PHONE_REGEX);
-    scrubbed = replacePattern(scrubbed, IPV4_REGEX);
+    // IPv4 redaction: only scrub public/routable IPs. Loopback, private,
+    // link-local, and multicast addresses are infrastructure metadata,
+    // not PII; redacting them produces noise like host: "[REDACTED]:3000"
+    // (was 127.0.0.1:3000) that buries real signal.
+    scrubbed = scrubbed.replace(IPV4_REGEX, (match) =>
+      isPrivateOrInfrastructureIp(match) ? match : REDACTED
+    );
 
     if (looksLikeHighEntropySecret(scrubbed)) {
       return REDACTED;

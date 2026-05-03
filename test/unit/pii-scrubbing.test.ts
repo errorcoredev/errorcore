@@ -123,7 +123,8 @@ describe('Scrubber', () => {
     ],
     ['generic sk keys', 'Token sk-abcdefghijklmno', 'Token [REDACTED]'],
     ['phone numbers', 'Call +1 (555) 123-4567 now', 'Call [REDACTED] now'],
-    ['IPv4 addresses', 'Connect to 192.168.1.1', 'Connect to [REDACTED]'],
+    ['public IPv4 addresses', 'Connect to 8.8.8.8', 'Connect to [REDACTED]'],
+    ['private IPv4 addresses are preserved', 'Connect to 192.168.1.1', 'Connect to 192.168.1.1'],
     [
       'valid credit cards',
       'Card 4111111111111111 was charged',
