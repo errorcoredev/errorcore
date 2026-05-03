@@ -30,8 +30,12 @@ export interface IOEventSlot {
   fd: number | null;
   requestHeaders: Record<string, string> | null;
   responseHeaders: Record<string, string> | null;
-  requestBody: Buffer | null;
-  responseBody: Buffer | null;
+  // String when the body's content-type is textual (e.g. application/json,
+  // text/*) and was successfully decoded to UTF-8 at materialization time.
+  // Buffer when the body is binary or could not be safely decoded. null
+  // when the body was never captured.
+  requestBody: Buffer | string | null;
+  responseBody: Buffer | string | null;
   requestBodyDigest?: string | null;
   responseBodyDigest?: string | null;
   requestBodyTruncated: boolean;

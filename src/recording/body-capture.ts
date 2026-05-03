@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http';
 
+import { getBodyEncoding, isTextualContentType } from '../pii/scrubber';
 import type { IOEventSlot, RequestContext } from '../types';
 
 const METADATA_OVERHEAD = 256;
@@ -930,7 +931,16 @@ export class BodyCapture {
     const body = Buffer.concat(state.chunks, state.capturedBytes);
     const scrubbed = this.scrubber?.scrubBodyBuffer(body, headers ?? state.headers) ?? body;
 
-    slot[bodyKey] = scrubbed;
+    // For textual content-types, decode UTF-8 (or charset-declared encoding)
+    // so the body lands in the package as a readable string, not as a typed-
+    // array byte sample that the JSON serializer would clamp to maxArrayItems.
+    // Binary content stays as a Buffer.
+    const contentType = (headers ?? state.headers)?.['content-type'];
+    if (isTextualContentType(contentType)) {
+      slot[bodyKey] = scrubbed.toString(getBodyEncoding(contentType));
+    } else {
+      slot[bodyKey] = scrubbed;
+    }
     slot[digestKey] = state.digestHex;
     delete this.getState(slot)[bodyKey === 'requestBody' ? 'request' : 'response'];
     this.releaseState(state);

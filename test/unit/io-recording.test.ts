@@ -563,6 +563,46 @@ describe('Module 08 recorders', () => {
     expect(request.sentChunks.length).toBeGreaterThan(0);
   });
 
+  it('materializes outbound JSON request body as readable string, not Buffer', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const context = createRequestContext(als);
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: [
+        'application/json',
+        'application/x-www-form-urlencoded',
+        'text/plain',
+        'application/xml'
+      ]
+    });
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter: new HeaderFilter(config)
+    });
+    const request = new MockClientRequest();
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    request.write(Buffer.from('{"orderId":"abc","amount":4242}'));
+    request.end();
+
+    const [slot] = buffer.drain();
+    if (slot) {
+      bodyCapture.materializeSlotBodies(slot);
+    }
+
+    expect(typeof slot?.requestBody).toBe('string');
+    expect(slot?.requestBody).toBe('{"orderId":"abc","amount":4242}');
+  });
+
   it('captures synchronous undici outbound request body string/Buffer', () => {
     const config = createConfig();
     const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });

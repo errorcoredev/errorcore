@@ -110,7 +110,7 @@ export function looksLikeHighEntropySecret(value: string): boolean {
   return entropy >= 4.2;
 }
 
-function isTextualContentType(contentType: string | undefined): boolean {
+export function isTextualContentType(contentType: string | undefined): boolean {
   if (!contentType) {
     return false;
   }
@@ -124,6 +124,16 @@ function isTextualContentType(contentType: string | undefined): boolean {
   );
 }
 
+export function getBodyEncoding(contentType: string | undefined): BufferEncoding {
+  if (!contentType) {
+    return 'utf8';
+  }
+  if (contentType.includes('charset=latin1') || contentType.includes('charset=iso-8859-1')) {
+    return 'latin1';
+  }
+  return 'utf8';
+}
+
 function isMultipartContentType(contentType: string | undefined): boolean {
   if (!contentType) {
     return false;
@@ -132,17 +142,7 @@ function isMultipartContentType(contentType: string | undefined): boolean {
   return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'multipart/form-data';
 }
 
-function detectBodyEncoding(contentType: string | undefined): BufferEncoding {
-  if (!contentType) {
-    return 'utf8';
-  }
-
-  if (contentType.includes('charset=latin1') || contentType.includes('charset=iso-8859-1')) {
-    return 'latin1';
-  }
-
-  return 'utf8';
-}
+const detectBodyEncoding = getBodyEncoding;
 
 const SENSITIVE_SQL_QUICK_TEST =
   /^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*(ALTER\s+(?:USER|ROLE|LOGIN)|CREATE\s+(?:USER|ROLE|LOGIN)|DROP\s+(?:USER|ROLE|LOGIN)|SET\s+PASSWORD|SET\s+SESSION\s+AUTHORIZATION|GRANT\b|REVOKE\b)/i;
