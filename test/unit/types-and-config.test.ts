@@ -51,8 +51,9 @@ describe('resolveConfig', () => {
         'cache-control'
       ],
       headerBlocklist: [
-        /authorization|cookie|set-cookie|x-api-key|x-auth-token/i,
-        /auth|token|key|secret|password|credential/i
+        /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key|x-auth-token|x-access-token|x-refresh-token|x-csrf-token|x-secret-token)$/i,
+        /\b(api|auth|access|secret|session|bearer|private|client|refresh)[-_]?(key|token|secret|password)\b/i,
+        /\b(passwords?|passwd|credentials?)\b/i
       ],
       envAllowlist: [
         'NODE_ENV',

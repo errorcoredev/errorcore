@@ -624,4 +624,166 @@ describe('HeaderFilter', () => {
       expect(result).toEqual({ 'x-test': '' });
     });
   });
+
+  describe('default blocklist — operational vs auth headers', () => {
+    function createDefaultConfig(extraAllowlist: string[] = []): ResolvedConfig {
+      return resolveConfig({
+        transport: { type: 'stdout' },
+        headerAllowlist: [
+          'idempotency-key',
+          'x-idempotency-key',
+          'host',
+          'traceparent',
+          'content-type',
+          'content-length',
+          'accept',
+          'x-request-id',
+          'x-correlation-id',
+          ...extraAllowlist
+        ]
+      });
+    }
+
+    it('keeps idempotency-key and x-idempotency-key in the effective allowlist', () => {
+      const filter = new HeaderFilter(createDefaultConfig());
+
+      const result = filter.filterHeaders({
+        'idempotency-key': 'idem-1',
+        'x-idempotency-key': 'idem-2',
+        'content-type': 'application/json'
+      });
+
+      expect(result).toEqual({
+        'idempotency-key': 'idem-1',
+        'x-idempotency-key': 'idem-2',
+        'content-type': 'application/json'
+      });
+    });
+
+    it('keeps user-added operational headers without `key`/`token` substring damage', () => {
+      const filter = new HeaderFilter(
+        createDefaultConfig(['keystone', 'key-stone', 'keep-alive', 'oauth-state', 'x-tracking-key'])
+      );
+
+      const result = filter.filterHeaders({
+        'keystone': 'monolith',
+        'key-stone': 'split-name',
+        'keep-alive': 'timeout=5',
+        'oauth-state': 'csrf-foo',
+        'x-tracking-key': 'analytics-1'
+      });
+
+      // `key-stone` is the regression marker. The audit's proposed
+      // /\b(...|key|...)\b/i fix would have killed it because `\b` accepts
+      // hyphen as a word boundary. The exact-match-then-compound design
+      // saves it because `key-stone` doesn't match (api|auth|access|...)-key.
+      expect(result).toEqual({
+        'keystone': 'monolith',
+        'key-stone': 'split-name',
+        'keep-alive': 'timeout=5',
+        'oauth-state': 'csrf-foo',
+        'x-tracking-key': 'analytics-1'
+      });
+    });
+
+    it("documents why the audit's proposed /\\b...\\b/i regex was rejected", () => {
+      // Empirical record. If a future reviewer tries to "simplify" the
+      // three-layer regex to /\b(auth|token|key|secret|password|credential)
+      // \b/i, this test fails on every line, telling them why before they
+      // ship the regression.
+      const auditRegex = /\b(auth|token|key|secret|password|credential)\b/i;
+
+      // The audit claimed these survive under the proposed regex; empirically
+      // they don't (\bkey\b matches the trailing `key` because `-` is a
+      // word boundary).
+      expect(auditRegex.test('idempotency-key')).toBe(true);
+      expect(auditRegex.test('x-idempotency-key')).toBe(true);
+      expect(auditRegex.test('x-tracking-key')).toBe(true);
+      expect(auditRegex.test('key-stone')).toBe(true);
+
+      // The audit claimed these are blocked under the proposed regex;
+      // empirically they survive — `\bauth\b` doesn't match the start of
+      // `authorization` because the trailing `\b` fails before `o`. This
+      // is the security regression the v3 plan caught.
+      expect(auditRegex.test('authorization')).toBe(false);
+      expect(auditRegex.test('cookie')).toBe(false);
+    });
+
+    it('still blocks well-known auth/cookie headers', () => {
+      const filter = new HeaderFilter(
+        createDefaultConfig([
+          'authorization',
+          'cookie',
+          'set-cookie',
+          'proxy-authorization',
+          'x-api-key',
+          'x-auth-token',
+          'x-csrf-token',
+          'x-secret-token'
+        ])
+      );
+
+      const result = filter.filterHeaders({
+        'authorization': 'Bearer xyz',
+        'cookie': 'sid=abc',
+        'set-cookie': 'sid=abc',
+        'proxy-authorization': 'Basic abc',
+        'x-api-key': 'k1',
+        'x-auth-token': 't1',
+        'x-csrf-token': 'c1',
+        'x-secret-token': 's1',
+        'content-type': 'application/json'
+      });
+
+      expect(result).toEqual({ 'content-type': 'application/json' });
+    });
+
+    it('blocks user-added auth-prefix compound headers', () => {
+      const filter = new HeaderFilter(
+        createDefaultConfig([
+          'api-key',
+          'auth_token',
+          'secret-key',
+          'session-secret',
+          'private-token',
+          'client-secret',
+          'refresh-token',
+          'bearer-token',
+          'access-token'
+        ])
+      );
+
+      const result = filter.filterHeaders({
+        'api-key': 'a',
+        'auth_token': 'b',
+        'secret-key': 'c',
+        'session-secret': 'd',
+        'private-token': 'e',
+        'client-secret': 'f',
+        'refresh-token': 'g',
+        'bearer-token': 'h',
+        'access-token': 'i',
+        'content-type': 'application/json'
+      });
+
+      expect(result).toEqual({ 'content-type': 'application/json' });
+    });
+
+    it('blocks standalone password/credential nouns including plurals', () => {
+      const filter = new HeaderFilter(
+        createDefaultConfig(['password', 'passwords', 'passwd', 'credential', 'credentials'])
+      );
+
+      const result = filter.filterHeaders({
+        'password': 'p1',
+        'passwords': 'p2',
+        'passwd': 'p3',
+        'credential': 'c1',
+        'credentials': 'c2',
+        'content-type': 'application/json'
+      });
+
+      expect(result).toEqual({ 'content-type': 'application/json' });
+    });
+  });
 });

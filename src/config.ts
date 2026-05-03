@@ -60,9 +60,18 @@ const DEFAULT_HEADER_ALLOWLIST = [
   'cache-control'
 ];
 
+// Default blocklist for outbound/inbound header capture. Three layers, narrow
+// to broad. The previous broad alternation /auth|token|key|secret|password|
+// credential/i used substring matches without word boundaries, which silently
+// killed operational headers like idempotency-key (matched via "key").
 const DEFAULT_HEADER_BLOCKLIST = [
-  /authorization|cookie|set-cookie|x-api-key|x-auth-token/i,
-  /auth|token|key|secret|password|credential/i
+  // Exact-match: well-known auth/cookie/api-key headers.
+  /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key|x-auth-token|x-access-token|x-refresh-token|x-csrf-token|x-secret-token)$/i,
+  // Auth-prefix compounds: api-key, auth-token, secret-key, session-secret, etc.
+  /\b(api|auth|access|secret|session|bearer|private|client|refresh)[-_]?(key|token|secret|password)\b/i,
+  // Standalone sensitive nouns. Word boundaries let `keystone` survive while
+  // `password`/`passwords`/`credential`/`credentials` get blocked.
+  /\b(passwords?|passwd|credentials?)\b/i
 ];
 
 const DEFAULT_ENV_ALLOWLIST = [
