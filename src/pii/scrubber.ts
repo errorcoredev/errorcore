@@ -161,6 +161,22 @@ function isMultipartContentType(contentType: string | undefined): boolean {
   return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'multipart/form-data';
 }
 
+function isJsonContentType(contentType: string | undefined): boolean {
+  if (!contentType) {
+    return false;
+  }
+  // application/json, application/vnd.api+json, text/json, etc.
+  const head = contentType.split(';', 1)[0]?.trim().toLowerCase() ?? '';
+  return head === 'application/json' || head === 'text/json' || head.endsWith('+json');
+}
+
+function isFormUrlEncodedContentType(contentType: string | undefined): boolean {
+  if (!contentType) {
+    return false;
+  }
+  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'application/x-www-form-urlencoded';
+}
+
 const detectBodyEncoding = getBodyEncoding;
 
 const SENSITIVE_SQL_QUICK_TEST =
@@ -305,6 +321,52 @@ export class Scrubber {
     if (isTextualContentType(contentType)) {
       const encoding = detectBodyEncoding(contentType);
       const decoded = buffer.toString(encoding);
+
+      // application/json: parse, walk via cloneAndScrub for key-aware
+      // redaction (catches `cvc: "123"` and other short opaque values that
+      // no value-pattern regex would match), re-stringify, then run
+      // scrubString as a belt-and-suspenders pass over CC numbers / JWTs
+      // that survived in non-sensitive keys. cloneAndScrub honors the
+      // configured serialization caps (depth 8, array 20, object 50,
+      // string 2048) — PII below those depths is redacted; PII at deeper
+      // nesting falls through to the string pass below.
+      if (isJsonContentType(contentType)) {
+        try {
+          const parsed = JSON.parse(decoded);
+          const walked = this.applyDefaultScrubber('', parsed);
+          const reserialized = JSON.stringify(walked);
+          const finalString = this.scrubString(reserialized);
+          if (finalString === decoded) {
+            return buffer;
+          }
+          return Buffer.from(finalString, encoding);
+        } catch {
+          // Parse failed — fall through to plain string scrub below.
+        }
+      }
+
+      // application/x-www-form-urlencoded: parse keys, redact sensitive
+      // values via the same key-aware check used for JSON objects.
+      if (isFormUrlEncodedContentType(contentType)) {
+        try {
+          const params = new URLSearchParams(decoded);
+          const out = new URLSearchParams();
+          for (const [key, value] of params.entries()) {
+            const scrubbedValue = matchesSensitiveKey(key)
+              ? REDACTED
+              : this.scrubString(value);
+            out.append(key, scrubbedValue);
+          }
+          const reserialized = out.toString();
+          if (reserialized === decoded) {
+            return buffer;
+          }
+          return Buffer.from(reserialized, encoding);
+        } catch {
+          // URLSearchParams.toString edge cases — fall through.
+        }
+      }
+
       const scrubbed = this.scrubString(decoded);
 
       if (scrubbed === decoded) {

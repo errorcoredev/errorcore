@@ -294,6 +294,129 @@ describe('Scrubber', () => {
     ).toBe('[MULTIPART BODY OMITTED]');
   });
 
+  describe('scrubBodyBuffer — structural JSON walk', () => {
+    it('redacts cvc, password, and token via key-aware walk in JSON bodies', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = JSON.stringify({
+        user: {
+          email: 'alice@example.com',
+          card: {
+            // 16 contiguous digits with valid Luhn — caught by the value
+            // pattern. Hyphenated CC numbers are an existing scrubString
+            // limitation outside Fix 4's scope.
+            number: '4111111111111111',
+            cvc: '424',
+            exp: '12/29'
+          },
+          name: 'Alice'
+        },
+        password: 'p@ssw0rd',
+        access_token: 'tok_123abc'
+      });
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/json'
+        })
+        .toString('utf8');
+
+      const parsed = JSON.parse(out) as {
+        user: { card: { number: string; cvc: string; exp: string }; name: string; email: string };
+        password: string;
+        access_token: string;
+      };
+
+      // Key-aware redaction: cvc would not match any value pattern, but the
+      // structural walk catches it via SENSITIVE_KEY_EXACT_MATCHES.
+      expect(parsed.user.card.cvc).toBe('[REDACTED]');
+      expect(parsed.user.card.number).toBe('[REDACTED]');
+      expect(parsed.password).toBe('[REDACTED]');
+      expect(parsed.access_token).toBe('[REDACTED]');
+      // Email scrubbed via value-pattern regex.
+      expect(parsed.user.email).toBe('[REDACTED]');
+      // Non-sensitive fields preserved.
+      expect(parsed.user.name).toBe('Alice');
+      expect(parsed.user.card.exp).toBe('12/29');
+    });
+
+    it('walks application/vnd.api+json content types', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = JSON.stringify({ data: { type: 'user', attributes: { cvc: '999' } } });
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/vnd.api+json'
+        })
+        .toString('utf8');
+
+      expect(JSON.parse(out)).toEqual({
+        data: { type: 'user', attributes: { cvc: '[REDACTED]' } }
+      });
+    });
+
+    it('falls back to string scrub when JSON.parse fails', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const malformed = '{"email":"alice@example.com","cvc":';
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(malformed, 'utf8'), {
+          'content-type': 'application/json'
+        })
+        .toString('utf8');
+
+      // Email regex still fires on the partial body — value-pattern fallback works.
+      // cvc is NOT redacted in fallback (no structural walk on broken JSON).
+      expect(out).toContain('[REDACTED]');
+      expect(out).not.toContain('alice@example.com');
+    });
+
+    it('redacts sensitive form-urlencoded fields by key name', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = 'name=Alice&cvc=424&password=hunter2&color=blue';
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/x-www-form-urlencoded'
+        })
+        .toString('utf8');
+
+      const params = new URLSearchParams(out);
+      expect(params.get('name')).toBe('Alice');
+      expect(params.get('cvc')).toBe('[REDACTED]');
+      expect(params.get('password')).toBe('[REDACTED]');
+      expect(params.get('color')).toBe('blue');
+    });
+
+    it('preserves non-PII bytes verbatim (no spurious changes)', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = JSON.stringify({ kind: 'order', items: 3, total: 45.5 });
+
+      const result = scrubber.scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+        'content-type': 'application/json'
+      });
+
+      // The buffer should be returned unchanged when there's nothing to scrub.
+      expect(result.toString('utf8')).toBe(body);
+    });
+
+    it('redacts deeply-nested PII up to the configured depth cap', () => {
+      const scrubber = new Scrubber(resolveConfig({ serialization: { maxDepth: 8 } }));
+      // Build an object with `cvc` at depth 6 (well within the cap of 8).
+      const body = JSON.stringify({
+        a: { b: { c: { d: { e: { f: { cvc: '123' } } } } } }
+      });
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/json'
+        })
+        .toString('utf8');
+
+      const parsed = JSON.parse(out) as { a: { b: { c: { d: { e: { f: { cvc: string } } } } } } };
+      expect(parsed.a.b.c.d.e.f.cvc).toBe('[REDACTED]');
+    });
+  });
+
   it('does not mutate the input object passed to scrubObject', () => {
     const scrubber = new Scrubber(resolveConfig({}));
     const input = {
