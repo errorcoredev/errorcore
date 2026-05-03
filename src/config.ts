@@ -38,11 +38,26 @@ const DEFAULT_HEADER_ALLOWLIST = [
   'content-type',
   'content-length',
   'accept',
+  'accept-encoding',
   'user-agent',
   'x-request-id',
   'x-correlation-id',
   'host',
-  'traceparent'
+  'traceparent',
+  // Operational headers that aren't PII but materially help debugging.
+  // The blocklist below still filters auth/secret-y values regardless.
+  'idempotency-key',
+  'x-idempotency-key',
+  'etag',
+  'if-match',
+  'if-none-match',
+  'if-modified-since',
+  'if-unmodified-since',
+  'range',
+  'content-range',
+  'vary',
+  'retry-after',
+  'cache-control'
 ];
 
 const DEFAULT_HEADER_BLOCKLIST = [
