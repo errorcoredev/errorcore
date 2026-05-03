@@ -521,7 +521,7 @@ describe('type exports', () => {
     };
     const resolved: ResolvedConfig = resolveTestConfig();
     const errorPackage: ErrorPackage = {
-      schemaVersion: '1.0.0',
+      schemaVersion: '1.1.0',
       capturedAt: '2026-01-01T00:00:00.000Z',
       error: {
         type: errorInfo.type,
@@ -556,7 +556,7 @@ describe('type exports', () => {
     expect(transportConfig.type).toBe('stdout');
     expect(requestSummary.requestId).toBe('req-1');
     expect(processMetadata.pid).toBe(1);
-    expect(errorPackage.schemaVersion).toBe('1.0.0');
+    expect(errorPackage.schemaVersion).toBe('1.1.0');
     expect(limits.maxPayloadSize).toBe(1024);
     expect(resolved.transport.type).toBe('stdout');
   });

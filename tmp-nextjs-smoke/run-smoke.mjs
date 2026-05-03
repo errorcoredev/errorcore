@@ -8,6 +8,10 @@ process.chdir(here);
 
 fs.rmSync('./smoke-errors.ndjson', { force: true });
 
+// Port can be overridden via SMOKE_PORT so a developer with 3099 already
+// bound (another Next.js dev server, an HTTP echo, etc.) is not blocked.
+const port = process.env.SMOKE_PORT || '3099';
+
 console.log('[smoke] building...');
 const build = spawnSync('npx', ['next', 'build'], { stdio: 'inherit', shell: true });
 if (build.status !== 0) {
@@ -15,8 +19,8 @@ if (build.status !== 0) {
   process.exit(1);
 }
 
-console.log('[smoke] starting server...');
-const server = spawn('npx', ['next', 'start', '-p', '3099'], { stdio: 'inherit', shell: true });
+console.log(`[smoke] starting server on port ${port}...`);
+const server = spawn('npx', ['next', 'start', '-p', port], { stdio: 'inherit', shell: true });
 
 // Poll a throwaway request until the server is up. Next.js 14 with `next
 // start` routes the first request through a cold-start path that does not
@@ -27,7 +31,7 @@ const deadline = Date.now() + 30_000;
 let ready = false;
 while (Date.now() < deadline && !ready) {
   try {
-    await fetch('http://localhost:3099/api/test-error');
+    await fetch(`http://localhost:${port}/api/test-error`);
     ready = true;
     break;
   } catch {
@@ -41,7 +45,7 @@ if (!ready) {
 }
 
 // Second, hot-path request — the one the assertions are made against.
-await fetch('http://localhost:3099/api/test-error').catch(() => undefined);
+await fetch(`http://localhost:${port}/api/test-error`).catch(() => undefined);
 
 // Wait for flush interval
 await new Promise((r) => setTimeout(r, 3000));

@@ -50,8 +50,10 @@ Provide the `AsyncLocalStorage`-based request context binding that correlates I/
 
 ### als-manager.ts
 - `require('node:async_hooks').AsyncLocalStorage`
-- `require('node:crypto').randomUUID()`
-- `process.hrtime.bigint()`
+- `require('node:crypto').randomBytes(16)` — trace-id generation (W3C 16 bytes)
+- `require('node:crypto').randomBytes(8)` — span-id generation (W3C 8 bytes)
+- `process.hrtime.bigint()` — `RequestContext.startTime`
+- `process.pid` — request-id prefix (`<pid>-<counter>`, not `randomUUID`)
 
 ### request-tracker.ts
 - `setInterval()` with `.unref()` for TTL sweep
@@ -113,7 +115,7 @@ interface RequestSummary {
 
 - Creates a fresh `AsyncLocalStorage` instance in its constructor. This is a class, NOT a module-level singleton.
 - `createRequestContext` copies values out of the `req` parameter into a new `RequestContext` object. It does NOT store a reference to the original `req` object (GC safety).
-- `requestId` generated via `crypto.randomUUID()`.
+- `requestId` is `<process.pid>-<counter>`, where the counter increments per request and wraps at `Number.MAX_SAFE_INTEGER`. The pid prefix gives cross-process uniqueness without paying for a UUID per request.
 - `startTime` generated via `process.hrtime.bigint()`.
 - `ioEvents`, `stateReads`, and `stateWrites` arrays are initialized empty.
 - `getStore()` exposes the raw `AsyncLocalStorage` instance for use with `diagnostics_channel.channel.bindStore()`.
@@ -127,6 +129,70 @@ When `req.tracestate` is provided:
 3. Store `parsed.inheritedEntries` on `RequestContext.inheritedTracestate` if non-empty (else leave undefined). These are re-emitted by HTTP recorders on egress.
 
 `formatOutboundTracestate()` returns the egress string for the **current** ALS context using `formatTracestate(eventClock.current(), ctx.inheritedTracestate, vendorKey)`. Returns `null` if no ALS context is active. Used by `recording/http-client.ts` and `recording/undici.ts`.
+
+### Traceparent ingest and egress
+
+The `traceparent` HTTP header is parsed on inbound and emitted on outbound following the W3C Trace Context recommendation ([https://www.w3.org/TR/trace-context/](https://www.w3.org/TR/trace-context/)). The ingest path lives in `src/context/als-manager.ts`'s file-local `parseTraceparent`. Egress is `ALSManager.formatTraceparent()`, exposed publicly via `getTraceparent()` on the SDK and on the Next.js subpath.
+
+#### Wire format (version 00)
+
+```
+<version>-<trace-id>-<parent-id>-<trace-flags>
+```
+
+Where:
+
+- `version` is exactly 2 lowercase hex chars. The current implementation emits `00`. On parse, the version is read but does not gate parsing of the remaining fields except as listed under Parse rejection rules.
+- `trace-id` is exactly 32 lowercase hex chars (16 bytes).
+- `parent-id` (a.k.a. span-id of the upstream caller) is exactly 16 lowercase hex chars (8 bytes).
+- `trace-flags` is exactly 2 lowercase hex chars. The full byte (0–255) is preserved in `RequestContext.traceFlags` so unknown bits round-trip across services per W3C §3.2.2.4.
+
+Future W3C versions MAY append additional fields after `trace-flags`. Parsers accept them by ignoring everything after the fourth `-`-delimited part.
+
+#### Parse rejection rules
+
+`parseTraceparent` returns `null` (which causes `createRequestContext` to fall back to a freshly generated trace) in any of the following cases. Every rule is required for W3C compliance and is verified by a unit test in `test/unit/serverless.test.ts`.
+
+| Rule | Source | Behavior |
+|------|--------|----------|
+| Header is `undefined` or empty | (n/a) | `parseTraceparent` returns `null`. `createRequestContext` originates a new trace. |
+| Fewer than 4 `-`-delimited parts | (structural) | Returns `null`. |
+| Version is not 2 lowercase hex chars | W3C §3.2.2.1 | Returns `null`. |
+| Version is `'ff'` | W3C §3.2.2.1 (reserved) | Returns `null`. Parsers MUST NOT use this value. |
+| Trace-id is not 32 lowercase hex chars | W3C §3.2.2.3 | Returns `null`. |
+| Trace-id is all zeros (`'0'.repeat(32)`) | W3C §3.2.2.3 | Returns `null`. The all-zero value is an invalid sentinel and a known sign of a misconfigured propagator. |
+| Parent-id is not 16 lowercase hex chars | W3C §3.2.2.3 | Returns `null`. |
+| Parent-id is all zeros (`'0'.repeat(16)`) | W3C §3.2.2.3 | Returns `null`. Same reasoning as the all-zero trace-id. |
+| Flags are not 2 lowercase hex chars | W3C §3.2.2.4 | Returns `null`. |
+
+Uppercase hex (e.g. `A` instead of `a`) fails the regex check on whichever field contains it. The check is intentionally strict: the W3C spec mandates lowercase and a tolerant parser would mask broken upstream propagators.
+
+#### Trace-flags propagation rule
+
+`RequestContext.traceFlags` carries the **full byte** observed on inbound, not just the sampled bit. On egress, `formatTraceparent` re-emits this byte verbatim. This preserves unknown flag bits across the SDK so that a downstream service which understands a flag bit the SDK does not still sees it on the outbound `traceparent`.
+
+When this request originated the trace (no inbound `traceparent`, or the inbound was rejected per the rules above), `traceFlags` defaults to `0x01` (sampled). The default is `0x01` rather than `0x00` because errorcore is an error-monitoring SDK and wants to capture errors regardless of upstream sampling; setting `0x00` on origination would tell downstream services we explicitly chose not to sample, which is the wrong signal.
+
+Operators who want to mirror an upstream's "do not sample" decision should ensure that upstream emits a valid `traceparent` (with the desired flag byte) so the rule above propagates it.
+
+#### Span-id semantics
+
+On every inbound request, `createRequestContext` generates a fresh `spanId` via `crypto.randomBytes(8).toString('hex')`. The fresh `spanId` represents the new span this request creates. The `parent-id` field on outbound `traceparent` is filled from `RequestContext.spanId` (per W3C §3.2.2.2: "the parent-id of the outgoing request is the span-id of the current operation"). The inbound `parent-id` is preserved on `RequestContext.parentSpanId` for the package's `trace.parentSpanId` field but is NOT used on egress.
+
+#### Generation
+
+When errorcore originates a trace (no inbound or the inbound was rejected):
+
+- `traceId` via `crypto.randomBytes(16).toString('hex')` (32 lowercase hex chars).
+- `spanId` via `crypto.randomBytes(8).toString('hex')` (16 lowercase hex chars).
+- `traceFlags = 0x01`.
+
+The generators use the OS CSPRNG via Node's `crypto` module. The probability that either generator produces an all-zero value is `2^-128` for trace-id and `2^-64` for span-id. We do not assert non-zero on the generated values: at the CSPRNG bit rate this would never trigger on real hardware.
+
+#### Public surface
+
+- `errorcore.getTraceparent(): string | null` — current request's egress `traceparent`. Returns `null` when called outside a request scope.
+- `errorcore/nextjs` re-exports `getTraceparent()`. The edge stub returns `null` unconditionally.
 
 ### RequestTracker
 

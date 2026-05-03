@@ -252,7 +252,7 @@ export class ErrorCapturer {
   };
 
   // Defense-in-depth dedup: when two captureError calls produce the same
-  // (traceId, requestId, fingerprint) within DEDUP_WINDOW_NS, suppress
+  // (traceId, requestId, fingerprint) within DEDUP_WINDOW_MS, suppress
   // the second. Catches user-side double-capture mistakes (e.g. when an
   // error path is wired both into express's default-error and into
   // process.on('unhandledRejection', captureError)).
@@ -420,7 +420,11 @@ export class ErrorCapturer {
           // request's `headers` map has been filtered through the
           // headerAllowlist by the time it reaches the recorder, so it
           // does not retain `tracestate` by default.
-          tracestate: context.inboundTracestate
+          tracestate: context.inboundTracestate,
+          // Module 06: W3C trace-flags byte observed at capture time.
+          // Lets the ingestion backend reason about sampling without
+          // re-parsing the inbound traceparent header.
+          traceFlags: context.traceFlags
         } : undefined,
         sourceMapResolution: sourceMapTelemetry
       };

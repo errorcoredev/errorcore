@@ -80,8 +80,11 @@ function onTimeout() {
   timer = null;
   if (!invocationMeta || !collectorUrl) return;
 
+  // The watchdog payload is a Lambda-timeout-only minimal subset that does
+  // not share a schema with the full ErrorPackage. Use a distinct version
+  // field name so an ingestion backend cannot confuse the two formats.
   const payload = JSON.stringify({
-    schemaVersion: '1.0.0',
+    watchdogPayloadVersion: '1.0.0',
     capturedAt: new Date().toISOString(),
     source: 'watchdog',
     error: lastCapturedError || {

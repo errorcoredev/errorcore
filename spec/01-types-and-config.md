@@ -107,6 +107,7 @@ interface RequestContext {
   traceId: string;
   spanId: string;
   parentSpanId: string | null;
+  traceFlags: number;                       // module 06 — W3C trace-flags byte (0-255)
   /** Internal scratch — not serialized; surfaced into Completeness at package time. */
   completenessOverflow?: { stateWritesDropped: number };
 }

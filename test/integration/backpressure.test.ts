@@ -260,7 +260,13 @@ describe('backpressure contract', () => {
       onInternalWarning: record
     });
 
-    const spy = vi.spyOn(fs, 'appendFileSync').mockImplementationOnce(() => {
+    // The DLQ write path opens the file with `fs.openSync` and writes via
+    // `fs.writeSync` so the data is fsync'd before the append returns. Mock
+    // openSync to fail with ENOSPC to simulate disk-full at the open syscall;
+    // the error code path in appendPayloadSync is the same as if the underlying
+    // appendFileSync had thrown (which is how this test was originally written
+    // before the durability fix).
+    const spy = vi.spyOn(fs, 'openSync').mockImplementationOnce(() => {
       const err = new Error('ENOSPC: no space left on device') as NodeJS.ErrnoException;
       err.code = 'ENOSPC';
       throw err;
@@ -295,7 +301,7 @@ describe('backpressure contract', () => {
       onInternalWarning: record
     });
 
-    const spy = vi.spyOn(fs, 'appendFileSync').mockImplementationOnce(() => {
+    const spy = vi.spyOn(fs, 'openSync').mockImplementationOnce(() => {
       const err = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
       err.code = 'EACCES';
       throw err;

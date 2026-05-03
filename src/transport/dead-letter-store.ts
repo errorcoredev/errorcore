@@ -7,6 +7,40 @@ import { safeConsole } from '../debug-log';
 import { serializeCause } from '../capture/error-capturer';
 import type { InternalWarning, InternalWarningCode } from '../types';
 
+// Append `data` to `filePath` and fsync the file descriptor before
+// returning. Without the fsync a SIGTERM or OS-level crash between
+// write() and the kernel's deferred flush loses payloads that the
+// caller already considered persisted.
+function appendFileSyncDurable(
+  filePath: string,
+  data: string,
+  mode: number
+): void {
+  const fd = fs.openSync(filePath, 'a', mode);
+  try {
+    fs.writeSync(fd, data, null, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Same durability contract for full-file replacement (used by the
+// rotation path that re-signs every entry under the new primary key).
+function writeFileSyncDurable(
+  filePath: string,
+  data: string,
+  mode: number
+): void {
+  const fd = fs.openSync(filePath, 'w', mode);
+  try {
+    fs.writeSync(fd, data, null, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /**
  * Pluggable signer/verifier. The default implementation
  * (createHmacVerifier) is a single-key HMAC-SHA256, identical to the
@@ -337,10 +371,7 @@ export class DeadLetterStore {
           const remaining = lines.slice(sentLineCount).join('\n') + '\n';
           // Write remaining lines back. If a new file was created by
           // appendPayloadSync in the meantime, append to it.
-          fs.appendFileSync(this.filePath, remaining, {
-            encoding: 'utf8',
-            mode: 0o600
-          });
+          appendFileSyncDurable(this.filePath, remaining, 0o600);
         }
 
         // A successful clearSent invalidates our in-memory counter.
@@ -446,10 +477,11 @@ export class DeadLetterStore {
                 mac: this.signEnvelope(input)
               };
 
-        fs.appendFileSync(this.filePath, JSON.stringify(envelope) + '\n', {
-          encoding: 'utf8',
-          mode: 0o600
-        });
+        appendFileSyncDurable(
+          this.filePath,
+          JSON.stringify(envelope) + '\n',
+          0o600
+        );
         return true;
       });
     } catch (error) {
@@ -625,10 +657,11 @@ export class DeadLetterStore {
       }
 
       const tempPath = this.filePath + '.rotating';
-      fs.writeFileSync(tempPath, out.join('\n') + (out.length > 0 ? '\n' : ''), {
-        encoding: 'utf8',
-        mode: 0o600
-      });
+      writeFileSyncDurable(
+        tempPath,
+        out.join('\n') + (out.length > 0 ? '\n' : ''),
+        0o600
+      );
       fs.renameSync(tempPath, this.filePath);
       this.pendingPayloadCount = resigned;
       return { resigned, dropped, markersKept };

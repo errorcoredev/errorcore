@@ -202,6 +202,170 @@ describe('Phase 6: Distributed Trace Propagation', () => {
       const als = new ALSManager();
       expect(als.formatTraceparent()).toBeNull();
     });
+
+    // W3C Trace Context §3.2.2.3: an all-zero trace-id MUST be treated
+    // as invalid and the traceparent dropped. The parser previously
+    // accepted it because the regex check alone matches `0`s.
+    it('rejects all-zero trace-id (W3C §3.2.2.3)', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `00-${'0'.repeat(32)}-${'b'.repeat(16)}-01`
+      });
+      expect(ctx.traceId).not.toBe('0'.repeat(32));
+      expect(ctx.traceId).toMatch(/^[0-9a-f]{32}$/);
+      expect(ctx.parentSpanId).toBeNull();
+    });
+
+    it('rejects all-zero parent-id (W3C §3.2.2.3)', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `00-${'a'.repeat(32)}-${'0'.repeat(16)}-01`
+      });
+      expect(ctx.parentSpanId).toBeNull();
+      expect(ctx.traceId).toMatch(/^[0-9a-f]{32}$/);
+      expect(ctx.traceId).not.toBe('a'.repeat(32));
+    });
+
+    // W3C §3.2.2.1: version 'ff' is reserved; parsers MUST NOT use it.
+    it("rejects version 'ff' (reserved per W3C §3.2.2.1)", () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `ff-${'a'.repeat(32)}-${'b'.repeat(16)}-01`
+      });
+      expect(ctx.traceId).not.toBe('a'.repeat(32));
+      expect(ctx.parentSpanId).toBeNull();
+    });
+
+    it('rejects non-hex version byte', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `gg-${'a'.repeat(32)}-${'b'.repeat(16)}-01`
+      });
+      expect(ctx.traceId).not.toBe('a'.repeat(32));
+      expect(ctx.parentSpanId).toBeNull();
+    });
+
+    it('rejects uppercase hex in trace-id', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `00-${'A'.repeat(32)}-${'b'.repeat(16)}-01`
+      });
+      expect(ctx.traceId).not.toBe('A'.repeat(32));
+      expect(ctx.parentSpanId).toBeNull();
+    });
+
+    it('rejects malformed flags byte', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-zz`
+      });
+      expect(ctx.traceId).not.toBe('a'.repeat(32));
+      expect(ctx.parentSpanId).toBeNull();
+    });
+
+    // Flag propagation: errorcore preserves the inbound trace-flags byte
+    // so unknown bits round-trip across services.
+    it('inherits trace-flags 01 (sampled) from inbound', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`
+      });
+      expect(ctx.traceFlags).toBe(0x01);
+
+      let emitted: string | null = null;
+      als.runWithContext(ctx, () => {
+        emitted = als.formatTraceparent();
+      });
+      expect(emitted).toBe(`00-${'a'.repeat(32)}-${ctx.spanId}-01`);
+    });
+
+    it('inherits trace-flags 00 (not sampled) from inbound', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-00`
+      });
+      expect(ctx.traceFlags).toBe(0x00);
+
+      let emitted: string | null = null;
+      als.runWithContext(ctx, () => {
+        emitted = als.formatTraceparent();
+      });
+      expect(emitted).toBe(`00-${'a'.repeat(32)}-${ctx.spanId}-00`);
+    });
+
+    it('preserves unknown flag bits (e.g. 0x0a) on emit', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-0a`
+      });
+      expect(ctx.traceFlags).toBe(0x0a);
+
+      let emitted: string | null = null;
+      als.runWithContext(ctx, () => {
+        emitted = als.formatTraceparent();
+      });
+      expect(emitted).toBe(`00-${'a'.repeat(32)}-${ctx.spanId}-0a`);
+    });
+
+    it('defaults trace-flags to 01 (sampled) when originating', () => {
+      const als = new ALSManager();
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {}
+      });
+      expect(ctx.traceFlags).toBe(0x01);
+
+      let emitted: string | null = null;
+      als.runWithContext(ctx, () => {
+        emitted = als.formatTraceparent();
+      });
+      expect(emitted).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    });
+
+    // Forward compat: a future version with extra fields after flags
+    // should still parse using the version-00 layout (W3C §3.2.2.2).
+    it('parses unknown future version (>00) with extra trailing fields', () => {
+      const als = new ALSManager();
+      const traceId = 'a'.repeat(32);
+      const parentId = 'b'.repeat(16);
+      const ctx = als.createRequestContext({
+        method: 'GET',
+        url: '/test',
+        headers: {},
+        traceparent: `01-${traceId}-${parentId}-01-future-extension`
+      });
+      expect(ctx.traceId).toBe(traceId);
+      expect(ctx.parentSpanId).toBe(parentId);
+      expect(ctx.traceFlags).toBe(0x01);
+    });
   });
 });
 

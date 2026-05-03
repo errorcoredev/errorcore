@@ -6,11 +6,13 @@ This document describes the data structures, their fields, relationships, and ho
 
 ## ErrorPackage
 
-The top-level structure sent to the collector when an error is captured. Schema version is `1.0.0`.
+The top-level structure sent to the collector when an error is captured. Schema version is `1.1.0`.
+
+The Lambda-timeout watchdog emits a separate, smaller payload that uses a distinct `watchdogPayloadVersion` field (current value `'1.0.0'`) and is documented under "Watchdog payload" below. The two formats do not share a schema.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `schemaVersion` | `'1.0.0'` | Schema version identifier. |
+| `schemaVersion` | `'1.1.0'` | Schema version identifier. |
 | `capturedAt` | `string` | ISO 8601 timestamp of when the error was captured. |
 | `timeAnchor` | `TimeAnchor` | Links wall-clock time to high-resolution time for correlating I/O event timestamps. |
 | `error` | `ErrorInfo` | The captured error. See ErrorInfo below. |
@@ -25,6 +27,7 @@ The top-level structure sent to the collector when an error is captured. Schema 
 | `processMetadata` | `ProcessMetadata` | Process-level information. |
 | `codeVersion` | `object` | Contains `gitSha` (string, optional) and `packageVersion` (string, optional). |
 | `environment` | `Record<string, string>` | Captured environment variables (filtered by allowlist/blocklist). |
+| `trace` | `object` or absent | W3C trace context observed at capture time. Fields: `traceId` (32 lowercase hex), `spanId` (16 lowercase hex), `parentSpanId` (16 lowercase hex or `null`), `tracestate` (string, optional, the inbound `tracestate` header verbatim), `traceFlags` (number 0-255, optional, the W3C trace-flags byte). Absent when no ALS request context was available. |
 | `integrity` | `object` or absent | HMAC-SHA256 signature. Fields: `algorithm` (`'HMAC-SHA256'`), `signature`. |
 | `completeness` | `Completeness` | Describes what was captured, what was truncated, and what failed. |
 
@@ -220,6 +223,35 @@ Describes what the ErrorPackage contains and what was dropped or truncated.
 | `captureFailures` | `string[]` | List of failures encountered during capture. |
 | `rateLimiterDrops` | `object` or absent | If captures were rate-limited: `droppedCount`, `firstDropMs`, `lastDropMs`. |
 | `stateWritesDropped` | `number` or absent | Number of state writes dropped because the per-request cap (`stateTracking.maxWritesPerContext`) was hit. Absent if no overflow occurred. |
+| `localVariablesCaptureLayer` | `'tag' \| 'identity'` or absent | Which correlation layer matched inspector locals to the captured stack frame. `'tag'` is the Symbol-tagged path (Layer 1); `'identity'` is the identity-tuple fallback (Layer 2). Absent when locals were not captured. |
+| `localVariablesDegradation` | `'exact' \| 'dropped_hash' \| 'dropped_count' \| 'background'` or absent | How the locals capture path completed. `'exact'` is the full path; the other values describe degradation modes. |
+| `localVariablesFrameAlignment` | `'full' \| 'prefix_only'` or absent | Whether locals aligned to all stack frames (`'full'`) or only the leading prefix (`'prefix_only'`, Layer 3 fallback). |
+| `sourceMapResolution` | `object` or absent | Source-map resolution telemetry. Fields: `framesResolved`, `framesUnresolved`, `cacheHits`, `cacheMisses`, `missing`, `corrupt`, `evictions`. |
+
+## Watchdog payload
+
+A second payload format is emitted only by the Lambda-timeout watchdog worker thread when an invocation is about to exceed its timeout. It is intentionally minimal because the host process is being torn down and the full capture pipeline cannot run.
+
+```json
+{
+  "watchdogPayloadVersion": "1.0.0",
+  "capturedAt": "2026-04-21T00:00:00.000Z",
+  "source": "watchdog",
+  "error": { "type": "...", "message": "...", "stack": "..." },
+  "invocation": {
+    "functionName": "...",
+    "requestId": "...",
+    "lambdaRequestId": "...",
+    "traceId": "...",
+    "eventSource": "...",
+    "startedAt": "...",
+    "durationMs": 0,
+    "timeoutMs": 0
+  }
+}
+```
+
+The presence of `source: 'watchdog'` is the discriminator. Backends should branch on `source` first; the version field name (`watchdogPayloadVersion` vs `schemaVersion`) is a secondary cue. The watchdog payload is never encrypted and is never written to the dead-letter store.
 
 ## TimeAnchor
 

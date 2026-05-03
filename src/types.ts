@@ -71,6 +71,13 @@ export interface RequestContext {
   traceId: string;
   spanId: string;
   parentSpanId: string | null;
+  /**
+   * W3C trace-flags byte (0-255). Carries the full byte (not just the
+   * sampled bit) so future flag definitions round-trip across services.
+   * Inherited from a valid inbound traceparent; defaults to 0x01
+   * (sampled) when this request originated the trace. See module 06.
+   */
+  traceFlags: number;
   /** Internal scratch — not serialized; surfaced into Completeness at package time. */
   completenessOverflow?: { stateWritesDropped: number };
 }
@@ -320,6 +327,8 @@ export interface ErrorPackage {
     spanId: string;
     parentSpanId: string | null;
     tracestate?: string;
+    /** W3C trace-flags byte observed at capture (0-255). Optional for back-compat. */
+    traceFlags?: number;
   };
   integrity?: {
     algorithm: 'HMAC-SHA256';
@@ -364,6 +373,7 @@ export interface ErrorPackageParts {
     spanId: string;
     parentSpanId: string | null;
     tracestate?: string;
+    traceFlags?: number;
   };
   sourceMapResolution?: {
     framesResolved: number;

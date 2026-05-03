@@ -8,18 +8,48 @@ import type { RequestContext, ResolvedConfig } from '../types';
 
 const DEFAULT_VENDOR_KEY = 'ec';
 
+// W3C Trace Context §3.2.2.3 says the all-zero trace-id and parent-id
+// values are invalid sentinels and the traceparent MUST be dropped. The
+// regex check alone accepts them, so we compare the literal here.
+const TRACE_ID_ALL_ZERO = '00000000000000000000000000000000';
+const PARENT_SPAN_ID_ALL_ZERO = '0000000000000000';
+
 function parseTraceparent(header: string | undefined): {
   traceId: string;
   parentSpanId: string;
+  traceFlags: number;
 } | null {
   if (!header) return null;
   const parts = header.split('-');
+  // W3C version 00 has exactly 4 parts. Future versions MAY append more
+  // fields after trace-flags, so accept >= 4 and ignore the tail.
   if (parts.length < 4) return null;
+
+  const version = parts[0];
   const traceId = parts[1];
   const parentSpanId = parts[2];
-  if (!traceId || traceId.length !== 32 || !parentSpanId || parentSpanId.length !== 16) return null;
-  if (!/^[0-9a-f]{32}$/.test(traceId) || !/^[0-9a-f]{16}$/.test(parentSpanId)) return null;
-  return { traceId, parentSpanId };
+  const flags = parts[3];
+
+  // Version: exactly 2 lowercase hex chars, and 'ff' is reserved as
+  // forbidden by §3.2.2.1. Anything else is treated as a possibly-future
+  // version we attempt to parse using the version-00 layout.
+  if (!version || !/^[0-9a-f]{2}$/.test(version) || version === 'ff') return null;
+
+  // trace-id: 32 lowercase hex chars, not all-zero.
+  if (!traceId || traceId.length !== 32 || !/^[0-9a-f]{32}$/.test(traceId)) return null;
+  if (traceId === TRACE_ID_ALL_ZERO) return null;
+
+  // parent-id: 16 lowercase hex chars, not all-zero.
+  if (!parentSpanId || parentSpanId.length !== 16 || !/^[0-9a-f]{16}$/.test(parentSpanId)) return null;
+  if (parentSpanId === PARENT_SPAN_ID_ALL_ZERO) return null;
+
+  // trace-flags: exactly 2 lowercase hex chars. Preserve the whole byte
+  // so unknown bits round-trip on egress (W3C §3.2.2.4 says implementers
+  // SHOULD propagate flags they do not understand).
+  if (!flags || !/^[0-9a-f]{2}$/.test(flags)) return null;
+  const traceFlags = parseInt(flags, 16);
+
+  return { traceId, parentSpanId, traceFlags };
 }
 
 function generateTraceId(): string {
@@ -73,6 +103,11 @@ export class ALSManager {
     const traceId = parsed?.traceId ?? generateTraceId();
     const spanId = generateSpanId();
     const parentSpanId = parsed?.parentSpanId ?? null;
+    // Honor an inbound flag byte. When we are originating the trace
+    // (no parsed traceparent), default to 0x01 (sampled) so error
+    // monitoring captures even on un-sampled traces. The full byte is
+    // preserved on egress so unknown flag bits propagate.
+    const traceFlags = parsed?.traceFlags ?? 0x01;
 
     // W3C tracestate ingest (module 21): merge any peer clock value before
     // any seq is consumed in this request, so subsequent stamps within this
@@ -102,7 +137,8 @@ export class ALSManager {
       inheritedTracestate,
       traceId,
       spanId,
-      parentSpanId
+      parentSpanId,
+      traceFlags
     };
   }
 
@@ -145,7 +181,10 @@ export class ALSManager {
   public formatTraceparent(): string | null {
     const ctx = this.getContext();
     if (!ctx) return null;
-    return `00-${ctx.traceId}-${ctx.spanId}-01`;
+    // W3C §3.2.2.4: render as 2 lowercase hex chars. ctx.traceFlags is
+    // the byte we observed on inbound (or 0x01 when we originated).
+    const flagsHex = (ctx.traceFlags & 0xff).toString(16).padStart(2, '0');
+    return `00-${ctx.traceId}-${ctx.spanId}-${flagsHex}`;
   }
 
   public getStore(): AsyncLocalStorage<RequestContext> {

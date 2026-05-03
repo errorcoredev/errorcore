@@ -345,7 +345,8 @@ export class PackageBuilder {
         traceId: parts.traceContext.traceId,
         spanId: parts.traceContext.spanId,
         parentSpanId: parts.traceContext.parentSpanId,
-        tracestate: parts.traceContext.tracestate
+        tracestate: parts.traceContext.tracestate,
+        traceFlags: parts.traceContext.traceFlags
       } : undefined,
       completeness: this.computeCompleteness(parts, false, {
         ioTimeline: serializedTimeline,

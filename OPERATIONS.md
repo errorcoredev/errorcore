@@ -145,6 +145,18 @@ The rate limiter tracks captures per window (default: 60 per 60 seconds). When t
 - The drop is counted.
 - The `completeness.rateLimiterDrops` field in the next successful package includes `droppedCount`, `firstDropMs`, and `lastDropMs`.
 
+## Tuning defaults from telemetry
+
+Three defaults are intentionally conservative and are expected to be raised once a deployment has real traffic. The SDK reports each as a counter in `completeness` and `getHealth()` so you can detect when a default is biting before a customer reports it. See `defaults-todo.md` in the repo for the full reasoning.
+
+| Default | Current | Signal that it's too low | Knob to turn |
+|---------|---------|--------------------------|--------------|
+| `rateLimitPerMinute` | 60 | `completeness.rateLimiterDrops.droppedCount > 0` during routine operation, or any `dropped` increment in `getHealth()` attributed to rate limiting. Bursty incidents are the common trigger. | `init({ rateLimitPerMinute: <higher> })` |
+| `bufferSize` (serverless preset) | 50 | `completeness.ioEventsDropped > 0` on captures from serverless functions with sustained concurrency. | `init({ bufferSize: <higher> })` |
+| `maxPayloadSize` | 32 KB | `completeness.ioPayloadsTruncated > 0` when capturing verbose errors that include locals, request bodies, or state writes together. | `init({ serialization: { maxPayloadSize: <higher> } })` |
+
+Don't pre-tune these from synthetic load. Watch the counters under real traffic for at least a week, then raise the relevant knob if the signal is consistent.
+
 ## Transport details
 
 ### HTTP transport

@@ -7,6 +7,28 @@ ship in any minor release and are called out under the BREAKING heading.
 
 ## Unreleased
 
+### Breaking (pre-1.0 semver window)
+
+- The Lambda-timeout watchdog payload now uses the field name
+  `watchdogPayloadVersion` (current value `'1.0.0'`) instead of
+  `schemaVersion`. The watchdog payload is a different shape from the
+  full ErrorPackage and previously reused the `schemaVersion` field
+  with a different value (`'1.0.0'` vs the ErrorPackage's `'1.1.0'`),
+  which would have forced any ingestion backend to disambiguate by
+  inspecting the `source` field while still parsing two distinct
+  schemas under the same field name. Backends that consumed the
+  watchdog payload should branch on `source: 'watchdog'` first. See
+  the new "Watchdog payload" section in `DB.md`.
+- Outbound `traceparent` now propagates the inbound trace-flags byte
+  verbatim instead of unconditionally emitting `01`. When errorcore
+  originates the trace (no inbound `traceparent`, or the inbound was
+  rejected as invalid) it still defaults to `01` (sampled). Unknown
+  flag bits set by upstream services round-trip across the SDK so
+  downstream services can read them. This brings the SDK in line with
+  W3C Trace Context §3.2.2.4. Consumers that depended on always
+  seeing `01` on errorcore-emitted `traceparent` will observe inbound
+  values flow through.
+
 ### Added
 
 - `previousEncryptionKeys: string[]` config — declare prior `encryptionKey`
@@ -60,6 +82,41 @@ ship in any minor release and are called out under the BREAKING heading.
   insertedId }`, so single-document inserts had been recording
   `rowCount: null` since the driver upgrade. Surfaced by the new
   driver-level integration test.
+- `DeadLetterStore` now fsyncs the file descriptor after every append
+  and after the rotation rewrite, so a SIGTERM or OS-level crash
+  between the write and the kernel's deferred flush no longer loses
+  payloads that the caller already considered persisted. Both the
+  hot-path append and the `--rotate` re-sign path go through a small
+  `appendFileSyncDurable` / `writeFileSyncDurable` helper that pairs
+  `openSync` + `writeSync` + `fsyncSync` + `closeSync`. File mode and
+  permissions are unchanged.
+- `tmp-nextjs-smoke/run-smoke.mjs` reads the listening port from
+  `SMOKE_PORT` (default `3099`). A developer with port 3099 already
+  bound is no longer blocked from running the smoke harness, and a
+  collision now fails for the right reason instead of looking like an
+  SDK regression.
+- `parseTraceparent` (in `src/context/als-manager.ts`) now rejects
+  the all-zero trace-id and all-zero parent-id sentinels (W3C
+  §3.2.2.3), version `ff` (reserved per §3.2.2.1), non-hex version
+  bytes, and malformed trace-flags slots. Previously a hostile or
+  misconfigured upstream propagator could feed invalid trace-context
+  values through the SDK because the parser only checked length and
+  hex-charset, missing the explicit invalidity rules. Each rule is
+  documented in `spec/06-request-context.md` and covered by a unit
+  test in `test/unit/serverless.test.ts`.
+- `RequestContext` now carries a `traceFlags: number` field (the W3C
+  trace-flags byte, 0–255). This is internal to the SDK; the public
+  `getTraceparent()` shape is unchanged.
+
+### Added
+
+- `ErrorPackage.trace.traceFlags` (optional `number`) records the W3C
+  trace-flags byte observed at capture. The ingestion backend can
+  reason about sampling intent without re-parsing the inbound
+  `traceparent` header. Schema version stays `'1.1.0'`: the field is
+  additive and optional, and consumers that ignore unknown fields
+  still parse correctly. The matching documentation is in `DB.md`'s
+  ErrorPackage table.
 
 ### Security
 
@@ -88,6 +145,10 @@ ship in any minor release and are called out under the BREAKING heading.
   through the main test runner instead of only `npm run smoke:nextjs`.
 - vitest's global `testTimeout` and `hookTimeout` raised to 90 s to
   accommodate `mongodb-memory-server` cold-start on the first run.
+- `test/unit/types-and-config.test.ts` updated stale `schemaVersion: '1.0.0'`
+  literals to `'1.1.0'` to match the actual `ErrorPackage` type. The test
+  was previously asserting the old schema string, which would have
+  masked a future schema-bump regression.
 - `npm run coverage` (new script) produces a coverage report via
   `@vitest/coverage-v8`. Reporters: text, html, lcov. The report excludes
   `dist/`, `bin/`, `tmp-*/`, `benchmark-harness/`, `perf/`,
@@ -111,6 +172,20 @@ ship in any minor release and are called out under the BREAKING heading.
   validation, and dead-letter recovery, plus the security defaults
   (loopback-only bind, two-layer CSRF guard, constant-time bearer
   compare).
+- `DB.md` now reports the current schema version (`'1.1.0'`, was
+  documented as `'1.0.0'`), documents the four `Completeness` fields
+  added in 0.2.0 (`localVariablesCaptureLayer`,
+  `localVariablesDegradation`, `localVariablesFrameAlignment`,
+  `sourceMapResolution`), and includes a "Watchdog payload" section
+  describing the Lambda-timeout-only payload format and its
+  `watchdogPayloadVersion` field.
+- `OPERATIONS.md` now has a "Tuning defaults from telemetry" section
+  that names the three intentionally conservative defaults
+  (`rateLimitPerMinute`, `bufferSize`, `maxPayloadSize`), the
+  `completeness` and `getHealth()` counters that signal each one is
+  biting, and the config knob to turn. This replaces an unstated
+  expectation that operators would discover the right knob from
+  source code.
 
 ## 0.2.0 (2026-04-21)
 
