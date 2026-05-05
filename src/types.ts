@@ -548,7 +548,7 @@ export type InternalWarningCode =
   | 'EC_SANITIZE_SKIP'
   | 'EC_PAYLOADS_DROPPED'
   | 'EC_PAYLOADS_DEAD_LETTERED'
-  // --- Deprecated snake_case literals (retained for type-level back-compat) ---
+  // Deprecated snake_case literals retained for type-level back-compat.
   | 'rate_limited'
   | 'capture_failed'
   | 'dead_letter_write_failed'
@@ -565,7 +565,7 @@ export type InternalWarningCode =
 export type AggregateWarningCode =
   | 'EC_PAYLOADS_DROPPED'
   | 'EC_PAYLOADS_DEAD_LETTERED'
-  // --- Deprecated snake_case literals (retained for type-level back-compat) ---
+  // Deprecated snake_case literals retained for type-level back-compat.
   | 'errorcore_payloads_dropped'
   | 'errorcore_payloads_dead_lettered';
 

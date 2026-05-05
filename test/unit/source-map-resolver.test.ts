@@ -421,9 +421,9 @@ describe('SourceMapResolver', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Task 16 — Sync-on-miss with 2MB size gate helpers
-// ---------------------------------------------------------------------------
+// Helpers for the Task 16 sync-on-miss path (planning doc:
+// docs/superpowers/plans/2026-04-20-errorcore-gap-fixes.md). The 2 MB gate
+// keeps the synchronous JSON.parse off the hot path for large maps.
 
 function writeSmallValidSourceMap(): { filePath: string; mapPath: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ec-smap-'));

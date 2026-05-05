@@ -106,7 +106,6 @@ async function closeTcp(server: net.Server, sockets?: Set<net.Socket>): Promise<
 }
 
 describe('backpressure contract', () => {
-  // ---------- row 1: transport slow but up → no warning ----------
   it('row 1: transport succeeds after retries, no warning fires', async () => {
     const dir = makeTempDir('slow-but-up');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -154,7 +153,6 @@ describe('backpressure contract', () => {
     }
   }, 20_000);
 
-  // ---------- row 2: transport down -> EC_TRANSPORT_FAILED ----------
   it('row 2: transport failure fires EC_TRANSPORT_FAILED and dead-letters', async () => {
     const dir = makeTempDir('transport-down');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -210,7 +208,6 @@ describe('backpressure contract', () => {
     }
   }, 20_000);
 
-  // ---------- EC_TRANSPORT_TIMEOUT (auxiliary) ----------
   it('transport timeout fires EC_TRANSPORT_TIMEOUT code', async () => {
     const dir = makeTempDir('transport-timeout');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -249,7 +246,6 @@ describe('backpressure contract', () => {
     }
   }, 20_000);
 
-  // ---------- row 3a: DLQ disk full (ENOSPC) -> EC_DISK_FULL ----------
   it('row 3a: DLQ write with ENOSPC fires EC_DISK_FULL', () => {
     const dir = makeTempDir('dlq-enospc');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -290,7 +286,6 @@ describe('backpressure contract', () => {
     }
   });
 
-  // ---------- row 3b: DLQ other errno (EACCES) -> EC_DLQ_WRITE_FAILED ----------
   it('row 3b: DLQ write with EACCES fires EC_DLQ_WRITE_FAILED', () => {
     const dir = makeTempDir('dlq-eacces');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -323,7 +318,6 @@ describe('backpressure contract', () => {
     }
   });
 
-  // ---------- row 4: DLQ at size cap -> EC_DLQ_FULL ----------
   it('row 4: DLQ at size cap fires EC_DLQ_FULL', () => {
     const dir = makeTempDir('dlq-size-cap');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -350,7 +344,6 @@ describe('backpressure contract', () => {
     cleanupTempDir(dir);
   });
 
-  // ---------- DLQ oversized payload (auxiliary) -> EC_DLQ_FULL ----------
   it('DLQ oversized payload fires EC_DLQ_FULL', () => {
     const dir = makeTempDir('dlq-oversized');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -378,7 +371,6 @@ describe('backpressure contract', () => {
     cleanupTempDir(dir);
   });
 
-  // ---------- row 5: invalid encryption key → throws, no callback ----------
   it('row 5: invalid encryption key throws at createSDK; callback does not fire', () => {
     const { warnings, record } = makeRecorder();
 
@@ -405,7 +397,6 @@ describe('backpressure contract', () => {
     expect(warnings).toHaveLength(0);
   });
 
-  // ---------- row 6: rate limit hit -> EC_RATE_LIMITED ----------
   it('row 6: rate limit hit fires EC_RATE_LIMITED and recovers after window', async () => {
     const dir = makeTempDir('rate-limit');
     const dlqPath = path.join(dir, 'dlq.ndjson');
@@ -443,7 +434,6 @@ describe('backpressure contract', () => {
     }
   }, 20_000);
 
-  // ---------- auxiliary: real-fs skip on Windows ----------
   test.skipIf(process.platform === 'win32')(
     'real-fs readonly directory produces a DLQ warning',
     () => {

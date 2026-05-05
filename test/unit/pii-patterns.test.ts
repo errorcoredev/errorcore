@@ -23,10 +23,6 @@ function testRegex(regex: RegExp, input: string): string[] {
   return Array.from(input.matchAll(regex), (m) => m[0]);
 }
 
-// ---------------------------------------------------------------------------
-// isValidLuhn
-// ---------------------------------------------------------------------------
-
 describe('isValidLuhn', () => {
   it.each([
     ['valid Visa', '4111111111111111', true],
@@ -40,10 +36,6 @@ describe('isValidLuhn', () => {
     expect(isValidLuhn(input)).toBe(expected);
   });
 });
-
-// ---------------------------------------------------------------------------
-// EMAIL_REGEX
-// ---------------------------------------------------------------------------
 
 describe('EMAIL_REGEX', () => {
   it.each([
@@ -62,10 +54,6 @@ describe('EMAIL_REGEX', () => {
     }
   );
 });
-
-// ---------------------------------------------------------------------------
-// CREDIT_CARD_REGEX
-// ---------------------------------------------------------------------------
 
 describe('CREDIT_CARD_REGEX', () => {
   it('matches 13-digit sequence', () => {
@@ -91,10 +79,6 @@ describe('CREDIT_CARD_REGEX', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// SSN_REGEX
-// ---------------------------------------------------------------------------
-
 describe('SSN_REGEX', () => {
   it('matches NNN-NN-NNNN', () => {
     expect(testRegex(SSN_REGEX, 'ssn 123-45-6789 end')).toEqual([
@@ -108,10 +92,6 @@ describe('SSN_REGEX', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// JWT_REGEX
-// ---------------------------------------------------------------------------
-
 describe('JWT_REGEX', () => {
   it('matches a JWT-shaped token', () => {
     const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123_-XYZ';
@@ -122,10 +102,6 @@ describe('JWT_REGEX', () => {
     expect(testRegex(JWT_REGEX, 'eyJnotajwt')).toEqual([]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// BEARER_REGEX
-// ---------------------------------------------------------------------------
 
 describe('BEARER_REGEX', () => {
   it('matches Bearer token', () => {
@@ -139,10 +115,6 @@ describe('BEARER_REGEX', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// BASIC_AUTH_REGEX
-// ---------------------------------------------------------------------------
-
 describe('BASIC_AUTH_REGEX', () => {
   it('matches Basic base64 value', () => {
     const matches = testRegex(BASIC_AUTH_REGEX, 'Authorization: Basic dXNlcjpwYXNz');
@@ -154,10 +126,6 @@ describe('BASIC_AUTH_REGEX', () => {
     expect(testRegex(BASIC_AUTH_REGEX, 'Basic abc123==')).toHaveLength(1);
   });
 });
-
-// ---------------------------------------------------------------------------
-// AWS_ACCESS_KEY_REGEX
-// ---------------------------------------------------------------------------
 
 describe('AWS_ACCESS_KEY_REGEX', () => {
   it('matches AKIA key', () => {
@@ -177,10 +145,6 @@ describe('AWS_ACCESS_KEY_REGEX', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// GITHUB_TOKEN_REGEX
-// ---------------------------------------------------------------------------
-
 describe('GITHUB_TOKEN_REGEX', () => {
   it.each([
     ['ghp_ prefix', `ghp_${'a'.repeat(36)}`],
@@ -194,10 +158,6 @@ describe('GITHUB_TOKEN_REGEX', () => {
     expect(testRegex(GITHUB_TOKEN_REGEX, `ghx_${'a'.repeat(36)}`)).toEqual([]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// STRIPE_KEY_REGEX
-// ---------------------------------------------------------------------------
 
 describe('STRIPE_KEY_REGEX', () => {
   it.each([
@@ -213,10 +173,6 @@ describe('STRIPE_KEY_REGEX', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// GENERIC_SK_KEY_REGEX
-// ---------------------------------------------------------------------------
-
 describe('GENERIC_SK_KEY_REGEX', () => {
   it('matches sk- followed by 10+ chars', () => {
     expect(testRegex(GENERIC_SK_KEY_REGEX, 'sk-abcdefghij')).toHaveLength(1);
@@ -226,10 +182,6 @@ describe('GENERIC_SK_KEY_REGEX', () => {
     expect(testRegex(GENERIC_SK_KEY_REGEX, 'sk-short')).toEqual([]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// PHONE_REGEX
-// ---------------------------------------------------------------------------
 
 describe('PHONE_REGEX', () => {
   it.each([
@@ -250,10 +202,6 @@ describe('PHONE_REGEX', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// IPV4_REGEX
-// ---------------------------------------------------------------------------
-
 describe('IPV4_REGEX', () => {
   it.each(['192.168.1.1', '10.0.0.1', '255.255.255.0'])(
     'matches %s',
@@ -266,10 +214,6 @@ describe('IPV4_REGEX', () => {
     expect(testRegex(IPV4_REGEX, '192.168.1')).toEqual([]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// SENSITIVE_KEY_EXACT_MATCHES
-// ---------------------------------------------------------------------------
 
 describe('SENSITIVE_KEY_EXACT_MATCHES', () => {
   it.each([
@@ -295,10 +239,6 @@ describe('SENSITIVE_KEY_EXACT_MATCHES', () => {
     expect(SENSITIVE_KEY_EXACT_MATCHES.has('username')).toBe(false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// SENSITIVE_KEY_REGEX
-// ---------------------------------------------------------------------------
 
 describe('SENSITIVE_KEY_REGEX', () => {
   it.each([

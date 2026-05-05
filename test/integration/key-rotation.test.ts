@@ -26,16 +26,14 @@ describe('dead-letter store key rotation', () => {
   });
 
   it('writes under PREV, then verifies and drains under PRIMARY+PREV chain', () => {
-    // 1. Old SDK: write a payload using PREV.
     const oldStore = new DeadLetterStore(dlqPath, { integrityKey: PREV });
     expect(oldStore.appendPayloadSync('{"err":"old"}')).toBe(true);
     expect(oldStore.getPendingCount()).toBe(1);
 
-    // 2. New SDK: rotate. Use the PRIMARY-key Encryption with PREV in
-    //    the chain to power the verifier. But this won't match because
-    //    Encryption uses derived HMAC keys while the old store wrote a
-    //    raw-HMAC-over-PREV signature. Instead, build a chain of two
-    //    raw-HMAC verifiers.
+    // Rotation gotcha: handing PRIMARY+PREV to a fresh Encryption won't
+    // verify the old entry. Encryption derives HMAC keys via PBKDF2, but
+    // the legacy store wrote a raw HMAC over PREV. We chain two raw-HMAC
+    // verifiers to bridge that until reSignAll runs.
     const verifier = {
       sign: (p: string) => createHmacVerifier(PRIMARY).sign(p),
       verifyKeyIndex: (p: string, m: string) => {
