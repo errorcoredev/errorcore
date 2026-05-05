@@ -84,8 +84,12 @@ describe('resolveConfig', () => {
       ],
       envBlocklist: [/key|secret|token|password|credential|auth|private/i],
       encryptionKey: undefined,
+      macKey: undefined,
+      encryptionKeyCallback: undefined,
       previousEncryptionKeys: [],
       allowUnencrypted: true, // set explicitly by resolveTestConfig
+      allowProductionPlaintext: false,
+      hardCapBytes: 1_048_576,
       transport: { type: 'stdout' },
       captureLocalVariables: false,
       captureDbBindParams: false,

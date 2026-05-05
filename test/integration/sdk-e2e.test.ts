@@ -87,19 +87,18 @@ function readDeliveredPackage(filePath: string, encryptionKey?: string) {
   const payloadLine = content.split('\n').filter(Boolean).at(-1);
   expect(payloadLine).toBeDefined();
 
+  const envelope = JSON.parse(payloadLine as string) as import('../../src/types').EncryptedEnvelope;
+
   if (encryptionKey === undefined) {
-    return JSON.parse(payloadLine as string);
+    // Transparent envelope: ciphertext holds base64(plaintext-package).
+    expect(envelope.iv).toBe('unencrypted');
+    return JSON.parse(Buffer.from(envelope.ciphertext, 'base64').toString('utf8'));
   }
 
-  const decrypted = new Encryption(encryptionKey).decrypt(
-    JSON.parse(payloadLine as string) as {
-      salt: string;
-      iv: string;
-      ciphertext: string;
-      authTag: string;
-    }
-  );
-
+  // The producing SDK records its version on the envelope; mirror it on
+  // the decrypt-side Encryption so the AAD binding matches.
+  const sdkVersion = envelope.sdk.version;
+  const decrypted = new Encryption(encryptionKey, { sdkVersion }).decrypt(envelope);
   return JSON.parse(decrypted);
 }
 

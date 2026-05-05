@@ -632,8 +632,11 @@ describe('PackageBuilder', () => {
       config
     });
 
+    // Each build() mints a fresh eventId, so structural-equality on the
+    // packageObject must ignore eventId + capturedAt/receivedAt.
     expect(sharedResult.packageObject).toMatchObject({
       ...inlineResult.packageObject,
+      eventId: expect.any(String),
       capturedAt: expect.any(String),
       request: inlineResult.packageObject.request
         ? {
@@ -642,16 +645,18 @@ describe('PackageBuilder', () => {
           }
         : undefined
     });
-    expect(JSON.parse(sharedResult.payload)).toMatchObject({
-      ...JSON.parse(inlineResult.payload),
-      capturedAt: expect.any(String),
-      request: inlineResult.packageObject.request
-        ? {
-            ...JSON.parse(inlineResult.payload).request,
-            receivedAt: expect.any(String)
-          }
-        : undefined
+    // The wire payload is now the JSON-stringified envelope. Both helpers
+    // emit the same shape; the inner ciphertext differs because each
+    // capture has its own eventId/iv.
+    const inlineEnv = JSON.parse(inlineResult.payload);
+    const sharedEnv = JSON.parse(sharedResult.payload);
+    expect(sharedEnv).toMatchObject({
+      v: inlineEnv.v,
+      sdk: inlineEnv.sdk,
+      compressed: expect.any(Boolean)
     });
+    expect(typeof sharedEnv.eventId).toBe('string');
+    expect(typeof sharedEnv.ciphertext).toBe('string');
   });
 
   it('assembles packages through the dispatcher worker contract and shuts down cleanly', async () => {
@@ -684,9 +689,10 @@ describe('PackageBuilder', () => {
     const result = await dispatcher.assemble(parts);
 
     expect(result.packageObject.request?.id).toBe('req-dispatch');
-    expect(JSON.parse(result.payload)).toMatchObject({
-      schemaVersion: '1.1.0'
-    });
+    expect(result.packageObject.schemaVersion).toBe('1.1.0');
+    const envelope = JSON.parse(result.payload);
+    expect(envelope.v).toBe(1);
+    expect(typeof envelope.eventId).toBe('string');
 
     await dispatcher.shutdown();
   });
@@ -965,16 +971,17 @@ describe('ErrorCapturer', () => {
     await flushMicrotasks();
 
     const sentPayload = transport.send.mock.calls[0]?.[0] as string;
-    const decrypted = encryption.decrypt(JSON.parse(sentPayload) as {
-      salt: string;
-      iv: string;
-      ciphertext: string;
-      authTag: string;
-    });
+    const envelope = JSON.parse(sentPayload) as import('../../src/types').EncryptedEnvelope;
+    expect(envelope.v).toBe(1);
+    expect(typeof envelope.eventId).toBe('string');
+    expect(envelope.keyId).toMatch(/^[0-9a-f]{16}$/);
+    const decrypted = encryption.decrypt(envelope);
 
     expect(pkg).not.toBeNull();
     expect(pkg?.completeness.encrypted).toBe(true);
-    expect(pkg?.integrity?.algorithm).toBe('HMAC-SHA256');
+    // The pre-0.3 `integrity` field is removed; the outer HMAC lives on
+    // the envelope, not in the package plaintext.
+    expect((pkg as unknown as { integrity?: unknown })?.integrity).toBeUndefined();
     expect(pkg?.request?.id).toBe('req-err');
     expect(pkg?.ioTimeline).toHaveLength(1);
     expect(pkg?.completeness.usedAmbientEvents).toBe(false);

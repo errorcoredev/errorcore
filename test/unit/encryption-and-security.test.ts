@@ -5,54 +5,92 @@ import { RateLimiter } from '../../src/security/rate-limiter';
 
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 
-describe('Encryption', () => {
-  it('round-trips plaintext through encrypt and decrypt', () => {
-    const encryption = new Encryption('top-secret-key');
-    const payload = encryption.encrypt('hello world');
+function makeEnv(eventId = 'evt-test'): { eventId: string } {
+  return { eventId };
+}
 
-    expect(encryption.decrypt(payload)).toBe('hello world');
+function buf(s: string): Buffer {
+  return Buffer.from(s, 'utf8');
+}
+
+describe('Encryption', () => {
+  it('round-trips plaintext through encryptToEnvelope and decrypt', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const env = encryption.encryptToEnvelope(buf('hello world'), makeEnv());
+
+    expect(encryption.decrypt(env)).toBe('hello world');
   });
 
-  it('produces different encrypted payloads for different keys', () => {
-    const first = new Encryption('key-one').encrypt('same plaintext');
-    const second = new Encryption('key-two').encrypt('same plaintext');
+  it('produces different envelopes for different keys', () => {
+    const first = new Encryption('key-one', { sdkVersion: '0.3.0' })
+      .encryptToEnvelope(buf('same plaintext'), makeEnv('evt-1'));
+    const second = new Encryption('key-two', { sdkVersion: '0.3.0' })
+      .encryptToEnvelope(buf('same plaintext'), makeEnv('evt-1'));
 
-    expect(first).not.toEqual(second);
+    expect(first.ciphertext).not.toEqual(second.ciphertext);
+    expect(first.keyId).not.toEqual(second.keyId);
   });
 
   it('fails to decrypt with the wrong key', () => {
-    const payload = new Encryption('right-key').encrypt('secret');
-    const wrongEncryption = new Encryption('wrong-key');
+    const env = new Encryption('right-key', { sdkVersion: '0.3.0' })
+      .encryptToEnvelope(buf('secret'), makeEnv());
+    const wrongEncryption = new Encryption('wrong-key', { sdkVersion: '0.3.0' });
 
-    expect(() => wrongEncryption.decrypt(payload)).toThrow();
+    expect(() => wrongEncryption.decrypt(env)).toThrow(/EC_DECRYPT_HMAC_MISMATCH/);
   });
 
   it('fails to decrypt tampered ciphertext', () => {
-    const encryption = new Encryption('top-secret-key');
-    const payload = encryption.encrypt('secret');
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const env = encryption.encryptToEnvelope(buf('secret'), makeEnv());
 
     expect(() =>
       encryption.decrypt({
-        ...payload,
-        ciphertext: `${payload.ciphertext.slice(0, -2)}AA`
+        ...env,
+        ciphertext: `${env.ciphertext.slice(0, -2)}AA`
       })
-    ).toThrow();
+    ).toThrow(/EC_DECRYPT/);
+  });
+
+  it('rejects an envelope tampered in the outer HMAC before the GCM authTag is consulted', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const env = encryption.encryptToEnvelope(buf('secret'), makeEnv());
+
+    expect(() =>
+      encryption.decrypt({
+        ...env,
+        hmac: Buffer.alloc(32, 0).toString('base64')
+      })
+    ).toThrow(/EC_DECRYPT_HMAC_MISMATCH/);
+  });
+
+  it('binds AAD: corrupting eventId fails decryption', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const env = encryption.encryptToEnvelope(buf('secret'), makeEnv('orig-id'));
+
+    expect(() => encryption.decrypt({ ...env, eventId: 'tampered-id' })).toThrow();
   });
 
   it('encrypts and decrypts an empty string', () => {
-    const encryption = new Encryption('top-secret-key');
-    const payload = encryption.encrypt('');
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const env = encryption.encryptToEnvelope(buf(''), makeEnv());
 
-    expect(encryption.decrypt(payload)).toBe('');
+    expect(encryption.decrypt(env)).toBe('');
   });
 
-  it('returns all required base64 fields', () => {
-    const payload = new Encryption('top-secret-key').encrypt('payload');
+  it('returns all required envelope fields', () => {
+    const env = new Encryption('top-secret-key', { sdkVersion: '0.3.0' })
+      .encryptToEnvelope(buf('payload'), makeEnv('evt-x'));
 
-    expect(payload.salt).toMatch(BASE64_REGEX);
-    expect(payload.iv).toMatch(BASE64_REGEX);
-    expect(payload.ciphertext).toMatch(BASE64_REGEX);
-    expect(payload.authTag).toMatch(BASE64_REGEX);
+    expect(env.v).toBe(1);
+    expect(env.eventId).toBe('evt-x');
+    expect(env.sdk).toEqual({ name: 'errorcore', version: '0.3.0' });
+    expect(env.keyId).toMatch(/^[0-9a-f]{16}$/);
+    expect(env.iv).toMatch(BASE64_REGEX);
+    expect(env.ciphertext).toMatch(BASE64_REGEX);
+    expect(env.authTag).toMatch(BASE64_REGEX);
+    expect(env.hmac).toMatch(BASE64_REGEX);
+    expect(env.compressed).toBe(false);
+    expect(typeof env.producedAt).toBe('number');
   });
 
   it('rejects an empty encryption key', () => {
@@ -60,13 +98,11 @@ describe('Encryption', () => {
   });
 
   it('produces different IVs and ciphertexts for the same plaintext on the same instance', () => {
-    const encryption = new Encryption('top-secret-key');
-    const first = encryption.encrypt('identical plaintext');
-    const second = encryption.encrypt('identical plaintext');
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const first = encryption.encryptToEnvelope(buf('identical plaintext'), makeEnv('a'));
+    const second = encryption.encryptToEnvelope(buf('identical plaintext'), makeEnv('b'));
 
-    // Salt is static per instance (key derived once at construction).
-    // Per-message uniqueness is ensured via random IVs.
-    expect(first.salt).toBe(second.salt);
+    expect(first.keyId).toBe(second.keyId);
     expect(first.ciphertext).not.toBe(second.ciphertext);
     expect(first.iv).not.toBe(second.iv);
 
@@ -74,8 +110,22 @@ describe('Encryption', () => {
     expect(encryption.decrypt(second)).toBe('identical plaintext');
   });
 
+  it('compresses payloads above the 8 KB threshold', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const small = encryption.encryptToEnvelope(buf('x'.repeat(100)), makeEnv('s'));
+    const large = encryption.encryptToEnvelope(buf('x'.repeat(20_000)), makeEnv('l'));
+
+    expect(small.compressed).toBe(false);
+    expect(large.compressed).toBe(true);
+    // Compressed envelope of highly-redundant input MUST be smaller than
+    // the raw plaintext base64'd.
+    const rawBase64Length = Buffer.from('x'.repeat(20_000)).toString('base64').length;
+    expect(large.ciphertext.length).toBeLessThan(rawBase64Length);
+    expect(encryption.decrypt(large)).toBe('x'.repeat(20_000));
+  });
+
   it('signs payloads deterministically and without exposing the HMAC key', () => {
-    const encryption = new Encryption('top-secret-key');
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
 
     const first = encryption.sign('hello');
     const second = encryption.sign('hello');
@@ -86,23 +136,19 @@ describe('Encryption', () => {
     expect(first).not.toBe(different);
 
     // The HMAC key must not be reachable from outside the class.
-    // getHmacKeyHex() was removed to close the public key exposure.
     expect((encryption as unknown as { getHmacKeyHex?: unknown }).getHmacKeyHex)
       .toBeUndefined();
     expect((Encryption.prototype as unknown as { getHmacKeyHex?: unknown }).getHmacKeyHex)
       .toBeUndefined();
   });
 
-  it('verifies sign against Node createHmac using a key derived the same way', async () => {
-    // This test guarantees we did not accidentally change HMAC derivation.
-    // If it breaks, existing dead-letter signatures on disk will stop
-    // verifying.
+  it('verifies sign against Node createHmac using the v1 mac salt', async () => {
     const { createHmac, pbkdf2Sync } = await import('node:crypto');
 
-    const encryption = new Encryption('top-secret-key');
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
     const expectedKey = pbkdf2Sync(
       Buffer.from('top-secret-key', 'utf8'),
-      Buffer.from('errorcore-v1-hmac-key', 'utf8'),
+      Buffer.from('errorcore-v1-mac-key', 'utf8'),
       100000,
       32,
       'sha256'
@@ -114,35 +160,17 @@ describe('Encryption', () => {
     expect(encryption.sign('payload')).toBe(expectedSig);
   });
 
-  it('decrypts legacy per-message-salt payloads without a salt timing oracle', () => {
-    // Old payload format used a random per-message salt; we must still
-    // decrypt those. Comparison between the embedded salt and the static
-    // keySalt is constant-time.
-    const { pbkdf2Sync, createCipheriv, randomBytes } = require('node:crypto') as typeof import('node:crypto');
+  it('rejects an explicit MAC key shorter than 32 bytes', () => {
+    expect(() => new Encryption('top-secret-key', { macKey: 'short' }))
+      .toThrow(/EC_MAC_KEY_TOO_SHORT/);
+  });
 
-    const secret = 'legacy-key';
-    const legacySalt = randomBytes(16); // pre-static-salt scheme
-    const legacyDerivedKey = pbkdf2Sync(
-      Buffer.from(secret, 'utf8'),
-      legacySalt,
-      100000,
-      32,
-      'sha256'
-    );
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', legacyDerivedKey, iv);
-    const ciphertext = Buffer.concat([cipher.update('legacy', 'utf8'), cipher.final()]);
-    const authTag = cipher.getAuthTag();
+  it('rejects unknown envelope versions', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
+    const env = encryption.encryptToEnvelope(buf('hi'), makeEnv());
 
-    const legacyPayload = {
-      salt: legacySalt.toString('base64'),
-      iv: iv.toString('base64'),
-      ciphertext: ciphertext.toString('base64'),
-      authTag: authTag.toString('base64')
-    };
-
-    const encryption = new Encryption(secret);
-    expect(encryption.decrypt(legacyPayload)).toBe('legacy');
+    expect(() => encryption.decrypt({ ...env, v: 2 as 1 }))
+      .toThrow(/EC_DECRYPT_UNKNOWN_VERSION/);
   });
 });
 

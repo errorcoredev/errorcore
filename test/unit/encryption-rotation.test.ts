@@ -31,10 +31,10 @@ describe('Encryption with key rotation', () => {
     expect(result.ok).toBe(false);
   });
 
-  it('encrypts with the primary key and decrypts via tryDecrypt', () => {
-    const enc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV] });
-    const env = enc.encrypt('hello');
-    const result = enc.tryDecrypt(env);
+  it('encrypts with the primary key and decrypts via decryptEnvelope', () => {
+    const enc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV], sdkVersion: '0.3.0' });
+    const env = enc.encryptToEnvelope(Buffer.from('hello', 'utf8'), { eventId: 'evt-rot-1' });
+    const result = enc.decryptEnvelope(env);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.plaintext).toBe('hello');
@@ -43,16 +43,25 @@ describe('Encryption with key rotation', () => {
   });
 
   it('decrypts an envelope produced by a previous key', () => {
-    const oldEnc = new Encryption(PREV);
-    const env = oldEnc.encrypt('legacy payload');
+    const oldEnc = new Encryption(PREV, { sdkVersion: '0.3.0' });
+    const env = oldEnc.encryptToEnvelope(Buffer.from('legacy payload', 'utf8'), { eventId: 'evt-rot-2' });
 
-    const newEnc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV] });
-    const result = newEnc.tryDecrypt(env);
+    const newEnc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV], sdkVersion: '0.3.0' });
+    const result = newEnc.decryptEnvelope(env);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.plaintext).toBe('legacy payload');
       expect(result.keyIndex).toBe(1);
     }
+  });
+
+  it('routes via keyId so a previous-key envelope is decrypted directly', () => {
+    const oldEnc = new Encryption(PREV, { sdkVersion: '0.3.0' });
+    const env = oldEnc.encryptToEnvelope(Buffer.from('routed', 'utf8'), { eventId: 'evt-rot-3' });
+    expect(env.keyId).toMatch(/^[0-9a-f]{16}$/);
+
+    const newEnc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV], sdkVersion: '0.3.0' });
+    expect(newEnc.decrypt(env)).toBe('routed');
   });
 
   it('preserves backward compatibility when called with a single key (no options)', () => {

@@ -11,8 +11,10 @@ interface StartupMetadata {
   platform: string;
   arch: string;
   pid: number;
+  ppid?: number;
   hostname: string;
   containerId?: string;
+  deploymentEnv?: string;
 }
 
 interface RuntimeMetadata {
@@ -69,11 +71,21 @@ export class ProcessMetadata {
       platform: process.platform,
       arch: process.arch,
       pid: process.pid,
+      ppid: process.ppid,
       hostname: this.readHostname(),
-      containerId: this.readContainerId()
+      containerId: this.readContainerId(),
+      // Spec §5: prefer explicit config, then ERRORCORE_ENVIRONMENT,
+      // then nothing. NODE_ENV is intentionally NOT used as a fallback —
+      // operators routinely set NODE_ENV=production in non-prod fleets
+      // (preview, staging) and the resulting label is misleading.
+      deploymentEnv:
+        this.config.deploymentEnv ??
+        process.env.ERRORCORE_ENVIRONMENT ??
+        undefined
     };
     this.codeVersion = {
       gitSha:
+        process.env.ERRORCORE_RELEASE ??
         process.env.GIT_SHA ??
         process.env.COMMIT_SHA ??
         process.env.SOURCE_VERSION ??
@@ -167,10 +179,15 @@ export class ProcessMetadata {
     return { ...this.environment };
   }
 
+  public getProcessStartAnchor(): TimeAnchor {
+    return { ...this.timeAnchor };
+  }
+
   public getMergedMetadata(): ProcessMetadataShape {
     return {
       ...this.getStartupMetadata(),
-      ...this.getRuntimeMetadata()
+      ...this.getRuntimeMetadata(),
+      processStartAnchor: this.getProcessStartAnchor()
     };
   }
 

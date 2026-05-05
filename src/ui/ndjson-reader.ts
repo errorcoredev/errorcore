@@ -218,9 +218,12 @@ export class NdjsonReader {
         this.encryption !== null &&
         typeof parsed === 'object' &&
         parsed !== null &&
-        'ciphertext' in parsed
+        'ciphertext' in parsed &&
+        'v' in parsed
       ) {
-        const decrypted = this.encryption.decrypt(parsed);
+        // New EncryptedEnvelope shape (v=1). The decrypt() method walks
+        // the rotation chain via keyId; throws on HMAC/authTag failure.
+        const decrypted = this.encryption.decrypt(parsed as import('../types').EncryptedEnvelope);
         return JSON.parse(decrypted);
       }
 

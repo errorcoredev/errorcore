@@ -310,9 +310,17 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     );
   }
 
+  // The DEK can come from config.encryptionKey, the ERRORCORE_DEK env
+  // var, or an async callback. Validate the explicit-config form here;
+  // the env-var path is read at SDK init.
+  const resolvedEncryptionKey = userConfig.encryptionKey
+    ?? (process.env.ERRORCORE_DEK !== undefined && process.env.ERRORCORE_DEK !== ''
+      ? process.env.ERRORCORE_DEK
+      : undefined);
+
   if (
-    userConfig.encryptionKey !== undefined &&
-    !/^[0-9a-f]{64}$/i.test(userConfig.encryptionKey)
+    resolvedEncryptionKey !== undefined &&
+    !/^[0-9a-f]{64}$/i.test(resolvedEncryptionKey)
   ) {
     throw new Error(
       'encryptionKey must be a 64-character hex string (32 bytes). ' +
@@ -321,13 +329,31 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     );
   }
 
-  if (userConfig.encryptionKey !== undefined) {
+  if (
+    userConfig.macKey !== undefined &&
+    !/^[0-9a-f]{64}$/i.test(userConfig.macKey)
+  ) {
+    throw new Error(
+      'macKey must be a 64-character hex string (32 bytes). ' +
+      'Generate one with: ' +
+      'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
+    );
+  }
+
+  if (
+    userConfig.encryptionKeyCallback !== undefined &&
+    typeof userConfig.encryptionKeyCallback !== 'function'
+  ) {
+    throw new Error('encryptionKeyCallback must be a function or undefined');
+  }
+
+  if (resolvedEncryptionKey !== undefined) {
     // Shannon entropy over the hex alphabet (max 4.0 bits per character).
     // A uniformly random 32-byte hex key scores ~3.93. Threshold of 3.5
     // rejects trivially repetitive keys (all-zeros, single-letter, short
     // repeating patterns) while still passing any key generated from
     // crypto.randomBytes.
-    const characterDistribution = hexKeyEntropy(userConfig.encryptionKey);
+    const characterDistribution = hexKeyEntropy(resolvedEncryptionKey);
     if (characterDistribution < 3.5) {
       throw new Error(
         'encryptionKey has insufficient character diversity (all-zeros, repeated characters, or trivially predictable). ' +
@@ -541,6 +567,31 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     );
   }
 
+  // §A14 production guard. If we're in production, posting via HTTP, with
+  // allowUnencrypted: true, with no DEK from any source, and no explicit
+  // allowProductionPlaintext: true, the SDK refuses to start. The triple-
+  // flag combo is intentional friction. The KMS-callback path counts as
+  // "key configured" because the SDK will resolve a real DEK at activate().
+  const allowUnencryptedResolved = userConfig.allowUnencrypted ?? !isProduction();
+  const allowProductionPlaintextResolved = userConfig.allowProductionPlaintext ?? false;
+  const hasResolvableKey =
+    resolvedEncryptionKey !== undefined ||
+    userConfig.encryptionKeyCallback !== undefined;
+  if (
+    isProduction() &&
+    transport.type === 'http' &&
+    allowUnencryptedResolved &&
+    !hasResolvableKey &&
+    !allowProductionPlaintextResolved
+  ) {
+    throw new Error(
+      'EC_PRODUCTION_PLAINTEXT_BYPASS: Refusing to start in production with HTTP transport, ' +
+      'allowUnencrypted: true, and no encryption key (config, ERRORCORE_DEK, or encryptionKeyCallback). ' +
+      'Either configure a DEK, or set allowProductionPlaintext: true to acknowledge plaintext-on-the-wire ' +
+      'in production (not recommended).'
+    );
+  }
+
   return {
     bufferSize,
     bufferMaxBytes,
@@ -552,7 +603,9 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     headerBlocklist: [...(userConfig.headerBlocklist ?? DEFAULT_HEADER_BLOCKLIST)],
     envAllowlist: [...(userConfig.envAllowlist ?? DEFAULT_ENV_ALLOWLIST)],
     envBlocklist: [...(userConfig.envBlocklist ?? DEFAULT_ENV_BLOCKLIST)],
-    encryptionKey: userConfig.encryptionKey,
+    encryptionKey: resolvedEncryptionKey,
+    macKey: userConfig.macKey,
+    encryptionKeyCallback: userConfig.encryptionKeyCallback,
     previousEncryptionKeys: [...previousEncryptionKeys],
     // Default matches the transport default above (isProduction() gate): in
     // development (NODE_ENV !== 'production') plaintext is allowed and the
@@ -560,6 +613,8 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     // is required. Keep both defaults tied to the same isProduction() check
     // or the zero-config dev path breaks.
     allowUnencrypted: userConfig.allowUnencrypted ?? !isProduction(),
+    allowProductionPlaintext: userConfig.allowProductionPlaintext ?? false,
+    hardCapBytes: userConfig.hardCapBytes ?? 1_048_576,
     transport: resolvedTransport,
     captureLocalVariables: userConfig.captureLocalVariables ?? false,
     captureDbBindParams: userConfig.captureDbBindParams ?? false,
@@ -593,7 +648,12 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     captureMiddlewareStatusCodes,
     traceContext: { vendorKey },
     stateTracking: { captureWrites, maxWritesPerContext },
-    service: resolveServiceName(userConfig.service)
+    service: resolveServiceName(userConfig.service),
+    deploymentEnv:
+      userConfig.deploymentEnv ??
+      (typeof process.env.ERRORCORE_ENVIRONMENT === 'string' && process.env.ERRORCORE_ENVIRONMENT.length > 0
+        ? process.env.ERRORCORE_ENVIRONMENT
+        : undefined)
   };
 }
 

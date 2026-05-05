@@ -80,6 +80,14 @@ export interface RequestContext {
   traceFlags: number;
   /** Internal scratch — not serialized; surfaced into Completeness at package time. */
   completenessOverflow?: { stateWritesDropped: number };
+  /**
+   * True when this service originated the trace (no inbound
+   * traceparent). Set by ALSManager.createRequestContext; surfaced as
+   * trace.isEntrySpan in the package. Optional only because some test
+   * fixtures construct RequestContext by hand — production code paths
+   * always populate it.
+   */
+  isEntrySpan?: boolean;
 }
 
 export interface StateRead {
@@ -264,8 +272,12 @@ export interface ProcessMetadata {
   platform: string;
   arch: string;
   pid: number;
+  /** Parent process id; useful for correlating sidecar/host relationships. */
+  ppid?: number;
   hostname: string;
   containerId?: string;
+  /** Spec §5: app-level deployment-env (staging|prod|...). */
+  deploymentEnv?: string;
   uptime: number;
   memoryUsage: {
     rss: number;
@@ -278,10 +290,23 @@ export interface ProcessMetadata {
   activeRequests: number;
   activeResourceTypes?: Record<string, number>;
   eventLoopLagMs: number;
+  /**
+   * One-time anchor captured at SDK init. Lets a receiver align any
+   * event's hrtimeNs to UTC across services using:
+   *   eventUtcMs = startAnchor.wallClockMs +
+   *                (eventHrtimeNs - startAnchor.hrtimeNs) / 1_000_000
+   * Stable for the lifetime of the process, so reconstruction agents can
+   * trust it as the canonical wall-clock origin even when individual
+   * capture's per-package timeAnchor drifts (it doesn't, today, but the
+   * field exists so it can survive future restructuring).
+   */
+  processStartAnchor: TimeAnchor;
 }
 
 export interface ErrorPackage {
   schemaVersion: '1.1.0';
+  /** Stable, per-event identifier minted at capture time (UUIDv4 today). */
+  eventId: string;
   /**
    * Application/service name that produced this capture. Resolved from
    * config.service, falling back to OTEL_SERVICE_NAME, then
@@ -329,12 +354,52 @@ export interface ErrorPackage {
     tracestate?: string;
     /** W3C trace-flags byte observed at capture (0-255). Optional for back-compat. */
     traceFlags?: number;
+    /**
+     * True when this service originated the trace (no inbound
+     * traceparent header was present). Lets the reconstruction agent
+     * distinguish gateway entry-spans from spans whose parent belongs
+     * to a peer it hasn't seen yet (the latter signals a missing
+     * upstream capture).
+     */
+    isEntrySpan?: boolean;
   };
-  integrity?: {
-    algorithm: 'HMAC-SHA256';
-    signature: string;
+  /**
+   * Set when enforceHardCap had to shed fields to fit the 1 MB envelope cap.
+   * Lists the dropped fields in order so reconstruction agents can flag the
+   * loss explicitly. Absent on captures that fit cleanly.
+   */
+  truncated?: {
+    reason: string;
+    droppedFields: string[];
   };
   completeness: Completeness;
+}
+
+/**
+ * Wire-format envelope for a captured ErrorPackage. The plaintext package
+ * is JSON, optionally compressed with zlib deflate, then encrypted with
+ * AES-256-GCM. AAD binds eventId, sdk.version, and keyId so a leaked
+ * ciphertext cannot be replayed against a different key without authTag
+ * failure. An outer HMAC-SHA256 over iv|ciphertext|authTag|AAD detects
+ * tampering before any GCM verification touches the ciphertext.
+ *
+ * `iv` / `authTag` / `hmac` carry the literal string `"unencrypted"` when
+ * the SDK is running in transparent-envelope mode (allowUnencrypted: true,
+ * no DEK). Receivers MUST reject those before passing the body to a
+ * decryption pipeline.
+ */
+export interface EncryptedEnvelope {
+  v: 1;
+  eventId: string;
+  sdk: { name: 'errorcore'; version: string };
+  keyId: string;
+  iv: string;
+  ciphertext: string;
+  authTag: string;
+  hmac: string;
+  /** True when the inner plaintext was zlib-deflated before encryption. */
+  compressed: boolean;
+  producedAt: number;
 }
 
 export interface ErrorPackageParts {
@@ -374,6 +439,7 @@ export interface ErrorPackageParts {
     parentSpanId: string | null;
     tracestate?: string;
     traceFlags?: number;
+    isEntrySpan?: boolean;
   };
   sourceMapResolution?: {
     framesResolved: number;
@@ -394,7 +460,10 @@ export interface ErrorPackageParts {
 
 export interface PackageAssemblyResult {
   packageObject: ErrorPackage;
+  /** JSON-stringified envelope ready for the wire. */
   payload: string;
+  /** The structured envelope (preferred input to typed transports). */
+  envelope?: EncryptedEnvelope;
 }
 
 export interface SerializationLimits {
@@ -431,8 +500,31 @@ export type PublicTransportConfig =
  * Codes the SDK emits via `onInternalWarning` for individual backpressure
  * or drop events. See docs/BACKPRESSURE.md for the full matrix — what each
  * code means, what the SDK did, and whether data was lost.
+ *
+ * The legacy snake_case names are retained as a deprecated type-level
+ * union for back-compat with consumers that pin them as string-literal
+ * types; runtime emissions now use the EC_* names.
  */
 export type InternalWarningCode =
+  | 'EC_RATE_LIMITED'
+  | 'EC_CAPTURE_FAILED'
+  | 'EC_DLQ_WRITE_FAILED'
+  | 'EC_DLQ_FULL'
+  | 'EC_DLQ_DISABLED'
+  | 'EC_DLQ_UNSIGNED'
+  | 'EC_TRANSPORT_FAILED'
+  | 'EC_TRANSPORT_TIMEOUT'
+  | 'EC_TRANSPORT_4XX'
+  | 'EC_DISK_FULL'
+  | 'EC_ENCRYPTION_KEY_INVALID'
+  | 'EC_ENCRYPTION_KEY_MISSING'
+  | 'EC_DECRYPT_HMAC_MISMATCH'
+  | 'EC_DECRYPT_AUTH_TAG_MISMATCH'
+  | 'EC_MAC_KEY_TOO_SHORT'
+  | 'EC_PRODUCTION_PLAINTEXT_BYPASS'
+  | 'EC_PACKAGE_OVER_HARD_CAP'
+  | 'EC_SANITIZE_SKIP'
+  // --- Deprecated snake_case literals (retained for type-level back-compat) ---
   | 'rate_limited'
   | 'capture_failed'
   | 'dead_letter_write_failed'
@@ -481,6 +573,13 @@ export type EncryptionVerifyResult =
   | { ok: true; keyIndex: number }
   | { ok: false };
 
+/**
+ * Optional async callback for resolving the data-encryption key from a
+ * KMS or other secret store. Called once at SDK init. Must return either
+ * a 64-character hex string or a 32-byte Buffer.
+ */
+export type EncryptionKeyCallback = () => Promise<string | Buffer> | string | Buffer;
+
 export interface SDKConfig {
   bufferSize?: number;
   bufferMaxBytes?: number;
@@ -493,8 +592,32 @@ export interface SDKConfig {
   envAllowlist?: string[];
   envBlocklist?: RegExp[];
   encryptionKey?: string;
+  /**
+   * Optional separate MAC key (64-char hex). When unset, the SDK derives
+   * a MAC sub-key from the DEK via PBKDF2 with a distinct salt — back-
+   * compatible with the single-secret config. Setting both lets operators
+   * rotate the encryption and authentication keys independently.
+   */
+  macKey?: string;
+  /**
+   * Async resolver for the DEK; preferred when the key lives in a KMS.
+   */
+  encryptionKeyCallback?: EncryptionKeyCallback;
   previousEncryptionKeys?: string[];
   allowUnencrypted?: boolean;
+  /**
+   * Triple-flag friction: required (along with allowUnencrypted: true and
+   * NODE_ENV=production) before the SDK will start an HTTP transport in
+   * production without a DEK. Without it, the SDK refuses init.
+   */
+  allowProductionPlaintext?: boolean;
+  /**
+   * Hard cap on the encrypted+base64 envelope size in bytes. Defaults to
+   * 1 MB. If a package's serialized form exceeds this after scrub, the
+   * SDK drops fields in order (localVariables first, then truncates
+   * ioTimeline to last 50 entries, then drops further sections).
+   */
+  hardCapBytes?: number;
   transport: TransportConfig;
   captureLocalVariables?: boolean;
   captureDbBindParams?: boolean;
@@ -542,6 +665,14 @@ export interface SDKConfig {
    * process.env.npm_package_name, then the literal "unknown-service".
    */
   service?: string;
+  /**
+   * Deployment environment label (staging|production|preview|...).
+   * Falls back to process.env.ERRORCORE_ENVIRONMENT if unset. Distinct
+   * from NODE_ENV — operators commonly run NODE_ENV=production in
+   * non-production fleets, which makes that variable a poor source of
+   * truth for the receiver.
+   */
+  deploymentEnv?: string;
 }
 
 export interface ResolvedConfig {
@@ -556,8 +687,12 @@ export interface ResolvedConfig {
   envAllowlist: string[];
   envBlocklist: RegExp[];
   encryptionKey: string | undefined;
+  macKey: string | undefined;
+  encryptionKeyCallback: EncryptionKeyCallback | undefined;
   previousEncryptionKeys: string[];
   allowUnencrypted: boolean;
+  allowProductionPlaintext: boolean;
+  hardCapBytes: number;
   transport: PublicTransportConfig;
   captureLocalVariables: boolean;
   captureDbBindParams: boolean;
@@ -601,6 +736,8 @@ export interface ResolvedConfig {
   };
   /** Resolved service name. Always set after resolveConfig. */
   service: string;
+  /** Spec §5 deployment environment label, resolved from config or env. */
+  deploymentEnv: string | undefined;
 }
 
 export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiScrubber'> {

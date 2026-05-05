@@ -80,6 +80,48 @@ function matchesSensitiveKey(key: string): boolean {
   return matchesRegex(SENSITIVE_KEY_REGEX, normalizedKey);
 }
 
+/**
+ * SDK-controlled fields whose values are nanosecond hrtime, byte counts,
+ * sequence numbers, or other non-PII telemetry. These keys are emitted
+ * by the SDK at known structural positions in the package, and were
+ * silently being [REDACTED] when their values happened to Luhn-match
+ * the credit-card regex (e.g. a 19-digit hrtimeNs string). We bypass
+ * value-pattern scrubbing for these keys.
+ *
+ * Safe because the scrubber walks the whole package root in
+ * package-builder.ts; user-controlled bodies are scrubbed earlier as
+ * leaf strings under request.body, so an inner `hrtimeNs` key inside
+ * a user's JSON body never reaches this layer.
+ */
+const INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'hrtimeNs', 'startTime', 'endTime', 'evictedAt', 'timestamp',
+  'errorEventHrtimeNs', 'wallClockMs', 'durationMs', 'eventLoopLagMs',
+  'seq', 'errorEventSeq', 'capturedAt', 'producedAt', 'receivedAt',
+  'pid', 'ppid', 'uptime',
+  'rss', 'heapTotal', 'heapUsed', 'external', 'arrayBuffers',
+  'activeHandles', 'activeRequests',
+  'min', 'max',
+  'rowCount', 'statusCode',
+  'phase', 'direction', 'type',
+  'fingerprint',
+  'keyId', 'eventId',
+  '_overflow', '_type', 'className',
+  'lineNumber', 'columnNumber'
+]);
+
+/**
+ * Header / value keys whose VALUE is operational metadata, not a
+ * secret. The header NAME is allowlisted in DEFAULT_HEADER_ALLOWLIST,
+ * but the SENSITIVE_KEY_REGEX still substring-matches `key` and
+ * redacts the value (`idempotency-key: abc-123` → REDACTED). This
+ * set bypasses value-side scrubbing for those known-operational keys.
+ */
+const SENSITIVE_KEY_EXACT_VALUE_PASSTHROUGH = new Set<string>([
+  'idempotency-key', 'x-idempotency-key',
+  'x-correlation-id', 'x-request-id', 'x-trace-id',
+  'etag', 'if-match', 'if-none-match', 'range'
+]);
+
 function truncateString(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
     return value;
@@ -352,7 +394,13 @@ export class Scrubber {
           const params = new URLSearchParams(decoded);
           const out = new URLSearchParams();
           for (const [key, value] of params.entries()) {
-            const scrubbedValue = matchesSensitiveKey(key)
+            const lowerKey = key.toLowerCase();
+            // Operational keys (idempotency-key, etag, etc.) carry
+            // values that are not secrets — leave them alone even
+            // though their key-name substring-matches /key/.
+            const scrubbedValue = SENSITIVE_KEY_EXACT_VALUE_PASSTHROUGH.has(lowerKey)
+              ? value
+              : matchesSensitiveKey(key)
               ? REDACTED
               : this.scrubString(value);
             out.append(key, scrubbedValue);
@@ -430,6 +478,20 @@ export class Scrubber {
   ): unknown {
     if (depth > Math.max(limits.maxDepth, 10)) {
       return DEPTH_LIMIT;
+    }
+
+    // SDK-internal infrastructure keys: pass values through without any
+    // pattern matching. Resolves §B1 (hrtime strings being Luhn-redacted).
+    if (INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key)) {
+      return value;
+    }
+
+    // Operational header values (idempotency-key, correlation-id, etc.).
+    // The header name is in the allowlist; the value should not be
+    // pattern-scrubbed just because the key matches /key/.
+    const lowerKey = typeof key === 'string' ? key.toLowerCase() : '';
+    if (SENSITIVE_KEY_EXACT_VALUE_PASSTHROUGH.has(lowerKey)) {
+      return value;
     }
 
     if (matchesSensitiveKey(key)) {

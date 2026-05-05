@@ -194,7 +194,10 @@ describe('SDK composition', () => {
     const encryptionKey =
       'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
     const enc = new Encryption(encryptionKey);
-    const payload = JSON.stringify(enc.encrypt('{"ok":true}'));
+    const envelope = enc.encryptToEnvelope(Buffer.from('{"ok":true}', 'utf8'), {
+      eventId: 'evt-dlq-replay'
+    });
+    const payload = JSON.stringify(envelope);
     // The SDK reads the dead-letter file with an Encryption-derived HMAC
     // (PBKDF2 of encryptionKey under the hmac-key salt). Sign the fixture
     // through the same Encryption instance so verification succeeds when
