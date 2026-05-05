@@ -14,6 +14,9 @@ test/benchmark-profiles/
 tmp-review-*/
 tmp-pre-ship-*/
 tmp-errorcore-cli-*/
+/errorcore-h2-smoke.pfx
+/worker-file-smoke.ndjson
+/cli-replay-smoke.*
 
 # tmp-nextjs-smoke is tracked except for its install artifacts.
 tmp-nextjs-smoke/node_modules/
