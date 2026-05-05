@@ -2,6 +2,7 @@
 import fs = require('node:fs');
 
 import { safeConsole } from '../debug-log';
+import { toTransportPayload, type TransportSendInput } from './payload';
 
 let warnedAboutStdoutTransport = false;
 
@@ -17,8 +18,9 @@ function warnAboutStdoutTransport(): void {
 }
 
 export class StdoutTransport {
-  public async send(payload: string | Buffer): Promise<void> {
+  public async send(input: TransportSendInput): Promise<void> {
     warnAboutStdoutTransport();
+    const payload = toTransportPayload(input).serialized;
     await new Promise<void>((resolve, reject) => {
       process.stdout.write(
         Buffer.isBuffer(payload) ? Buffer.concat([payload, Buffer.from('\n')]) : `${payload}\n`,

@@ -86,13 +86,14 @@ PackageBuilder serializes and constrains the package:
   - Clones all values with depth/size limits
   - Scrubs PII (headers, env vars, URL query params, credit cards,
     emails, phone numbers, SSNs, API keys, JWTs, high-entropy strings)
+  - Enforces the final serialized hard cap before transport
   - Optionally encrypts with AES-256-GCM
-  - Adds HMAC-SHA256 integrity signature
+  - Adds the envelope HMAC-SHA256 integrity signature
   - Records completeness metadata (what was captured, what was truncated)
   |
   v
 TransportDispatcher sends the serialized payload:
-  - HTTP: POST to collector
+  - HTTP: one Errorcore JSON envelope per POST
   - File: append NDJSON line
   - Stdout: write to console
   |
@@ -130,12 +131,16 @@ Warning codes:
 
 | Code | Meaning |
 |------|---------|
-| `errorcore_capture_failed` | Primary capture failed (Inspector or snapshot error) |
-| `errorcore_capture_fallback_failed` | Fallback assembly also failed |
-| `errorcore_transport_dispatch_failed` | Transport send failed |
-| `errorcore_dead_letter_write_failed` | Dead-letter persistence failed |
+| `EC_CAPTURE_FAILED` | Primary capture failed or fallback assembly also failed |
+| `EC_TRANSPORT_FAILED` | Transport send failed |
+| `EC_TRANSPORT_TIMEOUT` | Transport send timed out |
+| `EC_DLQ_WRITE_FAILED` | Dead-letter persistence failed |
+| `EC_DISK_FULL` | Dead-letter persistence failed due disk capacity |
+| `EC_DLQ_FULL` | Dead-letter persistence refused an oversized entry or full store |
+| `EC_DLQ_DISABLED` | Dead-letter path was configured but no stable signing secret was available |
+| `EC_PACKAGE_OVER_HARD_CAP` | Final serialized envelope exceeded `hardCapBytes` and was dropped |
 
-All warnings are prefixed with `[ErrorCore]` and written to `console.warn`.
+Warnings delivered to `onInternalWarning` use `EC_*` codes and scrub structured context/cause fields before invoking user code. Console output is short and avoids raw Authorization headers, cookies, collector credentials, full credentialed URLs, and large stack traces.
 
 ## Rate limiting
 
@@ -162,16 +167,19 @@ Don't pre-tune these from synthetic load. Watch the counters under real traffic 
 ### HTTP transport
 
 - Sends a POST request to the configured `url`.
-- Sets `Content-Type: application/json` and optionally `Authorization`.
+- Sends exactly one serialized Errorcore envelope per POST body, without a trailing newline.
+- Sets `Content-Type: application/errorcore+json`, optional `Authorization`, `X-Errorcore-Key-Id`, and `X-Errorcore-Event-Id`.
 - Timeout: `timeoutMs` (default 5000ms).
 - Retry logic:
-  - Up to 3 attempts.
-  - Delays between retries: 200ms, 600ms, 1800ms.
-  - Retryable: network timeouts, 5xx status codes, temporary DNS failures.
+  - Up to 5 attempts total.
+  - Honors `Retry-After` for retryable responses in both seconds and HTTP-date forms.
+  - Gives each payload a total retry budget of 30 seconds.
+  - Retryable: network timeouts, 408, 429, 500, 502, 503, 504, and temporary DNS/network failures.
   - Non-retryable: TLS certificate errors (`CERT_HAS_EXPIRED`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `ERR_TLS_CERT_ALTNAME_INVALID`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_GET_ISSUER_CERT`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`).
-  - Non-retryable: 4xx status codes.
+  - Non-retryable: 401, 403, 404, and other permanent 4xx status codes.
 - By default, only HTTPS URLs are accepted. Set `allowPlainHttpTransport: true` for HTTP.
 - TLS certificate validation can be disabled with `allowInvalidCollectorCertificates: true` (development only).
+- `protocol: 'auto' | 'http1' | 'http2'` controls collector protocol selection. `auto` uses HTTP/2 on HTTPS when available and falls back to HTTP/1.1 only on negotiation failure. `http2` requires HTTPS and no h2c support exists in this release.
 
 ### File transport
 
@@ -240,7 +248,7 @@ module.exports = {
 };
 ```
 
-The full callback signature, the warning-code matrix (individual codes such as `rate_limited`, `transport_failed`, `dead_letter_full`, `disk_full`, `encryption_key_invalid`; aggregate codes `errorcore_payloads_dropped`, `errorcore_payloads_dead_lettered`), and the rate-limit / aggregation rules are documented in [docs/BACKPRESSURE.md](docs/BACKPRESSURE.md).
+The full callback signature, the warning-code matrix (individual codes such as `EC_RATE_LIMITED`, `EC_TRANSPORT_FAILED`, `EC_DLQ_FULL`, `EC_DISK_FULL`, `EC_ENCRYPTION_KEY_INVALID`; aggregate codes `EC_PAYLOADS_DROPPED`, `EC_PAYLOADS_DEAD_LETTERED`), and the rate-limit / aggregation rules are documented in [docs/BACKPRESSURE.md](docs/BACKPRESSURE.md).
 
 Wire `onInternalWarning` to your alerting platform; scrape `getHealth()` for dashboards.
 

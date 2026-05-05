@@ -37,6 +37,7 @@ describe('resolveConfig', () => {
         'x-correlation-id',
         'host',
         'traceparent',
+        'tracestate',
         'idempotency-key',
         'x-idempotency-key',
         'etag',
@@ -133,7 +134,8 @@ describe('resolveConfig', () => {
       captureMiddlewareStatusCodes: 'none',
       traceContext: { vendorKey: 'ec' },
       stateTracking: { captureWrites: true, maxWritesPerContext: 50 },
-      service: 'errorcore'
+      service: 'errorcore',
+      deploymentEnv: undefined
     });
   });
 
@@ -331,7 +333,11 @@ describe('resolveConfig', () => {
         authorization: 'Bearer secret-token'
       }
     });
-    expect(resolved.transport).toEqual({ type: 'http', url: 'https://example.com/collect' });
+    expect(resolved.transport).toEqual({
+      type: 'http',
+      url: 'https://example.com/collect',
+      protocol: 'auto'
+    });
     expect(JSON.stringify(resolved)).not.toContain('secret-token');
   });
 

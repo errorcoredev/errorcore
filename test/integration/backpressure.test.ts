@@ -146,7 +146,7 @@ describe('backpressure contract', () => {
       await sdk.flush();
       await sdk.shutdown();
 
-      expect(warnings.find((w) => w.code === 'transport_failed' || w.code === 'transport_timeout')).toBeUndefined();
+      expect(warnings.find((w) => w.code === 'EC_TRANSPORT_FAILED' || w.code === 'EC_TRANSPORT_TIMEOUT')).toBeUndefined();
       expect(attempts).toBeGreaterThanOrEqual(3);
     } finally {
       await closeHttp(server);
@@ -154,8 +154,8 @@ describe('backpressure contract', () => {
     }
   }, 20_000);
 
-  // ---------- row 2: transport down → transport_failed ----------
-  it('row 2: transport failure fires transport_failed and dead-letters', async () => {
+  // ---------- row 2: transport down -> EC_TRANSPORT_FAILED ----------
+  it('row 2: transport failure fires EC_TRANSPORT_FAILED and dead-letters', async () => {
     const dir = makeTempDir('transport-down');
     const dlqPath = path.join(dir, 'dlq.ndjson');
     const { warnings, record } = makeRecorder();
@@ -195,7 +195,7 @@ describe('backpressure contract', () => {
       await sdk.flush();
       await sdk.shutdown();
 
-      const transportWarning = warnings.find((w) => w.code === 'transport_failed');
+      const transportWarning = warnings.find((w) => w.code === 'EC_TRANSPORT_FAILED');
       expect(transportWarning).toBeDefined();
       expect(transportWarning?.cause).toMatchObject({
         name: expect.any(String),
@@ -210,8 +210,8 @@ describe('backpressure contract', () => {
     }
   }, 20_000);
 
-  // ---------- transport_timeout (auxiliary) ----------
-  it('transport timeout fires transport_timeout code', async () => {
+  // ---------- EC_TRANSPORT_TIMEOUT (auxiliary) ----------
+  it('transport timeout fires EC_TRANSPORT_TIMEOUT code', async () => {
     const dir = makeTempDir('transport-timeout');
     const dlqPath = path.join(dir, 'dlq.ndjson');
     const { warnings, record } = makeRecorder();
@@ -237,7 +237,7 @@ describe('backpressure contract', () => {
       await sdk.flush();
       await sdk.shutdown();
 
-      const timeout = warnings.find((w) => w.code === 'transport_timeout');
+      const timeout = warnings.find((w) => w.code === 'EC_TRANSPORT_TIMEOUT');
       expect(timeout).toBeDefined();
       expect(timeout?.cause).toMatchObject({
         name: expect.any(String),
@@ -249,8 +249,8 @@ describe('backpressure contract', () => {
     }
   }, 20_000);
 
-  // ---------- row 3a: DLQ disk full (ENOSPC) → disk_full ----------
-  it('row 3a: DLQ write with ENOSPC fires disk_full', () => {
+  // ---------- row 3a: DLQ disk full (ENOSPC) -> EC_DISK_FULL ----------
+  it('row 3a: DLQ write with ENOSPC fires EC_DISK_FULL', () => {
     const dir = makeTempDir('dlq-enospc');
     const dlqPath = path.join(dir, 'dlq.ndjson');
     const { warnings, record } = makeRecorder();
@@ -275,7 +275,7 @@ describe('backpressure contract', () => {
     try {
       const ok = store.appendPayloadSync('{"payload":"hello"}');
       expect(ok).toBe(false);
-      const diskFull = warnings.find((w) => w.code === 'disk_full');
+      const diskFull = warnings.find((w) => w.code === 'EC_DISK_FULL');
       expect(diskFull).toBeDefined();
       expect((diskFull?.cause as NodeJS.ErrnoException).code).toBe('ENOSPC');
       expect(diskFull?.context?.errno).toBe('ENOSPC');
@@ -290,8 +290,8 @@ describe('backpressure contract', () => {
     }
   });
 
-  // ---------- row 3b: DLQ other errno (EACCES) → dead_letter_write_failed ----------
-  it('row 3b: DLQ write with EACCES fires dead_letter_write_failed', () => {
+  // ---------- row 3b: DLQ other errno (EACCES) -> EC_DLQ_WRITE_FAILED ----------
+  it('row 3b: DLQ write with EACCES fires EC_DLQ_WRITE_FAILED', () => {
     const dir = makeTempDir('dlq-eacces');
     const dlqPath = path.join(dir, 'dlq.ndjson');
     const { warnings, record } = makeRecorder();
@@ -310,7 +310,7 @@ describe('backpressure contract', () => {
     try {
       const ok = store.appendPayloadSync('{"payload":"hello"}');
       expect(ok).toBe(false);
-      const writeFailed = warnings.find((w) => w.code === 'dead_letter_write_failed');
+      const writeFailed = warnings.find((w) => w.code === 'EC_DLQ_WRITE_FAILED');
       expect(writeFailed).toBeDefined();
       expect((writeFailed?.cause as NodeJS.ErrnoException).code).toBe('EACCES');
 
@@ -323,8 +323,8 @@ describe('backpressure contract', () => {
     }
   });
 
-  // ---------- row 4: DLQ at size cap → dead_letter_full ----------
-  it('row 4: DLQ at size cap fires dead_letter_full', () => {
+  // ---------- row 4: DLQ at size cap -> EC_DLQ_FULL ----------
+  it('row 4: DLQ at size cap fires EC_DLQ_FULL', () => {
     const dir = makeTempDir('dlq-size-cap');
     const dlqPath = path.join(dir, 'dlq.ndjson');
     const { warnings, record } = makeRecorder();
@@ -343,15 +343,15 @@ describe('backpressure contract', () => {
     const ok = store.appendPayloadSync('{"p":"second"}');
     expect(ok).toBe(false);
 
-    const cap = warnings.find((w) => w.code === 'dead_letter_full');
+    const cap = warnings.find((w) => w.code === 'EC_DLQ_FULL');
     expect(cap).toBeDefined();
     expect(cap?.context?.reason).toBe('size_cap');
 
     cleanupTempDir(dir);
   });
 
-  // ---------- DLQ oversized payload (auxiliary) → dead_letter_full ----------
-  it('DLQ oversized payload fires dead_letter_full', () => {
+  // ---------- DLQ oversized payload (auxiliary) -> EC_DLQ_FULL ----------
+  it('DLQ oversized payload fires EC_DLQ_FULL', () => {
     const dir = makeTempDir('dlq-oversized');
     const dlqPath = path.join(dir, 'dlq.ndjson');
     const { warnings, record } = makeRecorder();
@@ -367,7 +367,7 @@ describe('backpressure contract', () => {
     expect(ok).toBe(false);
 
     const oversized = warnings.find(
-      (w) => w.code === 'dead_letter_full' && w.context?.reason === 'oversized_payload'
+      (w) => w.code === 'EC_DLQ_FULL' && w.context?.reason === 'oversized_payload'
     );
     expect(oversized).toBeDefined();
 
@@ -405,8 +405,8 @@ describe('backpressure contract', () => {
     expect(warnings).toHaveLength(0);
   });
 
-  // ---------- row 6: rate limit hit → rate_limited ----------
-  it('row 6: rate limit hit fires rate_limited and recovers after window', async () => {
+  // ---------- row 6: rate limit hit -> EC_RATE_LIMITED ----------
+  it('row 6: rate limit hit fires EC_RATE_LIMITED and recovers after window', async () => {
     const dir = makeTempDir('rate-limit');
     const dlqPath = path.join(dir, 'dlq.ndjson');
     const outPath = path.join(dir, 'out.log');
@@ -427,7 +427,7 @@ describe('backpressure contract', () => {
       expect(() => sdk.captureError(new Error('first'))).not.toThrow();
       expect(() => sdk.captureError(new Error('second'))).not.toThrow();
 
-      const rateLimited = warnings.find((w) => w.code === 'rate_limited');
+      const rateLimited = warnings.find((w) => w.code === 'EC_RATE_LIMITED');
       expect(rateLimited).toBeDefined();
       expect(rateLimited?.message).toContain('Rate limit');
 
@@ -435,7 +435,7 @@ describe('backpressure contract', () => {
       await new Promise((resolve) => setTimeout(resolve, 1100));
       warnings.length = 0;
       expect(() => sdk.captureError(new Error('third'))).not.toThrow();
-      expect(warnings.find((w) => w.code === 'rate_limited')).toBeUndefined();
+      expect(warnings.find((w) => w.code === 'EC_RATE_LIMITED')).toBeUndefined();
     } finally {
       await sdk.flush();
       await sdk.shutdown();
@@ -451,8 +451,8 @@ describe('backpressure contract', () => {
       const dlqDir = path.join(dir, 'ro-sub');
       fs.mkdirSync(dlqDir, { mode: 0o500 });
       // Path inside a directory without write permission. On POSIX
-      // systems this produces EACCES; we don't assert disk_full vs
-      // dead_letter_write_failed specifically because some filesystems
+      // systems this produces EACCES; we don't assert EC_DISK_FULL vs
+      // EC_DLQ_WRITE_FAILED specifically because some filesystems
       // surface other codes (EROFS on read-only mounts). What we
       // require is that SOME backpressure code fires and the caller
       // does not throw.
@@ -468,7 +468,7 @@ describe('backpressure contract', () => {
       expect(ok).toBe(false);
       expect(
         warnings.some(
-          (w) => w.code === 'dead_letter_write_failed' || w.code === 'disk_full'
+          (w) => w.code === 'EC_DLQ_WRITE_FAILED' || w.code === 'EC_DISK_FULL'
         )
       ).toBe(true);
 

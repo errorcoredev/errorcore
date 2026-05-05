@@ -4,7 +4,7 @@ import path = require('node:path');
 
 import { withLockSync } from './file-lock';
 import { safeConsole } from '../debug-log';
-import { serializeCause } from '../capture/error-capturer';
+import { scrubInternalWarningValue, serializeCause } from '../capture/error-capturer';
 import type { InternalWarning, InternalWarningCode } from '../types';
 
 // Append `data` to `filePath` and fsync the file descriptor before
@@ -87,11 +87,11 @@ const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
 
 function classifyDlqWriteErrno(
   err: unknown
-): 'disk_full' | 'dead_letter_write_failed' {
+): 'EC_DISK_FULL' | 'EC_DLQ_WRITE_FAILED' {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   return code !== undefined && DISK_FULL_ERRNO_CODES.has(code)
-    ? 'disk_full'
-    : 'dead_letter_write_failed';
+    ? 'EC_DISK_FULL'
+    : 'EC_DLQ_WRITE_FAILED';
 }
 
 export interface DeadLetterDrainEntry {
@@ -233,8 +233,12 @@ export class DeadLetterStore {
       const enriched: InternalWarning = {
         code: warning.code as InternalWarningCode,
         message: warning.message,
-        ...(warning.cause !== undefined ? { cause: serializeCause(warning.cause) } : {}),
-        ...(warning.context !== undefined ? { context: warning.context } : {}),
+        ...(warning.cause !== undefined
+          ? { cause: scrubInternalWarningValue(serializeCause(warning.cause)) }
+          : {}),
+        ...(warning.context !== undefined
+          ? { context: scrubInternalWarningValue(warning.context) as Record<string, unknown> }
+          : {}),
       };
       try {
         this.onInternalWarning(enriched);
@@ -255,7 +259,7 @@ export class DeadLetterStore {
     if (payloadBytes > this.maxPayloadBytes) {
       safeConsole.warn('[ErrorCore] Dead-letter payload exceeds maximum size; dropping payload');
       this.reportWarning({
-        code: 'dead_letter_full',
+        code: 'EC_DLQ_FULL',
         message: `Dead-letter payload exceeds maximum size (${payloadBytes} > ${this.maxPayloadBytes} bytes); dropping payload.`,
         context: { payloadBytes, maxPayloadBytes: this.maxPayloadBytes, reason: 'oversized_payload' }
       });
@@ -463,7 +467,7 @@ export class DeadLetterStore {
         if (this.exceedsMaxSize()) {
           safeConsole.warn('[ErrorCore] Dead-letter store at capacity; dropping payload');
           this.reportWarning({
-            code: 'dead_letter_full',
+            code: 'EC_DLQ_FULL',
             message: `Dead-letter store at capacity (>= ${this.maxSizeBytes} bytes); dropping payload.`,
             context: { maxSizeBytes: this.maxSizeBytes, reason: 'size_cap' }
           });
@@ -495,7 +499,7 @@ export class DeadLetterStore {
       this.reportWarning({
         code,
         message:
-          code === 'disk_full'
+          code === 'EC_DISK_FULL'
             ? `Dead-letter store append failed: out of disk space. Check disk capacity at the dead-letter path.`
             : `Dead-letter store append failed: ${message}. Check permissions and path at deadLetterPath.`,
         cause: error,

@@ -18,6 +18,7 @@ const path = nodeRequire('node:path') as typeof import('node:path');
 const os = nodeRequire('node:os') as typeof import('node:os');
 const httpsModule = nodeRequire('node:https') as typeof import('node:https');
 const httpModule = nodeRequire('node:http') as typeof import('node:http');
+const http2Module = nodeRequire('node:http2') as typeof import('node:http2');
 const originalRequire = Module.prototype.require;
 
 class MockWorker extends EventEmitter {
@@ -65,7 +66,10 @@ function createMockRequest(options: {
   statuses: number[];
   timeoutBehavior?: 'trigger' | 'none';
 }) {
-  const response = new EventEmitter() as EventEmitter & { statusCode?: number };
+  const response = new EventEmitter() as EventEmitter & {
+    statusCode?: number;
+    headers?: Record<string, string>;
+  };
   let callCount = 0;
 
   return vi.fn((requestOptions: unknown, callback: (response: typeof response) => void) => {
@@ -159,6 +163,12 @@ async function waitForSetImmediate(): Promise<void> {
   });
 }
 
+function createHttp1Transport(
+  config: ConstructorParameters<typeof HttpTransport>[0]
+): HttpTransport {
+  return new HttpTransport({ ...config, protocol: 'http1' });
+}
+
 describe('HttpTransport', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -169,12 +179,20 @@ describe('HttpTransport', () => {
     const requestSpy = createMockRequest({ statuses: [200] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({
+    const transport = createHttp1Transport({
       url: 'https://example.com/collect',
       authorization: 'Bearer secret-key'
     });
 
-    await transport.send('{"ok":true}');
+    await transport.send({
+      serialized: '{"ok":true}',
+      envelope: {
+        v: 1,
+        eventId: 'evt-transport',
+        sdk: { name: 'errorcore', version: '0.2.0' },
+        keyId: 'key-transport'
+      }
+    });
 
     expect(requestSpy).toHaveBeenCalledTimes(1);
     expect(requestSpy.mock.calls[0]?.[0]).toMatchObject({
@@ -183,7 +201,9 @@ describe('HttpTransport', () => {
       path: '/collect',
       method: 'POST',
       headers: {
-        'content-type': 'application/x-ndjson',
+        'content-type': 'application/errorcore+json',
+        'X-Errorcore-Key-Id': 'key-transport',
+        'X-Errorcore-Event-Id': 'evt-transport',
         Authorization: 'Bearer secret-key'
       }
     });
@@ -216,7 +236,7 @@ describe('HttpTransport', () => {
     });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({
+    const transport = createHttp1Transport({
       url: 'https://example.com/collect'
     });
 
@@ -237,7 +257,7 @@ describe('HttpTransport', () => {
 
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({
+    const transport = createHttp1Transport({
       url: 'https://example.com/collect'
     });
 
@@ -245,6 +265,49 @@ describe('HttpTransport', () => {
 
     expect(requestSpy).toHaveBeenCalledTimes(3);
     expect(delaySpy).toHaveBeenCalled();
+  });
+
+  it('honors Retry-After seconds for retryable HTTP responses', async () => {
+    let callCount = 0;
+    const requestSpy = vi.fn((_opts: unknown, callback: (res: EventEmitter & { statusCode?: number; headers?: Record<string, string> }) => void) => {
+      const response = new EventEmitter() as EventEmitter & {
+        statusCode?: number;
+        headers?: Record<string, string>;
+      };
+      const request = new EventEmitter() as EventEmitter & {
+        write: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        setTimeout: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      request.write = vi.fn();
+      request.destroy = vi.fn();
+      request.setTimeout = vi.fn(() => request);
+      request.end = vi.fn(() => {
+        response.statusCode = callCount === 0 ? 503 : 200;
+        response.headers = callCount === 0 ? { 'retry-after': '2' } : {};
+        callCount += 1;
+        callback(response);
+        response.emit('end');
+      });
+      return request;
+    });
+    httpsModule.request = requestSpy as typeof httpsModule.request;
+
+    const capturedDelays: number[] = [];
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler, ms?: number) => {
+      if (typeof ms === 'number' && ms > 0) {
+        capturedDelays.push(ms);
+      }
+      if (typeof fn === 'function') fn();
+      return { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    }) as typeof setTimeout);
+
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
+    await transport.send('payload');
+
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+    expect(capturedDelays).toContain(2000);
   });
 
   it('handles request timeouts', async () => {
@@ -256,7 +319,7 @@ describe('HttpTransport', () => {
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
-    const transport = new HttpTransport({
+    const transport = createHttp1Transport({
       url: 'https://example.com/collect'
     });
 
@@ -269,7 +332,7 @@ describe('HttpTransport', () => {
   it('rejects insecure HTTP URLs by default', () => {
     expect(
       () =>
-        new HttpTransport({
+        createHttp1Transport({
           url: 'http://example.com/collect'
         })
     ).toThrow('HTTP transport requires an https:// URL');
@@ -279,7 +342,7 @@ describe('HttpTransport', () => {
     const requestSpy = createMockRequest({ statuses: [200] });
     httpModule.request = requestSpy as typeof httpModule.request;
 
-    const transport = new HttpTransport({
+    const transport = createHttp1Transport({
       url: 'http://example.com/collect',
       allowPlainHttpTransport: true
     });
@@ -291,28 +354,28 @@ describe('HttpTransport', () => {
 
   it('(a) throws at init if URL is http:// and allowPlainHttpTransport is false', () => {
     expect(
-      () => new HttpTransport({ url: 'http://insecure.example.com/v1' })
+      () => createHttp1Transport({ url: 'http://insecure.example.com/v1' })
     ).toThrow('https://');
   });
 
   it('(b) does not throw at init if URL is https://', () => {
     expect(
-      () => new HttpTransport({ url: 'https://secure.example.com/v1' })
+      () => createHttp1Transport({ url: 'https://secure.example.com/v1' })
     ).not.toThrow();
   });
 
   it('(c) does not throw at init if URL is http:// and allowPlainHttpTransport is true', () => {
     expect(
       () =>
-        new HttpTransport({
+        createHttp1Transport({
           url: 'http://insecure.example.com/v1',
           allowPlainHttpTransport: true
         })
     ).not.toThrow();
   });
 
-  it('(d) retries exactly 3 times with delays of approximately 200, 600, 1800 ms before throwing', async () => {
-    const requestSpy = createMockRequest({ statuses: [500, 500, 500] });
+  it('(d) retries exactly 5 times with bounded backoff before throwing', async () => {
+    const requestSpy = createMockRequest({ statuses: [500, 500, 500, 500, 500] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
     const capturedDelays: number[] = [];
@@ -325,28 +388,28 @@ describe('HttpTransport', () => {
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
-    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
 
     await expect(transport.send('payload')).rejects.toThrow('HTTP 500');
 
-    expect(requestSpy).toHaveBeenCalledTimes(3);
-    expect(capturedDelays).toEqual([200, 600]);
+    expect(requestSpy).toHaveBeenCalledTimes(5);
+    expect(capturedDelays).toEqual([200, 600, 1800, 5400]);
 
     globalThis.setTimeout = originalSetTimeout;
   });
 
   it('(e) throws after max retries so the caller can fall through to dead-letter', async () => {
-    const requestSpy = createMockRequest({ statuses: [502, 502, 502] });
+    const requestSpy = createMockRequest({ statuses: [502, 502, 502, 502, 502] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler) => {
       if (typeof fn === 'function') fn();
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
-    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
 
     await expect(transport.send('payload')).rejects.toThrow();
-    expect(requestSpy).toHaveBeenCalledTimes(3);
+    expect(requestSpy).toHaveBeenCalledTimes(5);
   });
 
   it('does not retry when the socket errors with a non-transient code like EACCES', async () => {
@@ -374,14 +437,14 @@ describe('HttpTransport', () => {
     });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
 
     await expect(transport.send('payload')).rejects.toThrow();
     // Exactly one attempt: EACCES is not retryable.
     expect(requestSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('(f) appends a newline to every payload', async () => {
+  it('(f) sends HTTP payload bytes without adding an NDJSON newline', async () => {
     const writtenBodies: Buffer[] = [];
     const requestSpy = vi.fn((_opts: unknown, callback: (res: EventEmitter & { statusCode?: number }) => void) => {
       const response = new EventEmitter() as EventEmitter & { statusCode?: number };
@@ -404,30 +467,30 @@ describe('HttpTransport', () => {
     });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
     await transport.send('{"test":true}');
 
     expect(writtenBodies.length).toBe(1);
-    expect(writtenBodies[0].toString()).toMatch(/\n$/);
+    expect(writtenBodies[0].toString()).toBe('{"test":true}');
   });
 
-  it('(g) sets content-type to application/x-ndjson', async () => {
+  it('(g) sets content-type to application/errorcore+json', async () => {
     const requestSpy = createMockRequest({ statuses: [200] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
     await transport.send('payload');
 
     const options = requestSpy.mock.calls[0]?.[0] as Record<string, unknown>;
     const headers = options.headers as Record<string, string>;
-    expect(headers['content-type']).toBe('application/x-ndjson');
+    expect(headers['content-type']).toBe('application/errorcore+json');
   });
 
   it('(h) sets Authorization header when authorization config is provided', async () => {
     const requestSpy = createMockRequest({ statuses: [200] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({
+    const transport = createHttp1Transport({
       url: 'https://example.com/collect',
       authorization: 'Bearer my-token'
     });
@@ -442,7 +505,7 @@ describe('HttpTransport', () => {
     const requestSpy = createMockRequest({ statuses: [200] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
-    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
     await transport.send('payload');
 
     const options = requestSpy.mock.calls[0]?.[0] as Record<string, unknown>;
@@ -454,7 +517,7 @@ describe('HttpTransport', () => {
     const secureRequestSpy = createMockRequest({ statuses: [200] });
     httpsModule.request = secureRequestSpy as typeof httpsModule.request;
 
-    const secureTransport = new HttpTransport({ url: 'https://example.com/collect' });
+    const secureTransport = createHttp1Transport({ url: 'https://example.com/collect' });
     await secureTransport.send('payload');
 
     const secureOptions = secureRequestSpy.mock.calls[0]?.[0] as Record<string, unknown>;
@@ -465,7 +528,7 @@ describe('HttpTransport', () => {
 
     // allowPlainHttpTransport permits http:// collectors but must not affect
     // certificate validation on https:// collectors.
-    const plainHttpTransport = new HttpTransport({
+    const plainHttpTransport = createHttp1Transport({
       url: 'https://example.com/collect',
       allowPlainHttpTransport: true
     });
@@ -477,7 +540,7 @@ describe('HttpTransport', () => {
     const invalidCertRequestSpy = createMockRequest({ statuses: [200] });
     httpsModule.request = invalidCertRequestSpy as typeof httpsModule.request;
 
-    const invalidCertTransport = new HttpTransport({
+    const invalidCertTransport = createHttp1Transport({
       url: 'https://example.com/collect',
       allowInvalidCollectorCertificates: true
     });
@@ -493,11 +556,11 @@ describe('HttpTransport', () => {
     ];
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-    new HttpTransport({
+    createHttp1Transport({
       url: 'https://example.com/collect',
       allowInvalidCollectorCertificates: true
     });
-    new HttpTransport({
+    createHttp1Transport({
       url: 'https://another.example.com/collect',
       allowInvalidCollectorCertificates: true
     });
@@ -518,13 +581,125 @@ describe('HttpTransport', () => {
     ];
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-    new HttpTransport({
+    createHttp1Transport({
       url: 'http://example.com/collect',
       allowPlainHttpTransport: true,
       allowInvalidCollectorCertificates: true
     });
 
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends collector payloads over explicit HTTP/2 with envelope headers', async () => {
+    const session = new EventEmitter() as EventEmitter & {
+      destroyed: boolean;
+      closed: boolean;
+      request: ReturnType<typeof vi.fn>;
+      destroy: ReturnType<typeof vi.fn>;
+    };
+    session.destroyed = false;
+    session.closed = false;
+    session.destroy = vi.fn(() => {
+      session.destroyed = true;
+      session.closed = true;
+      session.emit('close');
+    });
+
+    let writtenBody = Buffer.alloc(0);
+    const stream = new EventEmitter() as EventEmitter & {
+      setTimeout: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      end: ReturnType<typeof vi.fn>;
+    };
+    stream.setTimeout = vi.fn(() => stream);
+    stream.close = vi.fn();
+    stream.end = vi.fn((body: Buffer) => {
+      writtenBody = body;
+      process.nextTick(() => {
+        stream.emit('response', {
+          [http2Module.constants.HTTP2_HEADER_STATUS]: 200
+        });
+        stream.emit('end');
+      });
+      return stream;
+    });
+    session.request = vi.fn(() => stream);
+
+    const connectSpy = vi.spyOn(http2Module, 'connect').mockImplementation((() => {
+      process.nextTick(() => session.emit('connect'));
+      return session;
+    }) as typeof http2Module.connect);
+
+    const transport = new HttpTransport({
+      url: 'https://example.com/collect',
+      protocol: 'http2'
+    });
+
+    await transport.send({
+      serialized: '{"ok":true}',
+      envelope: {
+        v: 1,
+        eventId: 'evt-h2',
+        sdk: { name: 'errorcore', version: '0.2.0' },
+        keyId: 'key-h2'
+      }
+    });
+    await transport.shutdown();
+
+    expect(connectSpy).toHaveBeenCalledWith('https://example.com', {
+      rejectUnauthorized: true
+    });
+    expect(session.request).toHaveBeenCalledWith(expect.objectContaining({
+      ':method': 'POST',
+      ':path': '/collect',
+      'content-type': 'application/errorcore+json',
+      'x-errorcore-key-id': 'key-h2',
+      'x-errorcore-event-id': 'evt-h2'
+    }));
+    expect(writtenBody.toString()).toBe('{"ok":true}');
+    expect(session.destroy).toHaveBeenCalled();
+  });
+
+  it('falls back from auto HTTP/2 to HTTP/1.1 when HTTP/2 negotiation fails', async () => {
+    const session = new EventEmitter() as EventEmitter & {
+      destroyed: boolean;
+      closed: boolean;
+      destroy: ReturnType<typeof vi.fn>;
+    };
+    session.destroyed = false;
+    session.closed = false;
+    session.destroy = vi.fn(() => {
+      session.destroyed = true;
+      session.closed = true;
+      session.emit('close');
+    });
+    vi.spyOn(http2Module, 'connect').mockImplementation((() => {
+      process.nextTick(() => session.emit('error', new Error('ALPN did not negotiate h2')));
+      return session;
+    }) as typeof http2Module.connect);
+
+    const requestSpy = createMockRequest({ statuses: [200] });
+    httpsModule.request = requestSpy as typeof httpsModule.request;
+
+    const transport = new HttpTransport({
+      url: 'https://example.com/collect'
+    });
+
+    await transport.send('payload');
+
+    expect(http2Module.connect).toHaveBeenCalled();
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects explicit HTTP/2 for plain HTTP collectors', () => {
+    expect(
+      () =>
+        new HttpTransport({
+          url: 'http://example.com/collect',
+          allowPlainHttpTransport: true,
+          protocol: 'http2'
+        })
+    ).toThrow(/h2c is not supported/);
   });
 
   it('does not retry permanent HTTP failures', async () => {
@@ -535,7 +710,7 @@ describe('HttpTransport', () => {
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
-    const transport = new HttpTransport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
 
     await expect(transport.send('payload')).rejects.toThrow('HTTP 401');
     expect(requestSpy).toHaveBeenCalledTimes(1);
@@ -563,7 +738,7 @@ describe('HttpTransport', () => {
           return { unref: vi.fn() } as unknown as NodeJS.Timeout;
         }) as typeof setTimeout);
 
-      const transport = new HttpTransport({ url: 'https://example.com/collect' });
+      const transport = createHttp1Transport({ url: 'https://example.com/collect' });
 
       let thrown: (Error & { code?: string }) | undefined;
       try {

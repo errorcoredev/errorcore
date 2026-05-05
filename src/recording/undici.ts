@@ -43,6 +43,7 @@ interface ALSManagerLike {
   getContext(): RequestContext | undefined;
   formatTraceparent(): string | null;
   formatOutboundTracestate?(): string | null;
+  getTraceHeaders?(): { traceparent: string; tracestate?: string } | null;
 }
 
 interface HeaderFilterLike {
@@ -120,14 +121,20 @@ export class UndiciRecorder {
       const context = this.als.getContext();
 
       if (context !== undefined) {
-        const traceparent = this.als.formatTraceparent();
+        const traceHeaders = this.als.getTraceHeaders?.() ?? (() => {
+          const traceparent = this.als.formatTraceparent();
+          if (traceparent === null) return null;
+          const tracestate = this.als.formatOutboundTracestate?.() ?? null;
+          return {
+            traceparent,
+            ...(tracestate === null || tracestate.length === 0 ? {} : { tracestate })
+          };
+        })();
         try {
-          if (traceparent !== null && typeof (request as any).addHeader === 'function') {
-            (request as any).addHeader('traceparent', traceparent);
-            // Module 21: emit ec=clk:<n> alongside traceparent.
-            const tracestate = this.als.formatOutboundTracestate?.() ?? null;
-            if (tracestate !== null && tracestate.length > 0) {
-              (request as any).addHeader('tracestate', tracestate);
+          if (traceHeaders !== null && typeof (request as any).addHeader === 'function') {
+            (request as any).addHeader('traceparent', traceHeaders.traceparent);
+            if (traceHeaders.tracestate !== undefined) {
+              (request as any).addHeader('tracestate', traceHeaders.tracestate);
             }
           }
         } catch {

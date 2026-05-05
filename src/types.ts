@@ -466,6 +466,26 @@ export interface PackageAssemblyResult {
   envelope?: EncryptedEnvelope;
 }
 
+export interface TraceHeaders {
+  traceparent: string;
+  tracestate?: string;
+}
+
+export interface TraceContextInput {
+  traceparent?: string;
+  tracestate?: string;
+  method?: string;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
+export interface TransportPayload {
+  /** Exact bytes/string accepted by the transport for persistence or wire send. */
+  serialized: string | Buffer;
+  /** Parsed envelope metadata when the payload is an Errorcore envelope. */
+  envelope?: Pick<EncryptedEnvelope, 'v' | 'eventId' | 'sdk' | 'keyId'>;
+}
+
 export interface SerializationLimits {
   maxDepth: number;
   maxArrayItems: number;
@@ -483,6 +503,7 @@ export type TransportConfig =
       url: string;
       authorization?: string;
       timeoutMs?: number;
+      protocol?: 'auto' | 'http1' | 'http2';
       maxBackups?: number;
     };
 
@@ -493,6 +514,7 @@ export type PublicTransportConfig =
       type: 'http';
       url: string;
       timeoutMs?: number;
+      protocol?: 'auto' | 'http1' | 'http2';
       maxBackups?: number;
     };
 
@@ -524,6 +546,8 @@ export type InternalWarningCode =
   | 'EC_PRODUCTION_PLAINTEXT_BYPASS'
   | 'EC_PACKAGE_OVER_HARD_CAP'
   | 'EC_SANITIZE_SKIP'
+  | 'EC_PAYLOADS_DROPPED'
+  | 'EC_PAYLOADS_DEAD_LETTERED'
   // --- Deprecated snake_case literals (retained for type-level back-compat) ---
   | 'rate_limited'
   | 'capture_failed'
@@ -539,6 +563,9 @@ export type InternalWarningCode =
  * summarising counts over a flush interval, rather than per-event.
  */
 export type AggregateWarningCode =
+  | 'EC_PAYLOADS_DROPPED'
+  | 'EC_PAYLOADS_DEAD_LETTERED'
+  // --- Deprecated snake_case literals (retained for type-level back-compat) ---
   | 'errorcore_payloads_dropped'
   | 'errorcore_payloads_dead_lettered';
 
@@ -578,7 +605,7 @@ export type EncryptionVerifyResult =
  * KMS or other secret store. Called once at SDK init. Must return either
  * a 64-character hex string or a 32-byte Buffer.
  */
-export type EncryptionKeyCallback = () => Promise<string | Buffer> | string | Buffer;
+export type EncryptionKeyCallback = () => string | Buffer;
 
 export interface SDKConfig {
   bufferSize?: number;
@@ -600,7 +627,7 @@ export interface SDKConfig {
    */
   macKey?: string;
   /**
-   * Async resolver for the DEK; preferred when the key lives in a KMS.
+   * Synchronous resolver for the DEK. Called once during SDK creation before activation.
    */
   encryptionKeyCallback?: EncryptionKeyCallback;
   previousEncryptionKeys?: string[];
@@ -744,8 +771,17 @@ export interface PackageAssemblyWorkerConfig extends Omit<ResolvedConfig, 'piiSc
   piiScrubber: undefined;
 }
 
+export interface PackageAssemblyEncryptionConfig {
+  encryptionKey: string;
+  macKey?: string;
+  previousEncryptionKeys: string[];
+  sdkVersion: string;
+  derivedKeyHex?: string;
+}
+
 export interface PackageAssemblyWorkerData {
   config: PackageAssemblyWorkerConfig;
+  encryption?: PackageAssemblyEncryptionConfig;
 }
 
 export type PackageAssemblyWorkerRequest =

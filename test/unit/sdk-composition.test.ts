@@ -67,7 +67,8 @@ describe('SDK composition', () => {
     try {
       expect(sdk.config.transport).toEqual({
         type: 'http',
-        url: 'https://collector.example.com/v1/errors'
+        url: 'https://collector.example.com/v1/errors',
+        protocol: 'auto'
       });
       expect(JSON.stringify(sdk.config)).not.toContain('super-secret');
     } finally {
@@ -232,7 +233,13 @@ describe('SDK composition', () => {
       await Promise.resolve();
 
       expect(sendSpy).toHaveBeenCalledTimes(1);
-      expect(sendSpy).toHaveBeenCalledWith(payload);
+      expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({
+        serialized: payload,
+        envelope: expect.objectContaining({
+          eventId: 'evt-dlq-replay',
+          keyId: envelope.keyId
+        })
+      }));
       expect(fs.existsSync(deadLetterPath)).toBe(false);
     } finally {
       await sdk.shutdown();
@@ -270,7 +277,10 @@ describe('SDK composition', () => {
       await Promise.resolve();
 
       expect(sendSpy).toHaveBeenCalledTimes(1);
-      expect(sendSpy).toHaveBeenCalledWith(payload);
+      expect(sendSpy).toHaveBeenCalledWith({
+        serialized: payload,
+        envelope: undefined
+      });
       expect(fs.existsSync(deadLetterPath)).toBe(false);
     } finally {
       await sdk.shutdown();

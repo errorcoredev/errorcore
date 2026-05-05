@@ -31,7 +31,8 @@ import type {
   PackageAssemblyResult,
   RequestContext,
   ResolvedConfig,
-  TimeAnchor
+  TimeAnchor,
+  TransportPayload
 } from '../types';
 
 interface IOEventBufferLike {
@@ -43,7 +44,7 @@ interface IOEventBufferLike {
 }
 
 interface TransportLike {
-  send(payload: string): Promise<void> | void;
+  send(payload: TransportPayload): Promise<void> | void;
 }
 
 interface BodyCaptureLike {
@@ -75,11 +76,11 @@ export interface CaptureDeliveryDiagnostics {
 // out-of-space conditions so operators can route them differently.
 const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
 
-function classifyDlqWriteErrno(err: unknown): 'disk_full' | 'dead_letter_write_failed' {
+function classifyDlqWriteErrno(err: unknown): 'EC_DISK_FULL' | 'EC_DLQ_WRITE_FAILED' {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   return code !== undefined && DISK_FULL_ERRNO_CODES.has(code)
-    ? 'disk_full'
-    : 'dead_letter_write_failed';
+    ? 'EC_DISK_FULL'
+    : 'EC_DLQ_WRITE_FAILED';
 }
 
 export function serializeCause(cause: unknown): unknown {
@@ -97,6 +98,41 @@ export function serializeCause(cause: unknown): unknown {
   return cause;
 }
 
+const WARNING_SENSITIVE_KEY = /authorization|cookie|token|secret|password|credential|api[-_]?key|dsn/i;
+const WARNING_SECRET_VALUE =
+  /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+|([?&](?:token|key|secret|password|authorization)=)[^&\s]+|\b(?:secret|token|password|api[-_]?key)[-_][A-Za-z0-9._~+/=-]+\b|https?:\/\/[^@\s/]+:[^@\s/]+@/gi;
+
+export function scrubInternalWarningValue(value: unknown, depth = 0): unknown {
+  if (depth > 4) {
+    return '[REDACTED_DEPTH]';
+  }
+
+  if (typeof value === 'string') {
+    return value.replace(WARNING_SECRET_VALUE, (match, bearerPrefix, queryPrefix) => {
+      if (typeof bearerPrefix === 'string') return `${bearerPrefix}[REDACTED]`;
+      if (typeof queryPrefix === 'string') return `${queryPrefix}[REDACTED]`;
+      if (!match.startsWith('http')) return '[REDACTED]';
+      return 'https://[REDACTED]@';
+    }).slice(0, 500);
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((entry) => scrubInternalWarningValue(entry, depth + 1));
+  }
+
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>).slice(0, 50)) {
+      out[key] = WARNING_SENSITIVE_KEY.test(key)
+        ? '[REDACTED]'
+        : scrubInternalWarningValue(entry, depth + 1);
+    }
+    return out;
+  }
+
+  return value;
+}
+
 function emitSafeWarning(
   config: ResolvedConfig,
   warning: InternalWarning & { code: InternalWarningCode }
@@ -109,8 +145,12 @@ function emitSafeWarning(
     const enriched: InternalWarning = {
       code: warning.code,
       message: warning.message,
-      ...(warning.cause !== undefined ? { cause: serializeCause(warning.cause) } : {}),
-      ...(warning.context !== undefined ? { context: warning.context } : {}),
+      ...(warning.cause !== undefined
+        ? { cause: scrubInternalWarningValue(serializeCause(warning.cause)) }
+        : {}),
+      ...(warning.context !== undefined
+        ? { context: scrubInternalWarningValue(warning.context) as Record<string, unknown> }
+        : {}),
     };
     try {
       config.onInternalWarning(enriched);
@@ -351,7 +391,7 @@ export class ErrorCapturer {
         debug('capture() rate-limited, dropping');
         this.healthMetrics?.recordDroppedRateLimited();
         emitSafeWarning(this.config, {
-          code: 'rate_limited',
+          code: 'EC_RATE_LIMITED',
           message: `Rate limit exceeded (${this.config.rateLimitPerMinute} per ${this.config.rateLimitWindowMs}ms); error dropped.`
         });
         return null;
@@ -492,8 +532,8 @@ export class ErrorCapturer {
           ? `${captureError.name}: ${captureError.message.slice(0, 200)}`
           : 'unknown';
       emitSafeWarning(this.config, {
-        code: 'capture_failed',
-        message: `Error capture failed: ${detail} [code=errorcore_capture_failed]. If this recurs, check onInternalWarning for details.`,
+        code: 'EC_CAPTURE_FAILED',
+        message: `Error capture failed: ${detail} [code=EC_CAPTURE_FAILED]. If this recurs, check onInternalWarning for details.`,
         cause: captureError,
         context: { stage: 'primary', detail }
       });
@@ -501,7 +541,7 @@ export class ErrorCapturer {
 
       if (this.deadLetterStore !== null) {
         try {
-          this.deadLetterStore.appendFailureMarkerSync('capture_failed');
+          this.deadLetterStore.appendFailureMarkerSync('EC_CAPTURE_FAILED');
         } catch {
         }
       }
@@ -593,12 +633,12 @@ export class ErrorCapturer {
   }
 
   private captureInline(parts: ErrorPackageParts): ErrorPackage {
-    const { packageObject, payload } = finalizePackageAssemblyResult({
+    const { packageObject, payload, envelope } = finalizePackageAssemblyResult({
       packageObject: this.packageBuilder.build(parts),
       config: this.config,
       encryption: this.encryption
     });
-    this.dispatchTransport(payload);
+    this.dispatchTransport({ serialized: payload, ...(envelope === undefined ? {} : { envelope }) });
     return packageObject;
   }
 
@@ -610,7 +650,10 @@ export class ErrorCapturer {
         throw new Error('Package assembly worker returned no result');
       }
 
-      this.dispatchTransport(result.payload);
+      this.dispatchTransport({
+        serialized: result.payload,
+        ...(result.envelope === undefined ? {} : { envelope: result.envelope })
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       parts.captureFailures.push(`package-worker: ${message}`);
@@ -619,8 +662,8 @@ export class ErrorCapturer {
         this.captureInline(parts);
       } catch (fallbackError) {
         emitSafeWarning(this.config, {
-          code: 'capture_failed',
-          message: 'Error capture fallback failed [code=errorcore_capture_fallback_failed]. Both the worker and inline capture paths failed.',
+          code: 'EC_CAPTURE_FAILED',
+          message: 'Error capture fallback failed [code=EC_CAPTURE_FAILED]. Both the worker and inline capture paths failed.',
           cause: fallbackError,
           context: { stage: 'fallback' }
         });
@@ -628,7 +671,25 @@ export class ErrorCapturer {
     }
   }
 
-  private dispatchTransport(payload: string): void {
+  private dispatchTransport(payload: TransportPayload): void {
+    const serializedBytes = Buffer.isBuffer(payload.serialized)
+      ? payload.serialized.length
+      : Buffer.byteLength(payload.serialized, 'utf8');
+    if (serializedBytes > this.config.hardCapBytes) {
+      emitSafeWarning(this.config, {
+        code: 'EC_PACKAGE_OVER_HARD_CAP',
+        message: `Error package exceeded hard cap (${serializedBytes} > ${this.config.hardCapBytes} bytes); payload dropped.`,
+        context: {
+          serializedBytes,
+          hardCapBytes: this.config.hardCapBytes,
+          eventId: payload.envelope?.eventId
+        }
+      });
+      this.deliveryDiagnostics.dropped += 1;
+      this.healthMetrics?.recordDroppedCaptureFailed();
+      return;
+    }
+
     this.healthMetrics?.recordCaptured();
     const start = Date.now();
 
@@ -654,10 +715,10 @@ export class ErrorCapturer {
         // codes"). The raw reason is still delivered to
         // onInternalWarning via `context.reason` and `cause`.
         emitSafeWarning(this.config, {
-          code: isTimeout ? 'transport_timeout' : 'transport_failed',
+          code: isTimeout ? 'EC_TRANSPORT_TIMEOUT' : 'EC_TRANSPORT_FAILED',
           message: isTimeout
-            ? 'Transport timeout [code=errorcore_transport_timeout]. Payload dead-lettered (if configured). Check collector connectivity.'
-            : 'Transport dispatch failed [code=errorcore_transport_dispatch_failed]. Payload dead-lettered (if configured). Check collector connectivity.',
+            ? 'Transport timeout [code=EC_TRANSPORT_TIMEOUT]. Payload dead-lettered (if configured). Check collector connectivity.'
+            : 'Transport dispatch failed [code=EC_TRANSPORT_FAILED]. Payload dead-lettered (if configured). Check collector connectivity.',
           cause: transportError,
           context: { reason }
         });
@@ -666,12 +727,16 @@ export class ErrorCapturer {
 
         if (this.deadLetterStore !== null) {
           try {
-            const stored = this.deadLetterStore.appendPayloadSync(payload);
+            const stored = this.deadLetterStore.appendPayloadSync(
+              Buffer.isBuffer(payload.serialized)
+                ? payload.serialized.toString('utf8')
+                : payload.serialized
+            );
             if (stored) {
               this.deliveryDiagnostics.deadLettered += 1;
             } else {
               // DLQ declined the write (size cap / oversized payload).
-              // The store has already emitted its own `dead_letter_full`
+              // The store has already emitted its own `EC_DLQ_FULL`
               // warning via the onInternalWarning hook wired at SDK
               // construction — don't double-emit here.
               this.deliveryDiagnostics.dropped += 1;
@@ -684,9 +749,9 @@ export class ErrorCapturer {
               // Console message is sanitized (errno only; no raw
               // exception text). Structured details on the callback.
               message:
-                code === 'disk_full'
-                  ? 'Dead-letter store write failed: out of disk space [code=errorcore_disk_full]. Check disk capacity at deadLetterPath.'
-                  : 'Dead-letter store write failed [code=errorcore_dead_letter_write_failed]. Check disk space and permissions at deadLetterPath.',
+                code === 'EC_DISK_FULL'
+                  ? 'Dead-letter store write failed: out of disk space [code=EC_DISK_FULL]. Check disk capacity at deadLetterPath.'
+                  : 'Dead-letter store write failed [code=EC_DLQ_WRITE_FAILED]. Check disk space and permissions at deadLetterPath.',
               cause: dlError,
               context: {
                 errno: (dlError as NodeJS.ErrnoException | null)?.code

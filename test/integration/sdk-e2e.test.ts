@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { createServer, request as httpRequest } from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -80,7 +81,11 @@ async function sendRequest(input: {
   });
 }
 
-function readDeliveredPackage(filePath: string, encryptionKey?: string) {
+function readDeliveredPackage(
+  filePath: string,
+  encryptionKey?: string,
+  options?: { macKey?: string }
+) {
   const content = fs.readFileSync(filePath, 'utf8').trim();
   expect(content.length).toBeGreaterThan(0);
 
@@ -98,7 +103,10 @@ function readDeliveredPackage(filePath: string, encryptionKey?: string) {
   // The producing SDK records its version on the envelope; mirror it on
   // the decrypt-side Encryption so the AAD binding matches.
   const sdkVersion = envelope.sdk.version;
-  const decrypted = new Encryption(encryptionKey, { sdkVersion }).decrypt(envelope);
+  const decrypted = new Encryption(encryptionKey, {
+    sdkVersion,
+    macKey: options?.macKey
+  }).decrypt(envelope);
   return JSON.parse(decrypted);
 }
 
@@ -108,6 +116,112 @@ afterEach(() => {
 });
 
 describe('SDK integration', () => {
+  it('starts in production with encryptionKeyCallback and emits encrypted packages', async () => {
+    const output = createTempOutput('errorcore-e2e-callback-key');
+    const previousNodeEnv = process.env.NODE_ENV;
+    const encryptionKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    let sdk: ReturnType<typeof createSDK> | null = null;
+
+    process.env.NODE_ENV = 'production';
+
+    try {
+      sdk = createSDK({
+        encryptionKeyCallback: () => encryptionKey,
+        transport: { type: 'file', path: output.file },
+        captureBody: false,
+        rateLimitPerMinute: 1000,
+        bufferSize: 500,
+        bufferMaxBytes: 1024 * 1024,
+        useWorkerAssembly: false
+      });
+      sdk.activate();
+      sdk.captureError(new Error('callback-key-boom'));
+      await sdk.shutdown();
+
+      const pkg = readDeliveredPackage(output.file, encryptionKey);
+      expect(pkg.completeness.encrypted).toBe(true);
+      expect(pkg.error.message).toBe('callback-key-boom');
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv;
+      if (sdk?.isActive()) {
+        await sdk.shutdown();
+      }
+      fs.rmSync(output.directory, { recursive: true, force: true });
+    }
+  });
+
+  it('built worker assembly emits envelopes compatible with configured macKey and SDK version', () => {
+    const script = String.raw`
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { createSDK } = require('./dist/sdk');
+const { Encryption } = require('./dist/security/encryption');
+const pkgJson = require('./package.json');
+
+(async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'errorcore-dist-worker-mac-'));
+  const file = path.join(directory, 'errorcore-output.log');
+  const encryptionKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const macKey = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+  const sdk = createSDK({
+    encryptionKey,
+    macKey,
+    transport: { type: 'file', path: file },
+    captureBody: false,
+    rateLimitPerMinute: 1000,
+    bufferSize: 500,
+    bufferMaxBytes: 1024 * 1024,
+    flushIntervalMs: 0,
+    silent: true,
+    useWorkerAssembly: true
+  });
+
+  try {
+    sdk.activate();
+    sdk.captureError(new Error('dist-worker-mac-boom'));
+    await sdk.shutdown();
+
+    const line = fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).at(-1);
+    const envelope = JSON.parse(line);
+    const plaintext = new Encryption(encryptionKey, {
+      macKey,
+      sdkVersion: envelope.sdk.version
+    }).decrypt(envelope);
+    const packageObject = JSON.parse(plaintext);
+
+    process.stdout.write(JSON.stringify({
+      sdkVersion: envelope.sdk.version,
+      packageVersion: pkgJson.version,
+      keyId: envelope.keyId,
+      message: packageObject.error.message
+    }));
+  } finally {
+    await sdk.shutdown().catch(() => undefined);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+})().catch((error) => {
+  process.stderr.write(error.stack || error.message || String(error));
+  process.exit(1);
+});
+`;
+
+    const output = execFileSync(process.execPath, ['-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8'
+    });
+    const result = JSON.parse(output) as {
+      sdkVersion: string;
+      packageVersion: string;
+      keyId: string;
+      message: string;
+    };
+
+    expect(result.sdkVersion).toBe(result.packageVersion);
+    expect(result.keyId).not.toBe('unencrypted');
+    expect(result.message).toBe('dist-worker-mac-boom');
+  });
+
   it('captures and delivers an encrypted package from a real inbound HTTP request', async () => {
     const output = createTempOutput('errorcore-e2e-encrypted');
     const sdk = createSDK({

@@ -3,6 +3,7 @@ import fs = require('node:fs');
 import path = require('node:path');
 
 import { safeConsole } from '../debug-log';
+import { toTransportPayload, type TransportSendInput } from './payload';
 
 interface FileTransportConfig {
   path: string;
@@ -32,9 +33,10 @@ export class FileTransport {
     this.maxBackups = config.maxBackups ?? 5;
   }
 
-  public async send(payload: string | Buffer): Promise<void> {
+  public async send(input: TransportSendInput): Promise<void> {
     try {
       await this.rotateIfNeeded();
+      const payload = toTransportPayload(input).serialized;
       const line = Buffer.isBuffer(payload)
         ? Buffer.concat([payload, Buffer.from('\n')])
         : `${payload}\n`;

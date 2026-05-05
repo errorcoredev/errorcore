@@ -44,6 +44,7 @@ const DEFAULT_HEADER_ALLOWLIST = [
   'x-correlation-id',
   'host',
   'traceparent',
+  'tracestate',
   // Operational headers that aren't PII but materially help debugging.
   // The blocklist below still filters auth/secret-y values regardless.
   'idempotency-key',
@@ -329,9 +330,14 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     );
   }
 
+  const resolvedMacKey = userConfig.macKey
+    ?? (process.env.ERRORCORE_MAC_KEY !== undefined && process.env.ERRORCORE_MAC_KEY !== ''
+      ? process.env.ERRORCORE_MAC_KEY
+      : undefined);
+
   if (
-    userConfig.macKey !== undefined &&
-    !/^[0-9a-f]{64}$/i.test(userConfig.macKey)
+    resolvedMacKey !== undefined &&
+    !/^[0-9a-f]{64}$/i.test(resolvedMacKey)
   ) {
     throw new Error(
       'macKey must be a 64-character hex string (32 bytes). ' +
@@ -514,6 +520,19 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     if (transport.timeoutMs !== undefined) {
       assertPositiveInteger(transport.timeoutMs, 'transport.timeoutMs');
     }
+
+    if (
+      transport.protocol !== undefined &&
+      transport.protocol !== 'auto' &&
+      transport.protocol !== 'http1' &&
+      transport.protocol !== 'http2'
+    ) {
+      throw new Error("transport.protocol must be one of 'auto' | 'http1' | 'http2'");
+    }
+
+    if (transport.protocol === 'http2' && new URL(transport.url).protocol !== 'https:') {
+      throw new Error('transport.protocol: "http2" requires an https:// collector URL; h2c is not supported');
+    }
   }
 
   const resolvedTransport: PublicTransportConfig =
@@ -522,6 +541,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
           type: 'http',
           url: transport.url,
           ...(transport.timeoutMs === undefined ? {} : { timeoutMs: transport.timeoutMs }),
+          protocol: transport.protocol ?? 'auto',
           ...(transport.maxBackups === undefined ? {} : { maxBackups: transport.maxBackups })
         }
       : transport;
@@ -604,7 +624,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     envAllowlist: [...(userConfig.envAllowlist ?? DEFAULT_ENV_ALLOWLIST)],
     envBlocklist: [...(userConfig.envBlocklist ?? DEFAULT_ENV_BLOCKLIST)],
     encryptionKey: resolvedEncryptionKey,
-    macKey: userConfig.macKey,
+    macKey: resolvedMacKey,
     encryptionKeyCallback: userConfig.encryptionKeyCallback,
     previousEncryptionKeys: [...previousEncryptionKeys],
     // Default matches the transport default above (isProduction() gate): in

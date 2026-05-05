@@ -23,6 +23,7 @@ interface ALSManagerLike {
   getContext(): RequestContext | undefined;
   formatTraceparent(): string | null;
   formatOutboundTracestate?(): string | null;
+  getTraceHeaders?(): { traceparent: string; tracestate?: string } | null;
 }
 
 interface BodyCaptureLike {
@@ -129,16 +130,21 @@ export class HttpClientRecorder {
       const target = buildTarget(request);
 
       if (context !== undefined) {
-        const traceparent = this.als.formatTraceparent();
-        try {
-          if (traceparent !== null) {
-            request.setHeader('traceparent', traceparent);
-          }
-          // Module 21: prepend our ec=clk:<n> entry to inherited vendor
-          // entries from ingress and emit alongside traceparent.
+        const traceHeaders = this.als.getTraceHeaders?.() ?? (() => {
+          const traceparent = this.als.formatTraceparent();
+          if (traceparent === null) return null;
           const tracestate = this.als.formatOutboundTracestate?.() ?? null;
-          if (tracestate !== null && tracestate.length > 0) {
-            request.setHeader('tracestate', tracestate);
+          return {
+            traceparent,
+            ...(tracestate === null || tracestate.length === 0 ? {} : { tracestate })
+          };
+        })();
+        try {
+          if (traceHeaders !== null) {
+            request.setHeader('traceparent', traceHeaders.traceparent);
+          }
+          if (traceHeaders?.tracestate !== undefined) {
+            request.setHeader('tracestate', traceHeaders.tracestate);
           }
         } catch {
           // Request might already be sent or header immutable

@@ -32,6 +32,11 @@ export interface HealthSnapshot {
 
   transportQueueDepth: number;
   deadLetterDepth: number;
+  deadLetter: {
+    enabled: boolean;
+    signed: boolean;
+    reason: 'configured' | 'not_configured' | 'unsigned';
+  };
   ioBufferDepth: number;
 
   flushLatencyP50: number;
