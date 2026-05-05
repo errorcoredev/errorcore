@@ -7,6 +7,106 @@ ship in any minor release and are called out under the BREAKING heading.
 
 ## Unreleased
 
+### Breaking (pre-1.0 semver window) — wire-format ship-readiness pass
+
+- **EncryptedEnvelope wire format (hard cutover).** Captures are now
+  emitted as a 10-field envelope: `{ v: 1, eventId, sdk: { name, version },
+  keyId, iv, ciphertext, authTag, hmac, compressed, producedAt }`. The
+  pre-0.3 4-field shape (`{ salt, iv, ciphertext, authTag }`) is no
+  longer produced or accepted. Receivers MUST be upgraded to read the
+  new shape before deploying this SDK. The DLQ format follows the same
+  envelope; pre-0.3 dead-letter files cannot be drained under the new
+  code (they will fail integrity verification with
+  `EC_DECRYPT_HMAC_MISMATCH`). The 0.2.x → 0.3.0 upgrade requires
+  draining outstanding DLQs under the old SDK first.
+- **AAD binding + outer HMAC.** Encryption is now AES-256-GCM with
+  associated-data binding `<aadVersion>|<keyId>|<sdkVersion>|<eventId>`
+  set BEFORE plaintext flows into the cipher, and an outer
+  HMAC-SHA256 over `iv | ciphertext | authTag | AAD`. The outer HMAC
+  uses a separately-derived MAC sub-key (or an explicit `macKey`
+  config / `ERRORCORE_MAC_KEY`). A receiver can now reject obviously-
+  tampered envelopes pre-decryption and detect ciphertext-substitution
+  attacks the previous shape didn't catch.
+- **Plaintext zlib compression.** The plaintext package is deflated
+  before encryption when over 8 KB; the envelope's `compressed` flag
+  tells the receiver whether to inflate. Trims typical packages by
+  60-80%.
+- **`integrity` package field removed.** The HMAC now lives on the
+  envelope, not inside the plaintext. Consumers that read
+  `pkg.integrity.signature` no longer find it; the canonical mac is
+  `envelope.hmac`.
+- **`eventId` minted at capture.** Every `ErrorPackage` carries a
+  stable `eventId` (UUIDv4 today). The envelope echoes it, and the
+  receiver can use it to route, deduplicate, and bind audit trails.
+- **Hard-cap downgrade (1 MB).** When a serialized package exceeds
+  the new `hardCapBytes` (default `1_048_576`), the SDK sheds fields
+  in priority order — `localVariables`, then trims `ioTimeline` to
+  the last 50, then `evictionLog`, `concurrentRequests`,
+  `stateWrites`, `stateReads` — and emits
+  `pkg.truncated: { reason: 'hard_cap_1mb', droppedFields: [...] }`
+  so the receiver surfaces the loss explicitly. `serialization.maxTotalPackageSize`
+  remains a soft pre-shed limit and is unchanged in default.
+- **Production guard tightened.** When `NODE_ENV=production`, an
+  HTTP transport with `allowUnencrypted: true`, no DEK from
+  `encryptionKey` / `ERRORCORE_DEK` / `encryptionKeyCallback`, and no
+  `allowProductionPlaintext: true` flag, the SDK refuses to start
+  with `EC_PRODUCTION_PLAINTEXT_BYPASS`. The four-flag combo is
+  intentional friction.
+- **`InternalWarningCode` rename to `EC_*`** with the legacy
+  snake_case literals retained as type-level deprecated aliases.
+  Runtime emissions move to the new names progressively; the old
+  string literals continue to type-check on consumers' callbacks.
+
+### Added
+
+- `ERRORCORE_DEK` env var resolves the data-encryption key when no
+  `config.encryptionKey` is provided. `encryptionKeyCallback`
+  (sync or async) supports KMS-style key resolution at activate.
+- `macKey` / `ERRORCORE_MAC_KEY`: lets operators rotate the outer-
+  HMAC key independently of the DEK. Refuses keys shorter than 32
+  bytes (`EC_MAC_KEY_TOO_SHORT`).
+- `hardCapBytes` (default 1 MB): post-scrub, pre-encryption hard cap.
+  See `enforceHardCap` in `package-builder.ts`.
+- `allowProductionPlaintext: boolean` (default `false`): triple-flag
+  override for the production HTTP plaintext guard.
+- `deploymentEnv` config field + `ERRORCORE_ENVIRONMENT` env var:
+  spec §5 deployment-environment label distinct from `NODE_ENV`.
+- `ERRORCORE_RELEASE` env var: highest-priority `codeVersion.gitSha`
+  source, ahead of `GIT_SHA` / `COMMIT_SHA` / `SOURCE_VERSION`.
+- `processMetadata.processStartAnchor: TimeAnchor`: one-time anchor
+  captured at SDK init, surfaced on every package. Receivers use it
+  for cross-event UTC alignment.
+- `processMetadata.ppid`: parent process id.
+- `trace.isEntrySpan: boolean`: true when the SDK originated the
+  trace (no inbound traceparent). Lets reconstruction agents
+  distinguish gateway entry-spans from lost-parent spans.
+
+### Fixed
+
+- **§B1 timestamp scrub false-positive.** Infrastructure keys
+  (`hrtimeNs`, `startTime`, `endTime`, `wallClockMs`, etc.) are now
+  passed through the scrubber unmodified. Pre-fix, an 18-19 digit
+  hrtime that happened to Luhn-match the credit-card regex was
+  silently `[REDACTED]` — the v4 audit found 1794 such redactions
+  in a 374-capture corpus.
+- **idempotency-key value.** `idempotency-key`, `x-idempotency-key`,
+  `x-correlation-id`, `x-request-id`, `x-trace-id`, `etag`,
+  `if-match`, `if-none-match`, `range` values are no longer
+  redacted by the substring-on-`/key/` regex. The header NAME was
+  already allowlisted; this carry-over now also covers the value
+  side (and form-urlencoded body fields).
+
+### Spec amendments (code wins)
+
+See `docs/spec-amendments.md` for the three deviations from
+`Errorcore_Architecture.pdf` that the implementation kept after
+review. Summary:
+
+1. Locals serialization depth is 8, not 3.
+2. `captureDbBindParams: true` opt-in flag exists for testing;
+   default `false` matches the spec's "never values" guarantee.
+3. DLQ line-level integrity uses HMAC-SHA256, not CRC32.
+
 ### Breaking (pre-1.0 semver window)
 
 - The Lambda-timeout watchdog payload now uses the field name

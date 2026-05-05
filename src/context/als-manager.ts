@@ -138,7 +138,13 @@ export class ALSManager {
       traceId,
       spanId,
       parentSpanId,
-      traceFlags
+      traceFlags,
+      // True when we originated the trace (no inbound traceparent
+      // header). Surfaced into ErrorPackage.trace.isEntrySpan so a
+      // multi-service reconstruction agent can distinguish gateway
+      // entry-spans from "lost-parent" spans where an upstream capture
+      // is missing.
+      isEntrySpan: parsed === null
     };
   }
 

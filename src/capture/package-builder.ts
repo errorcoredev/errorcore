@@ -1,9 +1,13 @@
 
+import { randomUUID } from 'node:crypto';
+
 import { Scrubber } from '../pii/scrubber';
-import { Encryption } from '../security/encryption';
+import { Encryption, buildTransparentEnvelope } from '../security/encryption';
+import { getSdkVersion } from '../version';
 import type {
   CapturedFrame,
   Completeness,
+  EncryptedEnvelope,
   EvictionRecord,
   EvictionRecordSerialized,
   ErrorInfo,
@@ -119,17 +123,6 @@ function estimateBodySize(body: unknown): number {
   return Object.keys(body as Record<string, unknown>).length * 32;
 }
 
-function signSerializedPackage(
-  serializedPackage: string,
-  encryption: Encryption | null | undefined
-): string | null {
-  if (!encryption) {
-    return null;
-  }
-
-  return encryption.sign(serializedPackage);
-}
-
 /**
  * Count the number of rendered stack frames in an Error.stack string.
  * Lines starting with "    at " (after trimming) are counted as frames.
@@ -197,38 +190,29 @@ export function finalizePackageAssemblyResult(input: {
   packageObject: ErrorPackage;
   config: ResolvedConfig;
   encryption?: Encryption | null;
+  sdkVersion?: string;
 }): PackageAssemblyResult {
-  const { packageObject, config } = input;
-  const serializedPackageForSignature = JSON.stringify(packageObject);
-  const integritySignature = signSerializedPackage(
-    serializedPackageForSignature,
-    input.encryption
-  );
-
-  if (integritySignature !== null) {
-    packageObject.integrity = {
-      algorithm: 'HMAC-SHA256',
-      signature: integritySignature
-    };
-  }
-
-  const encrypted = config.encryptionKey !== undefined;
+  const { packageObject } = input;
+  const encrypted = input.encryption !== null && input.encryption !== undefined;
   packageObject.completeness.encrypted = encrypted;
-  const serializedPackage =
-    integritySignature === null && !encrypted
-      ? serializedPackageForSignature
-      : JSON.stringify(packageObject);
 
-  const payload = !encrypted
-    ? serializedPackage
-    : JSON.stringify(
-        (input.encryption ?? new Encryption(config.encryptionKey as string))
-          .encrypt(serializedPackage)
-      );
+  const serializedPackage = JSON.stringify(packageObject);
+  const plaintextBuf = Buffer.from(serializedPackage, 'utf8');
+  const sdkVersion = input.sdkVersion ?? getSdkVersion();
+
+  const envelope = encrypted
+    ? input.encryption!.encryptToEnvelope(plaintextBuf, {
+        eventId: packageObject.eventId
+      })
+    : buildTransparentEnvelope(plaintextBuf, {
+        eventId: packageObject.eventId,
+        sdkVersion
+      });
 
   return {
     packageObject,
-    payload
+    payload: JSON.stringify(envelope),
+    envelope
   };
 }
 
@@ -303,6 +287,7 @@ export class PackageBuilder {
 
     const packageObject: ErrorPackage = {
       schemaVersion: '1.1.0',
+      eventId: randomUUID(),
       service: this.config.service,
       capturedAt: new Date().toISOString(),
       errorEventSeq: parts.errorEventSeq,
@@ -346,7 +331,10 @@ export class PackageBuilder {
         spanId: parts.traceContext.spanId,
         parentSpanId: parts.traceContext.parentSpanId,
         tracestate: parts.traceContext.tracestate,
-        traceFlags: parts.traceContext.traceFlags
+        traceFlags: parts.traceContext.traceFlags,
+        ...(parts.traceContext.isEntrySpan !== undefined
+          ? { isEntrySpan: parts.traceContext.isEntrySpan }
+          : {})
       } : undefined,
       completeness: this.computeCompleteness(parts, false, {
         ioTimeline: serializedTimeline,
@@ -382,8 +370,78 @@ export class PackageBuilder {
 
     scrubbedPackage.completeness = this.computeCompleteness(parts, false, scrubbedPackage, frameAlignment);
     this.shedIfNeeded(scrubbedPackage, parts, frameAlignment);
+    this.enforceHardCap(scrubbedPackage);
 
     return scrubbedPackage;
+  }
+
+  /**
+   * Last-resort downgrade for packages that exceed the spec's 1 MB hard
+   * cap. Drops fields in priority order, marking the package's
+   * `truncated.droppedFields` so the receiver can surface the loss.
+   *
+   * Called AFTER scrubbing and `shedIfNeeded`, before encryption. The
+   * 1 MB target is approximate (we measure the JSON-stringified pkg
+   * plus a small envelope-overhead estimate); the receiver's authority
+   * is the actual envelope length on the wire.
+   */
+  private enforceHardCap(pkg: ErrorPackage): void {
+    const hardCap = this.config.hardCapBytes;
+    const ENVELOPE_OVERHEAD_ESTIMATE = 256;
+    const estimateSize = (): number =>
+      Buffer.byteLength(JSON.stringify(pkg), 'utf8') + ENVELOPE_OVERHEAD_ESTIMATE;
+
+    if (estimateSize() <= hardCap) return;
+
+    const dropped: string[] = [];
+    const markTruncated = (): void => {
+      pkg.truncated = { reason: 'hard_cap_1mb', droppedFields: [...dropped] };
+    };
+
+    if (pkg.localVariables !== undefined) {
+      delete pkg.localVariables;
+      dropped.push('localVariables');
+      markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.ioTimeline.length > 50) {
+      pkg.ioTimeline = pkg.ioTimeline.slice(-50);
+      dropped.push('ioTimeline:trim50');
+      markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.evictionLog.length > 0) {
+      pkg.evictionLog = [];
+      dropped.push('evictionLog');
+      markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.concurrentRequests.length > 0) {
+      pkg.concurrentRequests = [];
+      dropped.push('concurrentRequests');
+      markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.stateWrites.length > 0) {
+      pkg.stateWrites = [];
+      dropped.push('stateWrites');
+      markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.stateReads.length > 0) {
+      pkg.stateReads = [];
+      dropped.push('stateReads');
+      markTruncated();
+    }
+    // Even after all sheds, if still over cap the caller (encrypt path)
+    // is responsible for emitting EC_PACKAGE_OVER_HARD_CAP. We don't
+    // throw here: a too-large package is preferable to losing the event
+    // entirely; the receiver can still see whatever it does fit.
   }
 
   private shedIfNeeded(pkg: ErrorPackage, parts: ErrorPackageParts, frameAlignment?: 'full' | 'prefix_only'): void {

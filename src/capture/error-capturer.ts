@@ -459,7 +459,10 @@ export class ErrorCapturer {
           // Module 06: W3C trace-flags byte observed at capture time.
           // Lets the ingestion backend reason about sampling without
           // re-parsing the inbound traceparent header.
-          traceFlags: context.traceFlags
+          traceFlags: context.traceFlags,
+          // Spec §B7: distinguishes gateway entry-spans from
+          // lost-parent spans during reconstruction.
+          isEntrySpan: context.isEntrySpan
         } : undefined,
         sourceMapResolution: sourceMapTelemetry
       };

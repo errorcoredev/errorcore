@@ -16,6 +16,7 @@ import { HeaderFilter } from './pii/header-filter';
 import { Scrubber } from './pii/scrubber';
 import { RateLimiter } from './security/rate-limiter';
 import { Encryption } from './security/encryption';
+import { getSdkVersion } from './version';
 import { ProcessMetadata } from './capture/process-metadata';
 import { InspectorManager } from './capture/inspector-manager';
 import { BodyCapture } from './recording/body-capture';
@@ -67,6 +68,7 @@ function parseDerivedKeyFromEnv(): Buffer | undefined {
   }
   return Buffer.from(hex, 'hex');
 }
+
 
 function deriveDeadLetterVerifier(
   encryption: Encryption | null,
@@ -656,7 +658,9 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
   const encryption = config.encryptionKey
     ? new Encryption(config.encryptionKey, {
         derivedKey: parseDerivedKeyFromEnv(),
-        previousEncryptionKeys: config.previousEncryptionKeys
+        previousEncryptionKeys: config.previousEncryptionKeys,
+        macKey: config.macKey,
+        sdkVersion: getSdkVersion()
       })
     : null;
   const processMetadata = new ProcessMetadata(config);

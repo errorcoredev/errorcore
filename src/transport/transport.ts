@@ -324,23 +324,12 @@ export class TransportDispatcher implements Transport {
       this.fallbackTransport ??
       createTransport(this.config, this.transportAuthorization);
 
-    // sendSync is used only on the uncaught-exception path where we
-    // cannot await the async encrypt. Encryption.encrypt is itself
-    // synchronous, so there is no reason to skip it. Previously this
-    // path wrote plaintext to stdout/file even when the SDK was
-    // configured with an encryptionKey.
-    let outbound = payload;
-    if (this.encryption !== null) {
-      try {
-        outbound = JSON.stringify(this.encryption.encrypt(payload));
-      } catch {
-        // If encryption itself throws, fall back to the plaintext payload
-        // rather than dropping the error entirely. The SDK is already in
-        // a fatal-exit path.
-      }
-    }
-
-    transport.sendSync?.(outbound);
+    // sendSync is the uncaught-exception path. The package-builder is
+    // the single source of envelope assembly; by the time we get here
+    // the payload is already a JSON-stringified EncryptedEnvelope (or a
+    // transparent envelope when the SDK runs without a DEK). Do NOT
+    // re-encrypt — that would double-wrap and break decryption.
+    transport.sendSync?.(payload);
   }
 
   private initializeWorker(): void {
