@@ -1,5 +1,3 @@
-import type { ClientRequest } from 'node:http';
-
 export const ERRORCORE_INTERNAL = Symbol('errorcore.internal');
 
 export const SDK_INTERNAL_REQUESTS = new WeakSet<object>();
@@ -20,7 +18,7 @@ export function isInternalCallActive(): boolean {
   return internalCallDepth > 0;
 }
 
-export function markRequestAsInternal<T extends ClientRequest>(request: T): T {
+export function markRequestAsInternal<T extends object>(request: T): T {
   SDK_INTERNAL_REQUESTS.add(request);
   (request as T & { [ERRORCORE_INTERNAL]?: true })[ERRORCORE_INTERNAL] = true;
   return request;

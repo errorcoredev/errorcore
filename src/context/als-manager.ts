@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 
 import { EventClock } from './event-clock';
 import { parseTracestate, formatTracestate } from './tracestate';
-import type { RequestContext, ResolvedConfig } from '../types';
+import type { RequestContext, ResolvedConfig, TraceHeaders } from '../types';
 
 const DEFAULT_VENDOR_KEY = 'ec';
 
@@ -191,6 +191,19 @@ export class ALSManager {
     // the byte we observed on inbound (or 0x01 when we originated).
     const flagsHex = (ctx.traceFlags & 0xff).toString(16).padStart(2, '0');
     return `00-${ctx.traceId}-${ctx.spanId}-${flagsHex}`;
+  }
+
+  public getTraceHeaders(): TraceHeaders | null {
+    const traceparent = this.formatTraceparent();
+    if (traceparent === null) {
+      return null;
+    }
+
+    const tracestate = this.formatOutboundTracestate();
+    return {
+      traceparent,
+      ...(tracestate === null || tracestate.length === 0 ? {} : { tracestate })
+    };
   }
 
   public getStore(): AsyncLocalStorage<RequestContext> {

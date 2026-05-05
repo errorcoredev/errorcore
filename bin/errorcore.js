@@ -154,6 +154,7 @@ ${bold('Commands:')}
   ${cyan('validate')} [--config <path>]    Validate config and print resolved values
   ${cyan('status')}   [--config <path>]    Show dead-letter store status
   ${cyan('drain')}    [--config <path>]    Re-send dead-letter payloads
+  ${cyan('replay')}   [--config <path>]    Alias for drain
              [--dry-run] [--force] [--rotate]
   ${cyan('ui')}       [--config <path>]    Open the error dashboard
              [--port <number>]
@@ -413,7 +414,8 @@ async function cmdDrain(flags) {
   if (resolved.encryptionKey !== undefined) {
     const { Encryption } = requireDist(path.join('security', 'encryption.js'));
     const enc = new Encryption(resolved.encryptionKey, {
-      previousEncryptionKeys: resolved.previousEncryptionKeys || []
+      previousEncryptionKeys: resolved.previousEncryptionKeys || [],
+      macKey: resolved.macKey
     });
     verifier = {
       sign: (p) => enc.sign(p),
@@ -485,13 +487,17 @@ async function cmdDrain(flags) {
   }
 
   const transport = createTransportFromConfig(resolved, transportAuthorization);
+  const { parseEnvelopeMetadata } = requireDist(path.join('transport', 'payload.js'));
 
   const failedLineIndices = new Set();
   let failures = 0;
   for (let i = 0; i < payloads.length; i++) {
     const label = `[${i + 1}/${payloads.length}]`;
     try {
-      await transport.send(payloads[i]);
+      await transport.send({
+        serialized: payloads[i],
+        envelope: parseEnvelopeMetadata(payloads[i])
+      });
       process.stdout.write(`  ${label} ${green('sent')}\n`);
     } catch (err) {
       failures++;
@@ -561,7 +567,9 @@ function createTransportFromConfig(config, authorization) {
       url: t.url,
       authorization: authorization,
       timeoutMs: t.timeoutMs,
+      protocol: t.protocol,
       allowPlainHttpTransport: config.allowPlainHttpTransport,
+      allowInvalidCollectorCertificates: config.allowInvalidCollectorCertificates,
     });
   }
 
@@ -599,7 +607,10 @@ function cmdUI(flags) {
   let encryption = null;
   if (resolved.encryptionKey) {
     const { Encryption } = requireDist(path.join('security', 'encryption.js'));
-    encryption = new Encryption(resolved.encryptionKey);
+    encryption = new Encryption(resolved.encryptionKey, {
+      previousEncryptionKeys: resolved.previousEncryptionKeys || [],
+      macKey: resolved.macKey
+    });
   }
 
   const token = process.env.EC_DASHBOARD_TOKEN || undefined;
@@ -631,6 +642,7 @@ switch (command) {
     break;
 
   case 'drain':
+  case 'replay':
     cmdDrain(flags).catch((err) => {
       die(err.message || String(err));
     });

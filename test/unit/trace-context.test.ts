@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { ALSManager } from '../../src/context/als-manager';
 import { EventClock } from '../../src/context/event-clock';
 import { parseTracestate, formatTracestate } from '../../src/context/tracestate';
+import { createSDK } from '../../src/sdk';
 
 describe('parseTracestate', () => {
   it('parses a well-formed header with our vendor entry first', () => {
@@ -77,6 +78,56 @@ describe('parseTracestate', () => {
     expect(r.receivedSeq).toBe(3);
     // ec=foreign is treated as a foreign vendor entry (not our key) and preserved.
     expect(r.inheritedEntries).toEqual(['ec=foreign', 'vendor=x']);
+  });
+});
+
+describe('public W3C trace propagation helpers', () => {
+  it('getTraceHeaders returns traceparent and tracestate inside withTraceContext', () => {
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: { type: 'stdout' },
+      silent: true,
+      traceContext: { vendorKey: 'ec' }
+    });
+
+    const inboundTraceId = 'a'.repeat(32);
+    const inboundParentId = 'b'.repeat(16);
+    const headers = sdk.withTraceContext({
+      traceparent: `00-${inboundTraceId}-${inboundParentId}-0a`,
+      tracestate: 'vendor1=foo'
+    }, () => sdk.getTraceHeaders());
+
+    expect(headers).not.toBeNull();
+    expect(headers?.traceparent).toMatch(new RegExp(`^00-${inboundTraceId}-[0-9a-f]{16}-0a$`));
+    expect(headers?.tracestate).toBe('ec=clk:0,vendor1=foo');
+  });
+
+  it('withTraceContext preserves an existing ALS context instead of overwriting it', () => {
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: { type: 'stdout' },
+      silent: true
+    });
+
+    const firstTraceId = 'c'.repeat(32);
+    const secondTraceId = 'd'.repeat(32);
+
+    const observed = sdk.withTraceContext({
+      traceparent: `00-${firstTraceId}-${'1'.repeat(16)}-01`
+    }, () =>
+      sdk.withTraceContext({
+        traceparent: `00-${secondTraceId}-${'2'.repeat(16)}-01`
+      }, () => sdk.getTraceHeaders())
+    );
+
+    expect(observed?.traceparent).toContain(firstTraceId);
+    expect(observed?.traceparent).not.toContain(secondTraceId);
+  });
+
+  it('module-level getTraceHeaders returns null before init', async () => {
+    const errorcore = await import('../../src/index');
+
+    expect(errorcore.getTraceHeaders()).toBeNull();
   });
 });
 

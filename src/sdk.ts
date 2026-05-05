@@ -16,7 +16,10 @@ import { HeaderFilter } from './pii/header-filter';
 import { Scrubber } from './pii/scrubber';
 import { RateLimiter } from './security/rate-limiter';
 import { Encryption } from './security/encryption';
-import { getSdkVersion } from './version';
+import {
+  createEncryptionFromAssemblyConfig,
+  createPackageAssemblyEncryptionConfig
+} from './security/encryption-runtime';
 import { ProcessMetadata } from './capture/process-metadata';
 import { InspectorManager } from './capture/inspector-manager';
 import { BodyCapture } from './recording/body-capture';
@@ -30,6 +33,7 @@ import { PatchManager } from './recording/patches/patch-manager';
 import { ChannelSubscriber } from './recording/channel-subscriber';
 import { PackageBuilder } from './capture/package-builder';
 import { TransportDispatcher } from './transport/transport';
+import { parseEnvelopeMetadata } from './transport/payload';
 import {
   DeadLetterStore,
   createHmacVerifier,
@@ -41,7 +45,14 @@ import { SourceMapResolver } from './capture/source-map-resolver';
 import { WatchdogManager } from './middleware/watchdog';
 import { HealthMetrics } from './health/health-metrics';
 import type { HealthSnapshot } from './health/types';
-import type { RequestContext, ResolvedConfig, SDKConfig, TransportConfig } from './types';
+import type {
+  RequestContext,
+  ResolvedConfig,
+  SDKConfig,
+  TraceContextInput,
+  TraceHeaders,
+  TransportConfig
+} from './types';
 
 type SDKState = 'created' | 'active' | 'shutting_down' | 'shutdown';
 
@@ -56,19 +67,6 @@ function getTransportAuthorization(
 ): string | undefined {
   return transport?.type === 'http' ? transport.authorization : undefined;
 }
-
-function parseDerivedKeyFromEnv(): Buffer | undefined {
-  const hex = process.env.ERRORCORE_DERIVED_KEY;
-  if (hex === undefined || hex === '') return undefined;
-  if (!/^[0-9a-f]{64}$/i.test(hex)) {
-    safeConsole.warn(
-      '[errorcore] ERRORCORE_DERIVED_KEY must be a 64-character hex string (32 bytes). Falling back to runtime key derivation.'
-    );
-    return undefined;
-  }
-  return Buffer.from(hex, 'hex');
-}
-
 
 function deriveDeadLetterVerifier(
   encryption: Encryption | null,
@@ -91,6 +89,49 @@ function deriveDeadLetterVerifier(
   const fallback = config.encryptionKey ?? transportAuthorization;
   if (fallback === undefined) return null;
   return createHmacVerifier(fallback);
+}
+
+interface DeadLetterHealthState {
+  enabled: boolean;
+  signed: boolean;
+  reason: 'configured' | 'not_configured' | 'unsigned';
+}
+
+function normalizeCallbackEncryptionKey(value: string | Buffer): string {
+  if (Buffer.isBuffer(value)) {
+    if (value.length !== 32) {
+      throw new Error('encryptionKeyCallback must return a 32-byte Buffer or 64-character hex string');
+    }
+    return value.toString('hex');
+  }
+
+  if (!/^[0-9a-f]{64}$/i.test(value)) {
+    throw new Error('encryptionKeyCallback must return a 32-byte Buffer or 64-character hex string');
+  }
+
+  return value;
+}
+
+function resolveEncryptionKeyCallback(config: ResolvedConfig): ResolvedConfig {
+  if (config.encryptionKey !== undefined || config.encryptionKeyCallback === undefined) {
+    return config;
+  }
+
+  const resolved = config.encryptionKeyCallback();
+  if (
+    typeof resolved === 'object' &&
+    resolved !== null &&
+    typeof (resolved as unknown as Promise<unknown>).then === 'function'
+  ) {
+    throw new Error(
+      'encryptionKeyCallback returned a Promise, but createSDK()/init() are synchronous. Resolve the key before calling createSDK(), or use a synchronous callback.'
+    );
+  }
+
+  return {
+    ...config,
+    encryptionKey: normalizeCallbackEncryptionKey(resolved as string | Buffer)
+  };
 }
 
 export class SDKInstance {
@@ -146,6 +187,8 @@ export class SDKInstance {
 
   private readonly healthMetrics: HealthMetrics;
 
+  private readonly deadLetterHealth: DeadLetterHealthState;
+
   public constructor(input: {
     config: ResolvedConfig;
     buffer: IOEventBuffer;
@@ -167,6 +210,7 @@ export class SDKInstance {
     deadLetterStore: DeadLetterStore | null;
     watchdog: WatchdogManager | null;
     healthMetrics: HealthMetrics;
+    deadLetterHealth: DeadLetterHealthState;
   }) {
     this.config = input.config;
     this.buffer = input.buffer;
@@ -188,6 +232,7 @@ export class SDKInstance {
     this.deadLetterStore = input.deadLetterStore;
     this.watchdog = input.watchdog;
     this.healthMetrics = input.healthMetrics;
+    this.deadLetterHealth = input.deadLetterHealth;
   }
 
   public activate(): void {
@@ -322,7 +367,10 @@ export class SDKInstance {
     const sendAll = async () => {
       for (const entry of batch) {
         try {
-          await this.transport.send(entry.payload);
+          await this.transport.send({
+            serialized: entry.payload,
+            envelope: parseEnvelopeMetadata(entry.payload)
+          });
           processedLineCount = entry.lineNumber;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -392,6 +440,26 @@ export class SDKInstance {
     return this.als.runWithContext(context, fn);
   }
 
+  public withTraceContext<T>(input: TraceContextInput, fn: () => T): T {
+    if (this.als.getContext() !== undefined) {
+      return fn();
+    }
+
+    const context = this.als.createRequestContext({
+      method: input.method ?? 'INTERNAL',
+      url: input.url ?? 'withTraceContext',
+      headers: input.headers ?? {},
+      traceparent: input.traceparent,
+      tracestate: input.tracestate
+    });
+
+    return this.als.runWithContext(context, fn);
+  }
+
+  public getTraceHeaders(): TraceHeaders | null {
+    return this.als.getTraceHeaders();
+  }
+
   public async flush(): Promise<void> {
     // flush() is called from user code (typically in graceful shutdown
     // paths) and from the shutdown sequence itself. Allow it during the
@@ -440,6 +508,7 @@ export class SDKInstance {
       transportFailures: this.healthMetrics.getTransportFailures(),
       transportQueueDepth: this.errorCapturer.getPendingTransportCount(),
       deadLetterDepth: this.deadLetterStore?.getPendingCount() ?? 0,
+      deadLetter: this.deadLetterHealth,
       ioBufferDepth: bufferStats.slotCount,
       flushLatencyP50: this.healthMetrics.getLatencyPercentile(0.5),
       flushLatencyP99: this.healthMetrics.getLatencyPercentile(0.99),
@@ -508,7 +577,7 @@ export class SDKInstance {
     if (diagnostics.dropped > 0) {
       try {
         this.config.onInternalWarning({
-          code: 'errorcore_payloads_dropped',
+          code: 'EC_PAYLOADS_DROPPED',
           message: `${diagnostics.dropped} error package(s) could not be delivered or dead-lettered`,
           context: { count: diagnostics.dropped }
         });
@@ -520,7 +589,7 @@ export class SDKInstance {
     if (diagnostics.deadLettered > 0) {
       try {
         this.config.onInternalWarning({
-          code: 'errorcore_payloads_dead_lettered',
+          code: 'EC_PAYLOADS_DEAD_LETTERED',
           message: `${diagnostics.deadLettered} error package(s) stored in dead-letter queue for retry`,
           context: { count: diagnostics.deadLettered }
         });
@@ -639,7 +708,7 @@ export class SDKInstance {
 }
 
 export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
-  const config = resolveConfig(userConfig);
+  const config = resolveEncryptionKeyCallback(resolveConfig(userConfig));
   setLogLevel(config.logLevel);
   const transportAuthorization = getTransportAuthorization(userConfig.transport);
   const eventClock = new EventClock();
@@ -655,14 +724,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     maxCaptures: config.rateLimitPerMinute,
     windowMs: config.rateLimitWindowMs
   });
-  const encryption = config.encryptionKey
-    ? new Encryption(config.encryptionKey, {
-        derivedKey: parseDerivedKeyFromEnv(),
-        previousEncryptionKeys: config.previousEncryptionKeys,
-        macKey: config.macKey,
-        sdkVersion: getSdkVersion()
-      })
-    : null;
+  const packageAssemblyEncryption = createPackageAssemblyEncryptionConfig(config);
+  const encryption = createEncryptionFromAssemblyConfig(packageAssemblyEncryption);
   const processMetadata = new ProcessMetadata(config);
   const inspector = new InspectorManager(config, {
     getRequestId: () => als.getRequestId(),
@@ -750,7 +813,21 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     safeConsole.warn(
       '[ErrorCore] Dead-letter persistence is disabled because no encryptionKey or HTTP authorization secret is configured.'
     );
+    try {
+      config.onInternalWarning?.({
+        code: 'EC_DLQ_DISABLED',
+        message: 'Dead-letter persistence is disabled because no stable signing secret is configured.',
+        context: { reason: 'unsigned' }
+      });
+    } catch {
+    }
   }
+  const deadLetterHealth: DeadLetterHealthState =
+    config.deadLetterPath === undefined
+      ? { enabled: false, signed: false, reason: 'not_configured' }
+      : deadLetterStore === null
+        ? { enabled: false, signed: false, reason: 'unsigned' }
+        : { enabled: true, signed: true, reason: 'configured' };
   const sourceMapResolver = config.resolveSourceMaps
     ? new SourceMapResolver({
         sourceMapSyncThresholdBytes: config.sourceMapSyncThresholdBytes
@@ -763,7 +840,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     sourceMapResolver.warmCache();
   }
   const packageAssemblyDispatcher = config.useWorkerAssembly
-    ? new PackageAssemblyDispatcher({ config })
+    ? new PackageAssemblyDispatcher({ config, encryption: packageAssemblyEncryption })
     : null;
   let watchdog: WatchdogManager | null = null;
   if (config.serverless && config.transport.type === 'http') {
@@ -814,6 +891,7 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     bodyCapture,
     deadLetterStore,
     watchdog,
-    healthMetrics
+    healthMetrics,
+    deadLetterHealth
   });
 }

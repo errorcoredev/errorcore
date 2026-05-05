@@ -208,7 +208,11 @@ export class Encryption {
     let firstFailure: 'hmac' | 'authTag' | null = null;
 
     for (const km of keyOrder) {
-      const aad = buildAad(envelope.eventId, this.sdkVersion, km.keyId);
+      const aad = buildAad(
+        envelope.eventId,
+        envelope.sdk?.version ?? this.sdkVersion,
+        km.keyId
+      );
       const computedHmac = createHmac('sha256', km.macKey)
         .update(iv)
         .update(ciphertext)

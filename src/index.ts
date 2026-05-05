@@ -1,6 +1,6 @@
 // Copyright 2026 ErrorCore Dev — PolyForm Small Business 1.0.0 — see LICENSE.md
 
-import type { SDKConfig } from './types';
+import type { SDKConfig, TraceContextInput, TraceHeaders } from './types';
 import type { HealthSnapshot } from './health/types';
 import { SDKInstance, createSDK } from './sdk';
 import { resetMiddlewareWarning } from './middleware/common';
@@ -55,7 +55,7 @@ function setCaptureWarningEmitted(value: boolean): void {
  * // With an explicit config object
  * require('errorcore').init({
  *   transport: { type: 'http', url: 'https://collector.example.com/v1/errors' },
- *   encryptionKey: process.env.ERRORCORE_ENCRYPTION_KEY,
+ *   encryptionKey: process.env.ERRORCORE_DEK,
  * });
  *
  * @example
@@ -145,6 +145,19 @@ export function withContext<T>(fn: () => T): T {
   return instance.withContext(fn);
 }
 
+export function withTraceContext<T>(
+  input: TraceContextInput,
+  fn: () => T
+): T {
+  const instance = getGlobalInstance();
+
+  if (instance === null) {
+    return fn();
+  }
+
+  return instance.withTraceContext(input, fn);
+}
+
 export async function flush(): Promise<void> {
   const instance = getGlobalInstance();
 
@@ -193,7 +206,14 @@ export { wrapHandler } from './middleware/raw-http';
 export { withErrorcore } from './middleware/nextjs';
 export { wrapLambda, wrapServerless } from './middleware/lambda';
 
-export type { SDKConfig, ErrorPackage, Completeness, ResolvedConfig } from './types';
+export type {
+  SDKConfig,
+  ErrorPackage,
+  Completeness,
+  ResolvedConfig,
+  TraceContextInput,
+  TraceHeaders
+} from './types';
 export type { SDKInstance } from './sdk';
 export type { LambdaContext } from './middleware/lambda';
 export type { HealthSnapshot } from './health/types';
@@ -210,4 +230,8 @@ export function getModuleInstance(): SDKInstance | null {
 
 export function getTraceparent(): string | null {
   return getGlobalInstance()?.als.formatTraceparent() ?? null;
+}
+
+export function getTraceHeaders(): TraceHeaders | null {
+  return getGlobalInstance()?.getTraceHeaders() ?? null;
 }

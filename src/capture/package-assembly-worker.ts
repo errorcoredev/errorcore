@@ -2,7 +2,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 
 import { buildPackageAssemblyResult } from './package-builder';
-import { Encryption } from '../security/encryption';
+import { createEncryptionFromAssemblyConfig } from '../security/encryption-runtime';
 import type {
   PackageAssemblyWorkerData,
   PackageAssemblyWorkerRequest,
@@ -16,9 +16,7 @@ function startPackageAssemblyWorker(data: PackageAssemblyWorkerData): void {
     return;
   }
 
-  const encryption = data.config.encryptionKey
-    ? new Encryption(data.config.encryptionKey)
-    : null;
+  const encryption = createEncryptionFromAssemblyConfig(data.encryption);
 
   port.on('message', (message: PackageAssemblyWorkerRequest) => {
     try {

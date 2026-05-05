@@ -1,11 +1,13 @@
 
 import type { ResolvedConfig } from '../types';
+import type { TransportPayload } from '../types';
 import type { Encryption } from '../security/encryption';
 import { createDebug } from '../debug';
 import { FileTransport } from './file-transport';
 import { HttpTransport } from './http-transport';
 import { StdoutTransport } from './stdout-transport';
 import { safeConsole } from '../debug-log';
+import { toTransportPayload, type TransportSendInput } from './payload';
 
 const debug = createDebug('transport');
 
@@ -40,14 +42,14 @@ interface SyncCapableTransport extends Transport {
 
 interface PendingRequest {
   type: 'send' | 'flush' | 'shutdown';
-  payload?: string | Buffer;
+  payload?: TransportPayload;
   shutdownOptions?: { timeoutMs?: number };
   resolve: () => void;
   reject: (error: Error) => void;
 }
 
 interface QueueItem {
-  payload: string | Buffer;
+  payload: TransportPayload;
   resolve: () => void;
   reject: (error: Error) => void;
 }
@@ -165,10 +167,16 @@ function createTransport(config) {
 
 const transport = createTransport(workerData.config);
 
+function normalizePayload(payload) {
+  return payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, 'serialized')
+    ? payload.serialized
+    : payload;
+}
+
 parentPort.on('message', async (message) => {
   try {
     if (message.type === 'send') {
-      await transport.send(message.payload);
+      await transport.send(normalizePayload(message.payload));
       parentPort.postMessage({ id: message.id });
       return;
     }
@@ -209,6 +217,7 @@ function createTransport(
       url: config.transport.url,
       authorization: transportAuthorization,
       timeoutMs: config.transport.timeoutMs,
+      protocol: config.transport.protocol,
       allowPlainHttpTransport: config.allowPlainHttpTransport,
       allowInvalidCollectorCertificates: config.allowInvalidCollectorCertificates
     });
@@ -233,7 +242,7 @@ function createTransport(
  *             Implementations should implicitly flush before releasing.
  */
 export interface Transport {
-  send(payload: string | Buffer): Promise<void>;
+  send(payload: TransportPayload): Promise<void>;
   flush(): Promise<void>;
   shutdown(options?: { timeoutMs?: number }): Promise<void>;
 }
@@ -279,8 +288,9 @@ export class TransportDispatcher implements Transport {
     this.initializeWorker();
   }
 
-  public async send(payload: string | Buffer): Promise<void> {
+  public async send(input: TransportSendInput): Promise<void> {
     debug(`send() called, worker=${this.worker !== null ? 'active' : 'null'}`);
+    const payload = toTransportPayload(input);
 
     if (this.worker !== null) {
       return this.dispatchToWorker('send', payload);
@@ -479,7 +489,7 @@ export class TransportDispatcher implements Transport {
 
   private dispatchToWorker(
     type: 'send' | 'flush' | 'shutdown',
-    payload?: string | Buffer,
+    payload?: TransportPayload,
     shutdownOptions?: { timeoutMs?: number }
   ): Promise<void> {
     if (this.worker === null) {
@@ -510,7 +520,7 @@ export class TransportDispatcher implements Transport {
     });
   }
 
-  private enqueueFallback(payload: string | Buffer): Promise<void> {
+  private enqueueFallback(payload: TransportPayload): Promise<void> {
     this.ensureFallbackTransport();
 
     return new Promise<void>((resolve, reject) => {

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type {
   ErrorPackageParts,
   PackageAssemblyResult,
+  PackageAssemblyEncryptionConfig,
   PackageAssemblyWorkerConfig,
   PackageAssemblyWorkerData,
   PackageAssemblyWorkerRequest,
@@ -91,10 +92,15 @@ export class PackageAssemblyDispatcher {
 
   private shuttingDown = false;
 
-  public constructor(input: { config: ResolvedConfig; workerFactory?: WorkerFactory }) {
+  public constructor(input: {
+    config: ResolvedConfig;
+    encryption?: PackageAssemblyEncryptionConfig;
+    workerFactory?: WorkerFactory;
+  }) {
     this.workerFactory = input.workerFactory;
     this.workerData = {
-      config: createWorkerConfig(input.config)
+      config: createWorkerConfig(input.config),
+      ...(input.encryption === undefined ? {} : { encryption: input.encryption })
     };
     this.initializeWorker();
   }

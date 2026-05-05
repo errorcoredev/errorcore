@@ -71,7 +71,9 @@ function decodeQueryComponent(value: string): string {
 }
 
 function matchesSensitiveKey(key: string): boolean {
-  const normalizedKey = key.toLowerCase();
+  const normalizedKey = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .toLowerCase();
 
   if (SENSITIVE_KEY_EXACT_MATCHES.has(normalizedKey)) {
     return true;
@@ -119,6 +121,7 @@ const INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
 const SENSITIVE_KEY_EXACT_VALUE_PASSTHROUGH = new Set<string>([
   'idempotency-key', 'x-idempotency-key',
   'x-correlation-id', 'x-request-id', 'x-trace-id',
+  'traceparent', 'tracestate', 'retry-after',
   'etag', 'if-match', 'if-none-match', 'range'
 ]);
 

@@ -8,12 +8,13 @@ Errorcore captures the state around a failure so you can inspect what happened a
 
 ## What it does
 
-- Captures local variables and arguments at the point an error is thrown
+- Optionally captures local variables and arguments at the point an error is thrown
 - Tracks request context across async boundaries using AsyncLocalStorage
 - Records outbound IO in sequence
 - Attaches process and environment metadata with optional scrubbing
 - Encrypts payloads before transport
 - Buffers failed deliveries and retries when the network is available
+- Propagates W3C `traceparent` / `tracestate` headers for cross-service error context
 
 ## Getting started
 
@@ -65,12 +66,29 @@ module.exports = {
     type: 'http',
     url: 'https://collector.example.com/v1/errors',
     authorization: 'Bearer <token>',
+    protocol: 'auto',
   },
-  encryptionKey: process.env.ERRORCORE_ENCRYPTION_KEY,
+  encryptionKey: process.env.ERRORCORE_DEK,
+  macKey: process.env.ERRORCORE_MAC_KEY,
 };
 ```
 
 Generate a key: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+
+HTTP collector transport defaults to `protocol: 'auto'`: HTTPS collectors try HTTP/2 first and fall back to HTTP/1.1 only when negotiation fails; plain HTTP uses HTTP/1.1 only and still requires `allowPlainHttpTransport: true`. Set `protocol: 'http1'` to force HTTP/1.1 or `protocol: 'http2'` to require HTTPS HTTP/2. The SDK does not instrument application HTTP/2 servers or clients in this release.
+
+Manual propagation helpers are available when framework middleware is not enough:
+
+```js
+const errorcore = require('errorcore');
+
+errorcore.withTraceContext({ traceparent, tracestate, method: 'POST', url: '/job' }, () => {
+  const headers = errorcore.getTraceHeaders();
+  // attach headers.traceparent / headers.tracestate to outbound work
+});
+```
+
+This is W3C propagation and package metadata only. There is no span API, exporter, OpenTelemetry bridge, tracing UI, ingestion layer, reconstruction layer, default-on locals, or identity extraction in this SDK release.
 
 ## Database driver tiers
 

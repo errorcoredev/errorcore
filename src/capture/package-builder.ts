@@ -370,7 +370,7 @@ export class PackageBuilder {
 
     scrubbedPackage.completeness = this.computeCompleteness(parts, false, scrubbedPackage, frameAlignment);
     this.shedIfNeeded(scrubbedPackage, parts, frameAlignment);
-    this.enforceHardCap(scrubbedPackage);
+    this.enforceHardCap(scrubbedPackage, parts, frameAlignment);
 
     return scrubbedPackage;
   }
@@ -385,7 +385,11 @@ export class PackageBuilder {
    * plus a small envelope-overhead estimate); the receiver's authority
    * is the actual envelope length on the wire.
    */
-  private enforceHardCap(pkg: ErrorPackage): void {
+  private enforceHardCap(
+    pkg: ErrorPackage,
+    parts: ErrorPackageParts,
+    frameAlignment?: 'full' | 'prefix_only'
+  ): void {
     const hardCap = this.config.hardCapBytes;
     const ENVELOPE_OVERHEAD_ESTIMATE = 256;
     const estimateSize = (): number =>
@@ -396,6 +400,12 @@ export class PackageBuilder {
     const dropped: string[] = [];
     const markTruncated = (): void => {
       pkg.truncated = { reason: 'hard_cap_1mb', droppedFields: [...dropped] };
+      pkg.completeness = this.computeCompleteness(
+        parts,
+        pkg.completeness.encrypted,
+        pkg,
+        frameAlignment
+      );
     };
 
     if (pkg.localVariables !== undefined) {
@@ -412,9 +422,28 @@ export class PackageBuilder {
       if (estimateSize() <= hardCap) return;
     }
 
-    if (pkg.evictionLog.length > 0) {
-      pkg.evictionLog = [];
-      dropped.push('evictionLog');
+    let strippedBodies = false;
+    for (const event of pkg.ioTimeline) {
+      if (event.requestBody !== null) {
+        event.requestBody = null;
+        event.requestBodyTruncated = true;
+        strippedBodies = true;
+      }
+      if (event.responseBody !== null) {
+        event.responseBody = null;
+        event.responseBodyTruncated = true;
+        strippedBodies = true;
+      }
+    }
+    if (strippedBodies) {
+      dropped.push('ioTimeline:bodies');
+      markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.stateReads.length > 0) {
+      pkg.stateReads = [];
+      dropped.push('stateReads');
       markTruncated();
       if (estimateSize() <= hardCap) return;
     }
@@ -426,16 +455,23 @@ export class PackageBuilder {
       if (estimateSize() <= hardCap) return;
     }
 
-    if (pkg.stateWrites.length > 0) {
-      pkg.stateWrites = [];
-      dropped.push('stateWrites');
+    if (pkg.ambientContext !== undefined) {
+      delete pkg.ambientContext;
+      dropped.push('ambientContext');
       markTruncated();
       if (estimateSize() <= hardCap) return;
     }
 
-    if (pkg.stateReads.length > 0) {
-      pkg.stateReads = [];
-      dropped.push('stateReads');
+    if (pkg.evictionLog.length > 0) {
+      pkg.evictionLog = [];
+      dropped.push('evictionLog');
+      markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.stateWrites.length > 0) {
+      pkg.stateWrites = [];
+      dropped.push('stateWrites');
       markTruncated();
     }
     // Even after all sheds, if still over cap the caller (encrypt path)

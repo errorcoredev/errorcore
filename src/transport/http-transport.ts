@@ -1,20 +1,27 @@
 
 import http = require('node:http');
+import http2 = require('node:http2');
 import https = require('node:https');
 
+import { createDebug } from '../debug';
 import { markRequestAsInternal } from '../recording/internal';
 import { runAsInternal } from '../recording/net-dns';
+import { toTransportPayload, type TransportSendInput } from './payload';
+
+const debug = createDebug('http-transport');
 
 interface HttpTransportConfig {
   url: string;
   authorization?: string;
   timeoutMs?: number;
+  protocol?: 'auto' | 'http1' | 'http2';
   allowPlainHttpTransport?: boolean;
   allowInvalidCollectorCertificates?: boolean;
 }
 
-const MAX_ATTEMPTS = 3;
-const RETRY_DELAYS_MS = [200, 600, 1800];
+const MAX_ATTEMPTS = 5;
+const RETRY_DELAYS_MS = [200, 600, 1800, 5400];
+const RETRY_BUDGET_MS = 30000;
 
 // Shared with error-capturer.ts so both sides agree on the exact string
 // used to distinguish a timeout from other transport failures. Exported
@@ -34,6 +41,32 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function parseRetryAfter(value: string | string[] | undefined): number | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.ceil(seconds * 1000);
+  }
+
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
+  }
+
+  return undefined;
+}
+
+class Http2UnavailableError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'Http2UnavailableError';
+  }
 }
 
 function warnOnInvalidCertificatesOnce(
@@ -67,6 +100,12 @@ export class HttpTransport {
 
   private readonly agent: http.Agent | https.Agent;
 
+  private readonly protocol: 'auto' | 'http1' | 'http2';
+
+  private http2Session: http2.ClientHttp2Session | null = null;
+
+  private negotiatedProtocol: 'http1' | 'http2' | null = null;
+
   public constructor(config: HttpTransportConfig) {
     this.url = new URL(config.url);
     this.authorization = config.authorization;
@@ -74,11 +113,16 @@ export class HttpTransport {
     this.allowPlainHttpTransport = config.allowPlainHttpTransport ?? false;
     this.allowInvalidCollectorCertificates =
       config.allowInvalidCollectorCertificates ?? false;
+    this.protocol = config.protocol ?? 'auto';
 
     if (this.url.protocol !== 'https:' && !this.allowPlainHttpTransport) {
       throw new Error(
         'HTTP transport requires an https:// URL. Set allowPlainHttpTransport: true to allow plain HTTP (not recommended).'
       );
+    }
+
+    if (this.protocol === 'http2' && this.url.protocol !== 'https:') {
+      throw new Error('HTTP/2 collector transport requires an https:// URL; h2c is not supported.');
     }
 
     this.agent = this.url.protocol === 'https:'
@@ -91,8 +135,10 @@ export class HttpTransport {
     );
   }
 
-  public async send(payload: string | Buffer): Promise<void> {
+  public async send(input: TransportSendInput): Promise<void> {
+    const payload = toTransportPayload(input);
     let lastError: Error | null = null;
+    const startedAt = Date.now();
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       try {
@@ -101,8 +147,9 @@ export class HttpTransport {
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
-        if (attempt < MAX_ATTEMPTS - 1 && this.isRetryableError(lastError)) {
-          await delay(RETRY_DELAYS_MS[attempt]);
+        const retryDelay = this.getRetryDelay(lastError, attempt, startedAt);
+        if (retryDelay !== null) {
+          await delay(retryDelay);
           continue;
         }
 
@@ -119,12 +166,33 @@ export class HttpTransport {
 
   public async shutdown(): Promise<void> {
     this.agent.destroy();
+    this.destroyHttp2Session();
   }
 
-  private sendOnce(payload: string | Buffer): Promise<void> {
+  private async sendOnce(payload: ReturnType<typeof toTransportPayload>): Promise<void> {
+    if (this.protocol === 'http1' || this.url.protocol !== 'https:') {
+      await this.sendHttp1Once(payload);
+      return;
+    }
+
+    try {
+      await this.sendHttp2Once(payload);
+    } catch (error) {
+      if (this.protocol === 'auto' && error instanceof Http2UnavailableError) {
+        debug(`HTTP/2 unavailable for collector; falling back to HTTP/1.1: ${error.message}`);
+        await this.sendHttp1Once(payload);
+        return;
+      }
+
+      throw error;
+    }
+  }
+
+  private sendHttp1Once(payload: ReturnType<typeof toTransportPayload>): Promise<void> {
     return new Promise((resolve, reject) => {
-      const raw = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
-      const body = Buffer.concat([raw, Buffer.from('\n')]);
+      const body = Buffer.isBuffer(payload.serialized)
+        ? payload.serialized
+        : Buffer.from(payload.serialized);
       const useHttps = this.url.protocol === 'https:';
       const requestModule =
         useHttps ? https : this.allowPlainHttpTransport ? http : null;
@@ -153,8 +221,14 @@ export class HttpTransport {
               method: 'POST',
               agent: this.agent,
               headers: {
-                'content-type': 'application/x-ndjson',
+                'content-type': 'application/errorcore+json',
                 'content-length': String(body.length),
+                ...(payload.envelope?.keyId === undefined
+                  ? {}
+                  : { 'X-Errorcore-Key-Id': payload.envelope.keyId }),
+                ...(payload.envelope?.eventId === undefined
+                  ? {}
+                  : { 'X-Errorcore-Event-Id': payload.envelope.eventId }),
                 ...(this.authorization === undefined
                   ? {}
                   : { Authorization: this.authorization })
@@ -173,8 +247,10 @@ export class HttpTransport {
 
                 const statusError = new Error(`HTTP ${statusCode}`) as Error & {
                   statusCode?: number;
+                  retryAfterMs?: number;
                 };
                 statusError.statusCode = statusCode;
+                statusError.retryAfterMs = parseRetryAfter(response.headers?.['retry-after']);
                 reject(statusError);
               });
             }
@@ -193,6 +269,162 @@ export class HttpTransport {
         request.end();
       });
     });
+  }
+
+  private sendHttp2Once(payload: ReturnType<typeof toTransportPayload>): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const body = Buffer.isBuffer(payload.serialized)
+        ? payload.serialized
+        : Buffer.from(payload.serialized);
+
+      runAsInternal(() => {
+        this.getHttp2Session()
+          .then((session) => {
+            if (this.negotiatedProtocol !== 'http2') {
+              this.negotiatedProtocol = 'http2';
+              debug('collector negotiated protocol: h2');
+            }
+
+            const requestHeaders: http2.OutgoingHttpHeaders = {
+              [http2.constants.HTTP2_HEADER_METHOD]: http2.constants.HTTP2_METHOD_POST,
+              [http2.constants.HTTP2_HEADER_PATH]: `${this.url.pathname}${this.url.search}`,
+              [http2.constants.HTTP2_HEADER_SCHEME]: 'https',
+              [http2.constants.HTTP2_HEADER_AUTHORITY]: this.url.host,
+              'content-type': 'application/errorcore+json',
+              'content-length': String(body.length),
+              ...(payload.envelope?.keyId === undefined
+                ? {}
+                : { 'x-errorcore-key-id': payload.envelope.keyId }),
+              ...(payload.envelope?.eventId === undefined
+                ? {}
+                : { 'x-errorcore-event-id': payload.envelope.eventId }),
+              ...(this.authorization === undefined
+                ? {}
+                : { authorization: this.authorization })
+            };
+
+            const stream = markRequestAsInternal(session.request(requestHeaders));
+            let settled = false;
+            let statusCode = 500;
+            let retryAfterMs: number | undefined;
+
+            const settle = (fn: () => void): void => {
+              if (settled) return;
+              settled = true;
+              fn();
+            };
+
+            stream.setTimeout(this.timeoutMs, () => {
+              stream.close();
+              settle(() => reject(new Error(HTTP_TRANSPORT_TIMEOUT_MESSAGE)));
+            });
+
+            stream.on('response', (headers) => {
+              const rawStatus = headers[http2.constants.HTTP2_HEADER_STATUS];
+              statusCode = typeof rawStatus === 'number' ? rawStatus : Number(rawStatus ?? 500);
+              const retryAfter = headers['retry-after'];
+              retryAfterMs = parseRetryAfter(
+                typeof retryAfter === 'string' || Array.isArray(retryAfter)
+                  ? retryAfter
+                  : undefined
+              );
+            });
+
+            stream.on('data', () => undefined);
+            stream.on('error', (error) => {
+              this.destroyHttp2Session();
+              settle(() => reject(error));
+            });
+            stream.on('end', () => {
+              if (statusCode >= 200 && statusCode < 300) {
+                settle(resolve);
+                return;
+              }
+
+              const statusError = new Error(`HTTP ${statusCode}`) as Error & {
+                statusCode?: number;
+                retryAfterMs?: number;
+              };
+              statusError.statusCode = statusCode;
+              statusError.retryAfterMs = retryAfterMs;
+              settle(() => reject(statusError));
+            });
+
+            stream.end(body);
+          })
+          .catch((error) => {
+            reject(
+              this.protocol === 'auto'
+                ? new Http2UnavailableError(error instanceof Error ? error.message : String(error))
+                : error instanceof Error ? error : new Error(String(error))
+            );
+          });
+      });
+    });
+  }
+
+  private getHttp2Session(): Promise<http2.ClientHttp2Session> {
+    if (
+      this.http2Session !== null &&
+      !this.http2Session.destroyed &&
+      !this.http2Session.closed
+    ) {
+      return Promise.resolve(this.http2Session);
+    }
+
+    return new Promise((resolve, reject) => {
+      const session = http2.connect(this.url.origin, {
+        rejectUnauthorized: !this.allowInvalidCollectorCertificates
+      });
+      let settled = false;
+
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        session.destroy();
+        reject(error);
+      };
+
+      const timeout = setTimeout(() => {
+        fail(new Error(HTTP_TRANSPORT_TIMEOUT_MESSAGE));
+      }, this.timeoutMs);
+      timeout.unref();
+
+      session.once('connect', () => {
+        if (settled) return;
+        const negotiatedProtocol = (
+          session.socket as { alpnProtocol?: string | false | null } | undefined
+        )?.alpnProtocol;
+        if (typeof negotiatedProtocol === 'string' && negotiatedProtocol !== 'h2') {
+          fail(new Error(`collector did not negotiate HTTP/2 via ALPN (got ${negotiatedProtocol})`));
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timeout);
+        this.http2Session = session;
+        session.once('close', () => {
+          if (this.http2Session === session) {
+            this.http2Session = null;
+          }
+        });
+        session.once('error', () => {
+          if (this.http2Session === session) {
+            this.http2Session = null;
+          }
+        });
+        resolve(session);
+      });
+
+      session.once('error', fail);
+    });
+  }
+
+  private destroyHttp2Session(): void {
+    if (this.http2Session !== null) {
+      this.http2Session.destroy();
+      this.http2Session = null;
+    }
   }
 
   private isRetryableError(error: Error & { statusCode?: number; code?: string }): boolean {
@@ -230,5 +462,24 @@ export class HttpTransport {
     }
 
     return false;
+  }
+
+  private getRetryDelay(
+    error: Error & { statusCode?: number; code?: string; retryAfterMs?: number },
+    attempt: number,
+    startedAt: number
+  ): number | null {
+    if (attempt >= MAX_ATTEMPTS - 1 || !this.isRetryableError(error)) {
+      return null;
+    }
+
+    const elapsed = Date.now() - startedAt;
+    const remainingBudget = RETRY_BUDGET_MS - elapsed;
+    if (remainingBudget <= 0) {
+      return null;
+    }
+
+    const configuredDelay = error.retryAfterMs ?? RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]!;
+    return Math.min(configuredDelay, remainingBudget);
   }
 }

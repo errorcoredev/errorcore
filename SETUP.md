@@ -73,10 +73,21 @@ transport: {
   type: 'http',
   url: 'https://collector.example.com/v1/errors',
   authorization: 'Bearer <collector-token>',
+  protocol: 'auto',
   timeoutMs: 5000,
   maxBackups: 5,
 }
 ```
+
+`protocol` controls the collector transport only:
+
+| Value | Behavior |
+|-------|----------|
+| `'auto'` (default) | HTTPS tries HTTP/2 first, logs the negotiated protocol at debug level, then falls back to HTTP/1.1 only if HTTP/2 negotiation fails before a request is committed. Plain HTTP uses HTTP/1.1 only and still requires `allowPlainHttpTransport: true`. |
+| `'http1'` | Always use the HTTP/1.1 transport path. |
+| `'http2'` | Require HTTPS HTTP/2. Startup/config validation rejects plain HTTP; send fails if HTTP/2 cannot be negotiated. Cleartext h2c is not supported. |
+
+This does not add application `node:http2` instrumentation. The SDK continues to record app HTTP through the existing HTTP/HTTPS and undici hooks.
 
 **File transport** (controlled environments):
 
@@ -97,11 +108,20 @@ transport: { type: 'stdout' }
 
 ### Encryption
 
-By default, the SDK requires an encryption key. Packages are encrypted with AES-256-GCM before leaving the process.
+By default in production, the SDK requires an encryption key. Packages are encrypted with AES-256-GCM and authenticated with an outer HMAC before leaving the process.
 
 ```js
-encryptionKey: 'your-secret-key',
+encryptionKey: process.env.ERRORCORE_DEK,
+macKey: process.env.ERRORCORE_MAC_KEY,
 ```
+
+`encryptionKey` must be a 64-character hex string (32 bytes). `encryptionKeyCallback` is a synchronous resolver that is called once during SDK creation and then behaves exactly like `encryptionKey`:
+
+```js
+encryptionKeyCallback: () => loadHexKeyFromLocalKmsCache(),
+```
+
+The DEK resolution order is `encryptionKey`, then `ERRORCORE_DEK`, then `encryptionKeyCallback`. The MAC key resolution order is `macKey`, then `ERRORCORE_MAC_KEY`; when omitted, the SDK derives a separate MAC sub-key from the DEK.
 
 If you want to run without encryption (development only):
 
@@ -190,6 +210,7 @@ Headers and environment variables are filtered using allowlists and blocklists.
 headerAllowlist: [
   'content-type', 'content-length', 'accept',
   'user-agent', 'x-request-id', 'x-correlation-id', 'host',
+  'traceparent', 'tracestate', 'retry-after',
 ],
 
 headerBlocklist: [
@@ -231,7 +252,7 @@ stateTracking: {
 
 ### Trace context
 
-Configures the W3C `tracestate` vendor key used for cross-service Lamport-clock propagation.
+Configures the W3C `tracestate` vendor key used for cross-service Lamport-clock propagation. The SDK preserves inbound W3C `traceparent` flags, preserves foreign `tracestate` entries up to W3C limits, and adds its own clock entry under the configured vendor key.
 
 ```js
 traceContext: {
@@ -240,6 +261,19 @@ traceContext: {
 ```
 
 Pick a short identifier -- outbound `tracestate` is capped at 512 characters total, and longer keys leave less room for the actual state value. Invalid keys are rejected at `init()`.
+
+Manual propagation helpers are available for queues, jobs, and custom middleware:
+
+```js
+const errorcore = require('errorcore');
+
+errorcore.withTraceContext({ traceparent, tracestate, method: 'POST', url: '/worker' }, () => {
+  const headers = errorcore.getTraceHeaders();
+  // headers is null outside an active context
+});
+```
+
+`withTraceContext(input, fn)` keeps an existing AsyncLocalStorage context if one is already active. It does not create spans, sampling policy, baggage, exporters, OpenTelemetry bridges, or tracing UI.
 
 ### Limits and tuning
 

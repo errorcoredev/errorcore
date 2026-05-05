@@ -40,11 +40,15 @@ ship in any minor release and are called out under the BREAKING heading.
   receiver can use it to route, deduplicate, and bind audit trails.
 - **Hard-cap downgrade (1 MB).** When a serialized package exceeds
   the new `hardCapBytes` (default `1_048_576`), the SDK sheds fields
-  in priority order — `localVariables`, then trims `ioTimeline` to
-  the last 50, then `evictionLog`, `concurrentRequests`,
-  `stateWrites`, `stateReads` — and emits
+  in priority order: `localVariables`, trims `ioTimeline` to the
+  newest 50, removes request/response bodies from remaining I/O
+  events, then drops `stateReads`, `concurrentRequests`, and
+  `ambientContext`. It may also drop lower-value historical state or
+  eviction telemetry if needed to fit. The SDK emits
   `pkg.truncated: { reason: 'hard_cap_1mb', droppedFields: [...] }`
-  so the receiver surfaces the loss explicitly. `serialization.maxTotalPackageSize`
+  so the receiver surfaces the loss explicitly. If the final serialized
+  envelope is still over the cap, the SDK emits `EC_PACKAGE_OVER_HARD_CAP`
+  and drops the payload before transport. `serialization.maxTotalPackageSize`
   remains a soft pre-shed limit and is unchanged in default.
 - **Production guard tightened.** When `NODE_ENV=production`, an
   HTTP transport with `allowUnencrypted: true`, no DEK from
@@ -54,19 +58,42 @@ ship in any minor release and are called out under the BREAKING heading.
   intentional friction.
 - **`InternalWarningCode` rename to `EC_*`** with the legacy
   snake_case literals retained as type-level deprecated aliases.
-  Runtime emissions move to the new names progressively; the old
+  Runtime emissions now use the new names; the old
   string literals continue to type-check on consumers' callbacks.
 
 ### Added
 
+- Collector HTTP transport protocol selection:
+  `transport.protocol: 'auto' | 'http1' | 'http2'`. `auto` is the
+  default; HTTPS tries HTTP/2 first and falls back to HTTP/1.1 only
+  when negotiation fails before a request is committed. Plain HTTP
+  never attempts h2c. `http2` requires HTTPS and fails clearly when
+  HTTP/2 cannot be negotiated.
+- HTTP collector sends now use one Errorcore envelope per POST with
+  `Content-Type: application/errorcore+json` plus
+  `X-Errorcore-Key-Id` / `X-Errorcore-Event-Id` headers when envelope
+  metadata is present. File and stdout transports remain line-oriented.
+- Tight W3C propagation helpers:
+  `getTraceHeaders()` and `withTraceContext(input, fn)`. These expose
+  `traceparent` / `tracestate` propagation and package metadata only:
+  no spans, exporter, OpenTelemetry bridge, tracing UI, baggage, or
+  sampling product surface.
+- Dead-letter replay now sends typed transport payloads so HTTP replay
+  retains envelope metadata headers; `errorcore replay` is an alias for
+  `errorcore drain`.
+- Runtime warnings emitted through `onInternalWarning` use `EC_*`
+  codes and scrub structured context/cause before user callbacks.
+
 - `ERRORCORE_DEK` env var resolves the data-encryption key when no
-  `config.encryptionKey` is provided. `encryptionKeyCallback`
-  (sync or async) supports KMS-style key resolution at activate.
+  `config.encryptionKey` is provided. `encryptionKeyCallback` is a
+  synchronous resolver called once during SDK creation before activation.
 - `macKey` / `ERRORCORE_MAC_KEY`: lets operators rotate the outer-
   HMAC key independently of the DEK. Refuses keys shorter than 32
   bytes (`EC_MAC_KEY_TOO_SHORT`).
-- `hardCapBytes` (default 1 MB): post-scrub, pre-encryption hard cap.
-  See `enforceHardCap` in `package-builder.ts`.
+- `hardCapBytes` (default 1 MB): final serialized envelope hard cap.
+  The SDK applies deterministic downgrades, recomputes completeness,
+  and drops the payload with `EC_PACKAGE_OVER_HARD_CAP` rather than
+  sending an oversized envelope.
 - `allowProductionPlaintext: boolean` (default `false`): triple-flag
   override for the production HTTP plaintext guard.
 - `deploymentEnv` config field + `ERRORCORE_ENVIRONMENT` env var:

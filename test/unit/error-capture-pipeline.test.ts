@@ -970,7 +970,7 @@ describe('ErrorCapturer', () => {
     const pkg = als.runWithContext(context, () => capturer.capture(error));
     await flushMicrotasks();
 
-    const sentPayload = transport.send.mock.calls[0]?.[0] as string;
+    const sentPayload = (transport.send.mock.calls[0]?.[0] as { serialized: string }).serialized;
     const envelope = JSON.parse(sentPayload) as import('../../src/types').EncryptedEnvelope;
     expect(envelope.v).toBe(1);
     expect(typeof envelope.eventId).toBe('string');
@@ -1290,7 +1290,7 @@ describe('ErrorCapturer', () => {
     expect(fileContents).not.toContain('collector offline');
     expect(persisted.entries).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('collector offline');
 
@@ -1359,7 +1359,7 @@ describe('ErrorCapturer', () => {
       expect.stringContaining('[ErrorCore] File transport dropped payload:')
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1462,7 +1462,7 @@ describe('ErrorCapturer', () => {
     expect(stdout.writes).toHaveLength(1);
     expect(store.drain().entries).toEqual([]);
     expect(warnSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1566,7 +1566,7 @@ describe('ErrorCapturer', () => {
     expect(stdout.writes).toHaveLength(1);
     expect(store.drain().entries).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1616,7 +1616,7 @@ describe('ErrorCapturer', () => {
     expect(fileContents).not.toContain('stack with secret-token');
     expect(drained.entries).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_capture_failed]')
+      expect.stringContaining('[code=EC_CAPTURE_FAILED]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('user-visible secret-token');
 
@@ -1667,7 +1667,7 @@ describe('ErrorCapturer', () => {
     await flushMicrotasks(10);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_capture_fallback_failed]')
+      expect.stringContaining('[code=EC_CAPTURE_FAILED]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
 
@@ -1676,7 +1676,12 @@ describe('ErrorCapturer', () => {
   });
 
   it('emits sanitized warning codes when dead-letter fallback storage fails', async () => {
-    const config = resolveConfig({});
+    const warnings: import('../../src/types').InternalWarning[] = [];
+    const config = resolveConfig({
+      onInternalWarning: (warning) => {
+        warnings.push(warning);
+      }
+    });
     const processMetadata = new ProcessMetadata(config);
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -1710,12 +1715,16 @@ describe('ErrorCapturer', () => {
     await flushMicrotasks(10);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_transport_dispatch_failed]')
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[code=errorcore_dead_letter_write_failed]')
+      expect.stringContaining('[code=EC_DLQ_WRITE_FAILED]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
+    expect(JSON.stringify(warnings)).not.toContain('secret-token');
+    expect(warnings.map((warning) => warning.code)).toEqual(
+      expect.arrayContaining(['EC_TRANSPORT_FAILED', 'EC_DLQ_WRITE_FAILED'])
+    );
 
     requestTracker.shutdown();
     processMetadata.shutdown();

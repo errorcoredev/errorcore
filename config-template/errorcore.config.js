@@ -9,6 +9,7 @@ module.exports = {
   //   type: 'http',
   //   url: 'https://collector.example.com/v1/errors',
   //   authorization: 'Bearer <collector-token>',
+  //   protocol: 'auto', // 'auto' | 'http1' | 'http2'
   //   timeoutMs: 5000,
   //   maxBackups: 5,
   // },
@@ -44,8 +45,10 @@ module.exports = {
   // Provide a 64-character hex key (32 bytes) for payload encryption.
   // Use an environment variable — never hardcode secrets in config files.
   // Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-  encryptionKey: process.env.ERRORCORE_ENCRYPTION_KEY,
-  // IMPORTANT: Set to false and configure encryptionKey via ERRORCORE_ENCRYPTION_KEY
+  encryptionKey: process.env.ERRORCORE_DEK,
+  // Optional separate outer-HMAC key. Defaults to a DEK-derived MAC sub-key.
+  macKey: process.env.ERRORCORE_MAC_KEY,
+  // IMPORTANT: Set to false and configure encryptionKey via ERRORCORE_DEK
   // before deploying to production.
   allowUnencrypted: true,
 
@@ -62,7 +65,10 @@ module.exports = {
     'user-agent',
     'x-request-id',
     'x-correlation-id',
-    'host'
+    'host',
+    'traceparent',
+    'tracestate',
+    'retry-after'
   ],
 
   headerBlocklist: [
