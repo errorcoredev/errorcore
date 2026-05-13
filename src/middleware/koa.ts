@@ -5,11 +5,13 @@ import {
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
+import { registerRequestCleanup } from '../context/request-tracker';
 
 export function koaMiddleware(sdk?: SDKInstanceLike) {
   return async (
     ctx: {
       request: { method: string; url: string; headers: Record<string, unknown> };
+      req?: unknown;
       res: { finished?: boolean; on(event: 'finish', listener: () => void): void };
     },
     next: () => Promise<unknown>
@@ -25,23 +27,36 @@ export function koaMiddleware(sdk?: SDKInstanceLike) {
       return next();
     }
 
+    const requestContext = (() => {
+      try {
+        return instance.als.createRequestContext({
+          method: ctx.request.method,
+          url: ctx.request.url,
+          headers: filterHeaders(instance, ctx.request.headers),
+          traceparent: ctx.request.headers['traceparent'] as string | undefined,
+          tracestate: ctx.request.headers['tracestate'] as string | undefined
+        });
+      } catch {
+        return null;
+      }
+    })();
+
+    if (requestContext === null) {
+      return next();
+    }
+
     try {
-      const requestContext = instance.als.createRequestContext({
-        method: ctx.request.method,
-        url: ctx.request.url,
-        headers: filterHeaders(instance, ctx.request.headers),
-        traceparent: ctx.request.headers['traceparent'] as string | undefined,
-        tracestate: ctx.request.headers['tracestate'] as string | undefined
-      });
-
       instance.requestTracker.add(requestContext);
-      ctx.res.on('finish', () => {
-        instance.requestTracker.remove(requestContext.requestId);
+      registerRequestCleanup({
+        requestTracker: instance.requestTracker,
+        requestId: requestContext.requestId,
+        request: ctx.req,
+        response: ctx.res
       });
-
-      return await instance.als.runWithContext(requestContext, () => next());
     } catch {
       return next();
     }
+
+    return await instance.als.runWithContext(requestContext, () => next());
   };
 }

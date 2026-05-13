@@ -217,7 +217,11 @@ describe('IPV4_REGEX', () => {
 
 describe('SENSITIVE_KEY_EXACT_MATCHES', () => {
   it.each([
+    'pass',
     'password',
+    'passcode',
+    'passphrase',
+    'passwd',
     'secret',
     'token',
     'key',
@@ -242,7 +246,11 @@ describe('SENSITIVE_KEY_EXACT_MATCHES', () => {
 
 describe('SENSITIVE_KEY_REGEX', () => {
   it.each([
+    'pass',
     'password',
+    'passcode',
+    'passphrase',
+    'passwd',
     'secret',
     'token',
     'auth',

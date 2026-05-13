@@ -7,6 +7,67 @@ interface RequestTrackerConfig {
   ttlMs: number;
 }
 
+interface RequestCleanupTarget {
+  on?: unknown;
+  once?: unknown;
+}
+
+interface RequestCleanupConfig {
+  requestTracker: {
+    remove(requestId: string): void;
+  };
+  requestId: string;
+  request?: unknown;
+  response?: unknown;
+  onCleanup?: () => void;
+}
+
+export function registerRequestCleanup(config: RequestCleanupConfig): void {
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) {
+      return;
+    }
+
+    cleaned = true;
+    config.requestTracker.remove(config.requestId);
+    config.onCleanup?.();
+  };
+
+  registerCleanupEvent(config.response, 'finish', cleanup);
+  registerCleanupEvent(config.response, 'close', cleanup);
+  registerCleanupEvent(config.request, 'aborted', cleanup);
+  registerCleanupEvent(config.request, 'close', cleanup);
+}
+
+function registerCleanupEvent(
+  target: unknown,
+  event: string,
+  cleanup: () => void
+): void {
+  if (target == null || typeof target !== 'object') {
+    return;
+  }
+
+  const emitter = target as RequestCleanupTarget;
+  if (typeof emitter.once === 'function') {
+    (emitter.once as (event: string, listener: () => void) => void).call(
+      target,
+      event,
+      cleanup
+    );
+    return;
+  }
+
+  if (typeof emitter.on === 'function') {
+    (emitter.on as (event: string, listener: () => void) => void).call(
+      target,
+      event,
+      cleanup
+    );
+  }
+}
+
 export class RequestTracker {
   private readonly maxConcurrent: number;
 

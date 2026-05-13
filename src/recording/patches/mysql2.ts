@@ -1,10 +1,14 @@
 
 import { createRequire } from 'node:module';
 
-import type { IOEventSlot, RequestContext } from '../../types';
+import type { IOEventSlot, RequestContext, ResolvedConfig } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
-import { redactSensitiveQueryText } from '../../pii/scrubber';
+import {
+  Scrubber,
+  redactSensitiveQueryText,
+  scrubKeyValueAssignments
+} from '../../pii/scrubber';
 import { pushIOEvent } from '../utils';
 import type { RecorderState } from '../../sdk-diagnostics';
 import { detectBundler } from '../../sdk-diagnostics';
@@ -12,27 +16,39 @@ import { safeConsole } from '../../debug-log';
 
 const nodeRequire = createRequire(__filename);
 
-function formatParams(values: unknown[], captureActualValues: boolean): string | undefined {
+function stringifyParam(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function scrubParam(value: unknown, scrubber: Scrubber): unknown {
+  const scrubbed = scrubber.scrubValue('', value);
+  if (typeof scrubbed === 'string') {
+    return scrubKeyValueAssignments(scrubbed);
+  }
+
+  return scrubbed;
+}
+
+function formatParams(values: unknown[], config: ResolvedConfig): string | undefined {
   if (values.length === 0) {
     return undefined;
   }
 
-  if (!captureActualValues) {
+  if (!config.captureDbBindParams) {
     return values.map((_, index) => `[PARAM_${index + 1}]`).join(', ');
   }
 
+  const scrubber = new Scrubber(config);
   return values
-    .map((value) => {
-      if (typeof value === 'string') {
-        return value;
-      }
-
-      try {
-        return JSON.stringify(value);
-      } catch {
-        return String(value);
-      }
-    })
+    .map((value) => stringifyParam(scrubParam(value, scrubber)))
     .join(', ');
 }
 
@@ -134,7 +150,7 @@ function instrumentMethod(
       aborted: false,
       dbMeta: {
         query: redactSensitiveQueryText(parsed.sql),
-        params: formatParams(parsed.values, deps.config.captureDbBindParams),
+        params: formatParams(parsed.values, deps.config),
         rowCount: null
       }
     };
@@ -214,13 +230,26 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
       Connection?: { prototype?: object };
     };
 
-    if (mysql2.Connection?.prototype !== undefined) {
+    let wrappedMethods = 0;
+
+    if (
+      mysql2.Connection?.prototype !== undefined &&
+      typeof (mysql2.Connection.prototype as Record<string, unknown>).query === 'function'
+    ) {
       wrapMethod(mysql2.Connection.prototype, 'query', (original) =>
         instrumentMethod(deps, 'query', original)
       );
+      wrappedMethods += 1;
+    }
+
+    if (
+      mysql2.Connection?.prototype !== undefined &&
+      typeof (mysql2.Connection.prototype as Record<string, unknown>).execute === 'function'
+    ) {
       wrapMethod(mysql2.Connection.prototype, 'execute', (original) =>
         instrumentMethod(deps, 'execute', original)
       );
+      wrappedMethods += 1;
     }
 
     const uninstall = () => {
@@ -229,6 +258,11 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
         unwrapMethod(mysql2.Connection.prototype, 'execute');
       }
     };
+
+    if (wrappedMethods === 0) {
+      return { uninstall, state: { state: 'warn', reason: 'no-supported-methods' } };
+    }
+
     return { uninstall, state: { state: 'ok' } };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {

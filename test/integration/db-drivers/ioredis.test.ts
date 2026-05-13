@@ -84,6 +84,23 @@ describe.skipIf(Redis === null)('ioredis driver integration', () => {
     expect(setEvent!.endTime).not.toBeNull();
   });
 
+  it('scrubs cache keys in dbMeta query and collection', async () => {
+    await redis.set('session:alice@example.com:password=hunter2', 'bar');
+
+    const events = buffer.getRecentWithContext(50).events;
+    const setEvent = events.find((e) => e.method?.toLowerCase() === 'set');
+
+    expect(setEvent).toBeDefined();
+    expect(setEvent!.dbMeta?.query).toBe(
+      'set session:[REDACTED]:password=[REDACTED]'
+    );
+    expect(setEvent!.dbMeta?.collection).toBe(
+      'session:[REDACTED]:password=[REDACTED]'
+    );
+    expect(setEvent!.dbMeta?.query).not.toContain('alice@example.com');
+    expect(setEvent!.dbMeta?.query).not.toContain('hunter2');
+  });
+
   it('redacts AUTH credentials in dbMeta', async () => {
     // Send AUTH directly via raw command. ioredis's high-level .auth()
     // helper goes through internal queues that may or may not surface

@@ -56,6 +56,11 @@ interface BodyCaptureLike {
   materializeSlotBodies(slot: IOEventSlot): void;
 }
 
+interface PayloadSpoolLike {
+  markRequestComplete(requestId: string): void;
+  sweep(): void;
+}
+
 interface HeaderFilterLike {
   filterHeaders(headers: Record<string, unknown>): Record<string, string>;
   filterResponseHeaders(response: ServerResponse): Record<string, string>;
@@ -102,6 +107,8 @@ class RequestFinalizer {
 
   public requestContexts!: WeakMap<object, RequestContext>;
 
+  public payloadSpool!: PayloadSpoolLike | null;
+
   public pool!: RequestFinalizer[];
 
   public finalized = false;
@@ -126,6 +133,7 @@ class RequestFinalizer {
     headerFilter: HeaderFilterLike;
     bodyCapture: BodyCaptureLike;
     requestContexts: WeakMap<object, RequestContext>;
+    payloadSpool: PayloadSpoolLike | null;
     pool: RequestFinalizer[];
   }): this {
     this.buffer = input.buffer;
@@ -138,6 +146,7 @@ class RequestFinalizer {
     this.headerFilter = input.headerFilter;
     this.bodyCapture = input.bodyCapture;
     this.requestContexts = input.requestContexts;
+    this.payloadSpool = input.payloadSpool;
     this.pool = input.pool;
     this.finalized = false;
     return this;
@@ -159,6 +168,8 @@ class RequestFinalizer {
     this.context.bodyTruncated = this.slot.requestBodyTruncated;
     this.bodyCapture.releaseInboundRequest(this.request);
     this.requestTracker.remove(this.context.requestId);
+    this.payloadSpool?.markRequestComplete(this.context.requestId);
+    this.payloadSpool?.sweep();
     this.requestContexts.delete(this.request);
     this.als.releaseRequestContext?.(this.context);
     this.response.removeListener('close', handleResponseClose);
@@ -180,6 +191,7 @@ class RequestFinalizer {
     this.headerFilter = undefined as never;
     this.bodyCapture = undefined as never;
     this.requestContexts = undefined as never;
+    this.payloadSpool = null;
     this.pool = undefined as never;
   }
 }
@@ -216,6 +228,8 @@ export class HttpServerRecorder {
 
   private readonly requestContexts = new WeakMap<object, RequestContext>();
 
+  private readonly payloadSpool: PayloadSpoolLike | null;
+
   private readonly finalizerPool: RequestFinalizer[] = [];
 
   private readonly pushEventScratch = {} as Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>;
@@ -232,6 +246,7 @@ export class HttpServerRecorder {
     headerFilter: HeaderFilterLike;
     scrubber: ScrubberLike;
     config: ResolvedConfig;
+    payloadSpool?: PayloadSpoolLike | null;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
@@ -240,6 +255,7 @@ export class HttpServerRecorder {
     this.headerFilter = deps.headerFilter;
     this.scrubber = deps.scrubber;
     this.config = deps.config;
+    this.payloadSpool = deps.payloadSpool ?? null;
   }
 
   public install(): void {
@@ -322,6 +338,7 @@ export class HttpServerRecorder {
         headerFilter: this.headerFilter,
         bodyCapture: this.bodyCapture,
         requestContexts: this.requestContexts,
+        payloadSpool: this.payloadSpool,
         pool: this.finalizerPool
       });
 
@@ -444,7 +461,7 @@ export class HttpServerRecorder {
     const headers = this.getFilteredRequestHeaders(rawHeaders);
     const context = this.als.createRequestContext({
       method: request.method ?? 'UNKNOWN',
-      url: request.url ?? '',
+      url: this.scrubUrl(request.url ?? ''),
       headers,
       // W3C trace context (modules 06, 21): pull these BEFORE filtering so
       // the headerAllowlist doesn't strip them. ALSManager parses both.
@@ -458,6 +475,14 @@ export class HttpServerRecorder {
 
     this.requestContexts.set(request, context);
     return context;
+  }
+
+  private scrubUrl(rawUrl: string): string {
+    try {
+      return this.scrubber.scrubUrl(rawUrl);
+    } catch {
+      return '';
+    }
   }
 
   private getFilteredRequestHeaders(

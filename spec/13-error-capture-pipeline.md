@@ -300,7 +300,7 @@ function serializeError(error: Error, depth: number = 0): ErrorInfo {
 - `SIGTERM` shutdown capture
 - `unhandledRejection`-at-exit
 
-The `MAX_CACHE_SIZE` constant is raised from 50 to 128. Rationale: a medium Next.js app has 100–300 compiled server chunks; 50 churns aggressively and undoes resolution gains. 256 is too generous because `SourceMapConsumer` holds 5–20 MB of parsed mappings per entry in the pathological case. 128 is the count-based proxy pending a byte-size budget (tracked in `followups.md`).
+The `MAX_CACHE_SIZE` constant is raised from 50 to 128. Rationale: a medium Next.js app has 100–300 compiled server chunks; 50 churns aggressively and undoes resolution gains. 256 is too generous because `SourceMapConsumer` holds 5–20 MB of parsed mappings per entry in the pathological case. 128 is the count-based proxy pending a byte-size budget.
 
 ### Three-state cache (G3)
 

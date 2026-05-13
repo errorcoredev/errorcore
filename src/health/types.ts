@@ -5,7 +5,8 @@
  * and the module-level getHealth() facade.
  *
  * Semantics:
- *   - Counters (captured, dropped, droppedBreakdown.*, transportFailures)
+ *   - Counters (captured, dropped, droppedBreakdown.*, transportFailures,
+ *     payloadSpool.*)
  *     are monotonic since init() and reset only on process restart.
  *     Operators scrape snapshots and compute rates by differencing,
  *     matching the Prometheus counter convention.
@@ -29,6 +30,11 @@ export interface HealthSnapshot {
     deadLetterWriteFailed: number;
   };
   transportFailures: number;
+  payloadSpool: {
+    pressureWarnings: number;
+    previewFallbacks: number;
+    drops: number;
+  };
 
   transportQueueDepth: number;
   deadLetterDepth: number;

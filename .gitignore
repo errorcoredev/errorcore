@@ -1,5 +1,13 @@
 dist/
+docs/
 node_modules/
+
+# Local audit/review artifacts
+AUDIT*.md
+audit*.md
+*.pre-merge-backup.md
+docs/superpowers/
+
 *.env
 .env*
 *.log
@@ -18,6 +26,5 @@ tmp-errorcore-cli-*/
 /worker-file-smoke.ndjson
 /cli-replay-smoke.*
 
-# tmp-nextjs-smoke is tracked except for its install artifacts.
-tmp-nextjs-smoke/node_modules/
-tmp-nextjs-smoke/package-lock.json
+tmp-nextjs-smoke/
+

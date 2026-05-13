@@ -84,9 +84,7 @@ export class IOEventBuffer {
       this.evictIndex(index);
     }
 
-    while (this.payloadBytes + estimatedBytes > this.maxBytes && this.slotCount > 0) {
-      this.evictOldest();
-    }
+    this.enforceByteBudget(estimatedBytes);
 
     const slot = {} as IOEventSlot;
     this.assignSlot(slot, event, seq, estimatedBytes);
@@ -100,7 +98,9 @@ export class IOEventBuffer {
   }
 
   public updatePayloadBytes(oldBytes: number, newBytes: number): void {
+    this.requestIdIndex = null;
     this.payloadBytes += newBytes - oldBytes;
+    this.enforceByteBudget();
   }
 
   public filterByRequestId(requestId: string): IOEventSlot[] {
@@ -281,6 +281,12 @@ export class IOEventBuffer {
     }
   }
 
+  private enforceByteBudget(incomingBytes = 0): void {
+    while (this.payloadBytes + incomingBytes > this.maxBytes && this.slotCount > 0) {
+      this.evictOldest();
+    }
+  }
+
   private evictIndex(index: number): void {
     const slot = this.slots[index];
     if (slot === null) {
@@ -343,6 +349,8 @@ export class IOEventBuffer {
     slot.responseBody = event.responseBody;
     slot.requestBodyDigest = event.requestBodyDigest ?? null;
     slot.responseBodyDigest = event.responseBodyDigest ?? null;
+    slot.requestPayloadRef = event.requestPayloadRef ?? null;
+    slot.responsePayloadRef = event.responsePayloadRef ?? null;
     slot.requestBodyTruncated = event.requestBodyTruncated;
     slot.responseBodyTruncated = event.responseBodyTruncated;
     slot.requestBodyOriginalSize = event.requestBodyOriginalSize;

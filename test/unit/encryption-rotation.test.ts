@@ -3,6 +3,7 @@ import { Encryption } from '../../src/security/encryption';
 
 const PRIMARY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const PREV    = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
+const MAC_KEY = '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff';
 
 describe('Encryption with key rotation', () => {
   it('signs with the primary key and verifies under primary (keyIndex 0)', () => {
@@ -51,6 +52,24 @@ describe('Encryption with key rotation', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.plaintext).toBe('legacy payload');
+      expect(result.keyIndex).toBe(1);
+    }
+  });
+
+  it('decrypts a previous-key envelope when an explicit MAC key is configured', () => {
+    const oldEnc = new Encryption(PREV, { macKey: MAC_KEY, sdkVersion: '0.3.0' });
+    const env = oldEnc.encryptToEnvelope(Buffer.from('legacy explicit mac', 'utf8'), { eventId: 'evt-rot-mac' });
+
+    const newEnc = new Encryption(PRIMARY, {
+      previousEncryptionKeys: [PREV],
+      macKey: MAC_KEY,
+      sdkVersion: '0.3.0'
+    });
+    const result = newEnc.decryptEnvelope(env);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.plaintext).toBe('legacy explicit mac');
       expect(result.keyIndex).toBe(1);
     }
   });

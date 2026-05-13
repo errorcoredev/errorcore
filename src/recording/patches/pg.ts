@@ -1,10 +1,14 @@
 
 import { createRequire } from 'node:module';
 
-import type { IOEventSlot, RequestContext } from '../../types';
+import type { IOEventSlot, RequestContext, ResolvedConfig } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
-import { redactSensitiveQueryText } from '../../pii/scrubber';
+import {
+  Scrubber,
+  redactSensitiveQueryText,
+  scrubKeyValueAssignments
+} from '../../pii/scrubber';
 import { pushIOEvent } from '../utils';
 import type { RecorderState } from '../../sdk-diagnostics';
 import { detectBundler } from '../../sdk-diagnostics';
@@ -18,27 +22,39 @@ interface PgQueryDetails {
   callbackIndex: number | null;
 }
 
-function formatParams(values: unknown[], captureActualValues: boolean): string | undefined {
+function stringifyParam(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function scrubParam(value: unknown, scrubber: Scrubber): unknown {
+  const scrubbed = scrubber.scrubValue('', value);
+  if (typeof scrubbed === 'string') {
+    return scrubKeyValueAssignments(scrubbed);
+  }
+
+  return scrubbed;
+}
+
+function formatParams(values: unknown[], config: ResolvedConfig): string | undefined {
   if (values.length === 0) {
     return undefined;
   }
 
-  if (!captureActualValues) {
+  if (!config.captureDbBindParams) {
     return values.map((_, index) => `[PARAM_${index + 1}]`).join(', ');
   }
 
+  const scrubber = new Scrubber(config);
   return values
-    .map((value) => {
-      if (typeof value === 'string') {
-        return value;
-      }
-
-      try {
-        return JSON.stringify(value);
-      } catch {
-        return String(value);
-      }
-    })
+    .map((value) => stringifyParam(scrubParam(value, scrubber)))
     .join(', ');
 }
 
@@ -144,7 +160,7 @@ function createBaseEvent(
     aborted: false,
     dbMeta: {
       query: input.query,
-      params: formatParams(input.params, deps.config.captureDbBindParams),
+      params: formatParams(input.params, deps.config),
       rowCount: null
     }
   };
@@ -262,16 +278,26 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
       Pool?: { prototype?: object };
     };
 
-    if (pg.Client?.prototype !== undefined) {
+    let wrappedMethods = 0;
+
+    if (
+      pg.Client?.prototype !== undefined &&
+      typeof (pg.Client.prototype as Record<string, unknown>).query === 'function'
+    ) {
       wrapMethod(pg.Client.prototype, 'query', (original) =>
         instrumentQuery(deps, 'query', original)
       );
+      wrappedMethods += 1;
     }
 
-    if (pg.Pool?.prototype !== undefined) {
+    if (
+      pg.Pool?.prototype !== undefined &&
+      typeof (pg.Pool.prototype as Record<string, unknown>).query === 'function'
+    ) {
       wrapMethod(pg.Pool.prototype, 'query', (original) =>
         instrumentQuery(deps, 'query', original)
       );
+      wrappedMethods += 1;
     }
 
     const uninstall = () => {
@@ -283,6 +309,11 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
         unwrapMethod(pg.Pool.prototype, 'query');
       }
     };
+
+    if (wrappedMethods === 0) {
+      return { uninstall, state: { state: 'warn', reason: 'no-supported-methods' } };
+    }
+
     return { uninstall, state: { state: 'ok' } };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {

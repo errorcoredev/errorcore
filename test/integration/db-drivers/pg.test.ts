@@ -100,7 +100,7 @@ describe.skipIf(!envFlag('EC_INTEGRATION_PG') || pg === null)(
       }
     });
 
-    it('captures bind params verbatim when captureDbBindParams is true', async () => {
+    it('captures scrubbed bind params when captureDbBindParams is true', async () => {
       const buffer = makeBuffer();
       const { uninstall } = installPgPatch({
         buffer,
@@ -109,11 +109,18 @@ describe.skipIf(!envFlag('EC_INTEGRATION_PG') || pg === null)(
         explicitDriver: pg!,
       });
       try {
-        await client.query('SELECT $1::text AS name', ['alice']);
+        await client.query('SELECT $1::text AS email, $2::text AS secret, $3::text AS label', [
+          'alice@example.com',
+          'password=hunter2',
+          'visible-value',
+        ]);
         const events = buffer.getRecentWithContext(50).events;
         const event = events.find((e) => e.dbMeta?.query?.includes('SELECT $1') ?? false);
         expect(event).toBeDefined();
-        expect(event!.dbMeta?.params).toContain('alice');
+        expect(event!.dbMeta?.params).not.toContain('alice@example.com');
+        expect(event!.dbMeta?.params).not.toContain('hunter2');
+        expect(event!.dbMeta?.params).toContain('[REDACTED]');
+        expect(event!.dbMeta?.params).toContain('visible-value');
       } finally {
         uninstall();
       }

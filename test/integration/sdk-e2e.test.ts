@@ -376,7 +376,7 @@ const pkgJson = require('./package.json');
     }
   });
 
-  it('ships v1.1.0 stamping fields and eventClockRange brackets every captured event', async () => {
+  it('ships v1.2.0 stamping fields and eventClockRange brackets every captured event', async () => {
     const output = createTempOutput('errorcore-e2e-stamping');
     const sdk = createSDK({
       allowUnencrypted: true,
@@ -409,8 +409,8 @@ const pkgJson = require('./package.json');
 
       const pkg = readDeliveredPackage(output.file);
 
-      // Top-level v1.1.0 fields are present and well-typed.
-      expect(pkg.schemaVersion).toBe('1.1.0');
+      // Top-level v1.2.0 fields are present and well-typed.
+      expect(pkg.schemaVersion).toBe('1.2.0');
       expect(pkg.errorEventSeq).toBeTypeOf('number');
       expect(pkg.errorEventSeq).toBeGreaterThan(0);
       expect(pkg.errorEventHrtimeNs).toBeTypeOf('string');
@@ -436,7 +436,7 @@ const pkgJson = require('./package.json');
       // State writes were captured with seq + hrtimeNs string. The `key`
       // field's value is redacted by the PII scrubber (the property name
       // matches /key/i in the default blocklist), so we don't assert on it
-      // — that's pre-existing scrubber behavior, not new in v1.1.0.
+      // — that's pre-existing scrubber behavior, not new in v1.2.0.
       expect(pkg.stateWrites).toHaveLength(1);
       expect(pkg.stateWrites[0]).toMatchObject({
         container: 'cache',
@@ -493,7 +493,10 @@ const pkgJson = require('./package.json');
         port,
         method: 'GET',
         path: '/ts',
-        headers: { tracestate: 'ec=clk:42,vendor1=foo' }
+        headers: {
+          traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`,
+          tracestate: 'ec=clk:42,vendor1=foo'
+        }
       });
 
       await close(server);

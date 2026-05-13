@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { HeaderFilter } from '../../src/pii/header-filter';
 import { looksLikeHighEntropySecret, redactSensitiveQueryText, Scrubber } from '../../src/pii/scrubber';
+import * as scrubberExports from '../../src/pii/scrubber';
 import { isValidLuhn } from '../../src/pii/patterns';
 import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 
@@ -36,6 +37,11 @@ function referenceShannonEntropy(value: string): number {
   return entropy;
 }
 
+const scrubberHelpers = scrubberExports as typeof scrubberExports & {
+  scrubCacheKey?: (key: string) => string;
+  scrubKeyValueAssignments?: (text: string) => string;
+};
+
 describe('Scrubber', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -45,7 +51,11 @@ describe('Scrubber', () => {
     const scrubber = new Scrubber(resolveConfig({}));
 
     for (const key of [
+      'pass',
       'password',
+      'passcode',
+      'passphrase',
+      'passwd',
       'apiKey',
       'secret_token',
       'auth',
@@ -387,6 +397,32 @@ describe('Scrubber', () => {
       expect(params.get('color')).toBe('blue');
     });
 
+    it('redacts sensitive key-value assignments in text/plain body bytes', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = [
+        'username=Alice',
+        'password=hunter2',
+        'passcode: 123456',
+        'passphrase = correct horse battery staple',
+        'compass=west'
+      ].join('\n');
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'text/plain'
+        })
+        .toString('utf8');
+
+      expect(out).toContain('username=Alice');
+      expect(out).toContain('password=[REDACTED]');
+      expect(out).toContain('passcode: [REDACTED]');
+      expect(out).toContain('passphrase = [REDACTED]');
+      expect(out).toContain('compass=west');
+      expect(out).not.toContain('hunter2');
+      expect(out).not.toContain('123456');
+      expect(out).not.toContain('correct horse battery staple');
+    });
+
     it('preserves non-PII bytes verbatim (no spurious changes)', () => {
       const scrubber = new Scrubber(resolveConfig({}));
       const body = JSON.stringify({ kind: 'order', items: 3, total: 45.5 });
@@ -567,8 +603,58 @@ describe('redactSensitiveQueryText', () => {
       .toBe('[REDACTED: GRANT statement]');
   });
 
-  it('does not redact GRANT-like strings that appear mid-query', () => {
+  it('does not classify GRANT-like strings mid-query as privileged SQL', () => {
     expect(redactSensitiveQueryText("SELECT * FROM users WHERE role = 'GRANT_ADMIN'"))
-      .toBe("SELECT * FROM users WHERE role = 'GRANT_ADMIN'");
+      .toBe('SELECT * FROM users WHERE role = [REDACTED]');
+  });
+
+  it('redacts quoted strings and numeric literals in captured query text', () => {
+    expect(
+      redactSensitiveQueryText(
+        "SELECT * FROM users WHERE email = 'alice@example.com' AND age >= 42 AND balance = -12.50 LIMIT 10"
+      )
+    ).toBe(
+      'SELECT * FROM users WHERE email = [REDACTED] AND age >= [REDACTED] AND balance = [REDACTED] LIMIT [REDACTED]'
+    );
+  });
+
+  it('preserves bind placeholders while redacting inline literals', () => {
+    expect(
+      redactSensitiveQueryText(
+        "UPDATE users SET name = 'Alice', score = 7 WHERE id = $1 AND active = ?"
+      )
+    ).toBe(
+      'UPDATE users SET name = [REDACTED], score = [REDACTED] WHERE id = $1 AND active = ?'
+    );
+  });
+
+  it('redacts escaped quoted SQL strings as a single literal', () => {
+    expect(redactSensitiveQueryText("INSERT INTO audit (message) VALUES ('can''t login')"))
+      .toBe('INSERT INTO audit (message) VALUES ([REDACTED])');
+  });
+});
+
+describe('scrubKeyValueAssignments', () => {
+  it('redacts sensitive assignment values without touching non-sensitive assignments', () => {
+    expect(
+      scrubberHelpers.scrubKeyValueAssignments?.(
+        'username=alice\npasscode: 123456\napiKey = abc123\ncompass=west'
+      )
+    ).toBe('username=alice\npasscode: [REDACTED]\napiKey = [REDACTED]\ncompass=west');
+  });
+});
+
+describe('scrubCacheKey', () => {
+  it('redacts PII patterns and sensitive key-value segments in cache keys', () => {
+    expect(
+      scrubberHelpers.scrubCacheKey?.(
+        'session:user=jane@example.com:token=abc123:profile'
+      )
+    ).toBe('session:user=[REDACTED]:token=[REDACTED]:profile');
+  });
+
+  it('preserves cache-key structure when no sensitive segment is present', () => {
+    expect(scrubberHelpers.scrubCacheKey?.('catalog:compass=west:page=2'))
+      .toBe('catalog:compass=west:page=2');
   });
 });

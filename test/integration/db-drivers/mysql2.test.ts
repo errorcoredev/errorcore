@@ -96,7 +96,7 @@ describe.skipIf(!envFlag('EC_INTEGRATION_MYSQL') || mysql2 === null || mysql2Roo
       }
     });
 
-    it('captures bind params verbatim when captureDbBindParams is true', async () => {
+    it('captures scrubbed bind params when captureDbBindParams is true', async () => {
       const buffer = makeBuffer();
       const { uninstall } = installMysql2Patch({
         buffer,
@@ -105,11 +105,18 @@ describe.skipIf(!envFlag('EC_INTEGRATION_MYSQL') || mysql2 === null || mysql2Roo
         explicitDriver: mysql2Root!,
       });
       try {
-        await connection.execute('SELECT ? AS name', ['alice']);
+        await connection.execute('SELECT ? AS email, ? AS secret, ? AS label', [
+          'alice@example.com',
+          'password=hunter2',
+          'visible-value',
+        ]);
         const events = buffer.getRecentWithContext(50).events;
         const event = events.find((e) => e.dbMeta?.query?.includes('SELECT ?') ?? false);
         expect(event).toBeDefined();
-        expect(event!.dbMeta?.params).toContain('alice');
+        expect(event!.dbMeta?.params).not.toContain('alice@example.com');
+        expect(event!.dbMeta?.params).not.toContain('hunter2');
+        expect(event!.dbMeta?.params).toContain('[REDACTED]');
+        expect(event!.dbMeta?.params).toContain('visible-value');
       } finally {
         uninstall();
       }

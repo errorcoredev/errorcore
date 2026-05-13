@@ -10,6 +10,24 @@ import {
 import { extractFd, pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
 import { safeConsole } from '../debug-log';
+import {
+  AWS_ACCESS_KEY_REGEX,
+  BASIC_AUTH_REGEX,
+  BEARER_REGEX,
+  CREDIT_CARD_REGEX,
+  EMAIL_REGEX,
+  GENERIC_SK_KEY_REGEX,
+  GITHUB_TOKEN_REGEX,
+  JWT_REGEX,
+  PHONE_REGEX,
+  SENSITIVE_KEY_EXACT_MATCHES,
+  SENSITIVE_KEY_REGEX,
+  SSN_REGEX,
+  STRIPE_KEY_REGEX,
+  isValidLuhn
+} from '../pii/patterns';
+
+const REDACTED = '[REDACTED]';
 
 interface IOEventBufferLike {
   push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
@@ -43,6 +61,111 @@ interface BodyCaptureLike {
 
 interface HeaderFilterLike {
   filterAndNormalizeHeaders(headers: unknown): Record<string, string>;
+}
+
+function replacePattern(value: string, pattern: RegExp): string {
+  return value.replace(pattern, REDACTED);
+}
+
+function replaceCreditCards(value: string): string {
+  return value.replace(CREDIT_CARD_REGEX, (match) =>
+    isValidLuhn(match) ? REDACTED : match
+  );
+}
+
+function decodeQueryComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function matchesSensitiveQueryKey(key: string): boolean {
+  const normalizedKey = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .toLowerCase();
+
+  if (SENSITIVE_KEY_EXACT_MATCHES.has(normalizedKey)) {
+    return true;
+  }
+
+  return SENSITIVE_KEY_REGEX.test(normalizedKey);
+}
+
+function scrubQueryValue(key: string, value: string): string {
+  if (matchesSensitiveQueryKey(key)) {
+    return REDACTED;
+  }
+
+  let scrubbed = value;
+  scrubbed = replacePattern(scrubbed, EMAIL_REGEX);
+  scrubbed = replaceCreditCards(scrubbed);
+  scrubbed = replacePattern(scrubbed, SSN_REGEX);
+  scrubbed = replacePattern(scrubbed, JWT_REGEX);
+  scrubbed = replacePattern(scrubbed, BEARER_REGEX);
+  scrubbed = replacePattern(scrubbed, BASIC_AUTH_REGEX);
+  scrubbed = replacePattern(scrubbed, AWS_ACCESS_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, GITHUB_TOKEN_REGEX);
+  scrubbed = replacePattern(scrubbed, STRIPE_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, GENERIC_SK_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, PHONE_REGEX);
+  return scrubbed;
+}
+
+function scrubUrl(rawUrl: string): string {
+  if (rawUrl === '' || !rawUrl.includes('?')) {
+    return rawUrl;
+  }
+
+  try {
+    const hashIndex = rawUrl.indexOf('#');
+    const hash = hashIndex === -1 ? '' : rawUrl.slice(hashIndex);
+    const beforeHash = hashIndex === -1 ? rawUrl : rawUrl.slice(0, hashIndex);
+    const queryIndex = beforeHash.indexOf('?');
+
+    if (queryIndex === -1) {
+      return rawUrl;
+    }
+
+    const prefix = beforeHash.slice(0, queryIndex);
+    const rawQuery = beforeHash.slice(queryIndex + 1);
+    const rawSegments = rawQuery.split('&');
+    const scrubbedSegments = new Array<string>(rawSegments.length);
+    let changed = false;
+
+    for (let index = 0; index < rawSegments.length; index += 1) {
+      const segment = rawSegments[index];
+
+      if (segment === '') {
+        scrubbedSegments[index] = segment;
+        continue;
+      }
+
+      const equalsIndex = segment.indexOf('=');
+      const rawKey = equalsIndex === -1 ? segment : segment.slice(0, equalsIndex);
+      const rawValue = equalsIndex === -1 ? '' : segment.slice(equalsIndex + 1);
+      const key = decodeQueryComponent(rawKey);
+      const value = decodeQueryComponent(rawValue);
+      const scrubbedValue = scrubQueryValue(key, value);
+
+      if (scrubbedValue === value) {
+        scrubbedSegments[index] = segment;
+        continue;
+      }
+
+      changed = true;
+      scrubbedSegments[index] = `${encodeURIComponent(key)}=${encodeURIComponent(scrubbedValue)}`;
+    }
+
+    if (!changed) {
+      return rawUrl;
+    }
+
+    return `${prefix}?${scrubbedSegments.join('&')}${hash}`;
+  } catch {
+    return `${rawUrl.slice(0, rawUrl.indexOf('?'))}?${encodeURIComponent(REDACTED)}`;
+  }
 }
 
 function getRequestHeaders(request: ClientRequest): Record<string, unknown> | undefined {
@@ -88,7 +211,7 @@ function buildTarget(request: ClientRequest): {
   return {
     target: `${protocol}//${hostWithPort}`,
     method,
-    url
+    url: scrubUrl(url)
   };
 }
 

@@ -2,9 +2,10 @@
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
 
-import type { IOEventSlot, RequestContext } from '../../types';
+import type { IOEventSlot, RequestContext, ResolvedConfig } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+import { Scrubber } from '../../pii/scrubber';
 import { pushIOEvent } from '../utils';
 import type { RecorderState } from '../../sdk-diagnostics';
 import { detectBundler } from '../../sdk-diagnostics';
@@ -55,6 +56,23 @@ function summarizeKeys(value: unknown): string | undefined {
   }
 
   return undefined;
+}
+
+function stringifyParams(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatParams(args: unknown[], config: ResolvedConfig): string | undefined {
+  if (!config.captureDbBindParams || args.length === 0) {
+    return undefined;
+  }
+
+  const scrubber = new Scrubber(config);
+  return stringifyParams(scrubber.scrubValue('', args));
 }
 
 function resolveRowCount(result: unknown): number | null {
@@ -135,6 +153,7 @@ function instrumentMethod(
       aborted: false,
       dbMeta: {
         query: summarizeKeys(args[0]),
+        params: formatParams(args, deps.config),
         collection: collection.collectionName
       }
     };
@@ -202,11 +221,21 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
       Collection?: { prototype?: object };
     };
 
+    let wrappedMethods = 0;
+
     if (mongodb.Collection?.prototype !== undefined) {
       for (const methodName of COLLECTION_METHODS) {
+        if (
+          typeof (mongodb.Collection.prototype as Record<string, unknown>)[methodName] !==
+          'function'
+        ) {
+          continue;
+        }
+
         wrapMethod(mongodb.Collection.prototype, methodName, (original) =>
           instrumentMethod(deps, methodName, original)
         );
+        wrappedMethods += 1;
       }
     }
 
@@ -217,6 +246,11 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
         }
       }
     };
+
+    if (wrappedMethods === 0) {
+      return { uninstall, state: { state: 'warn', reason: 'no-supported-methods' } };
+    }
+
     return { uninstall, state: { state: 'ok' } };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {

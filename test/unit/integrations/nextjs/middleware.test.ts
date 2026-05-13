@@ -119,6 +119,55 @@ describe('C1 — withNextMiddleware', () => {
     expect(inner).toHaveBeenCalled();
   });
 
+  it('captures matching status returns when an ALS context already exists', async () => {
+    const sdk = makeFakeActiveSDK({
+      existingContext: true,
+      captureMiddlewareStatusCodes: 'all'
+    });
+    const wrapped = withNextMiddleware(
+      async () => ({ status: 503 }),
+      sdk as never
+    );
+
+    await wrapped(makeFakeRequest({ method: 'GET', url: '/' }));
+
+    expect(sdk.requestTracker.add).not.toHaveBeenCalled();
+    expect(sdk.als.createRequestContext).not.toHaveBeenCalled();
+    expect(sdk.captureError).toHaveBeenCalledTimes(1);
+    const captured = sdk.captureError.mock.calls[0][0];
+    expect(captured.name).toBe('MiddlewareRejection');
+    expect(captured.message).toBe('HTTP 503');
+  });
+
+  it('captures thrown errors when an ALS context already exists', async () => {
+    const sdk = makeFakeActiveSDK({ existingContext: true });
+    const boom = new Error('nested middleware boom');
+    const wrapped = withNextMiddleware(async () => { throw boom; }, sdk as never);
+
+    await expect(wrapped(makeFakeRequest({ method: 'GET', url: '/' }))).rejects.toBe(boom);
+
+    expect(sdk.requestTracker.add).not.toHaveBeenCalled();
+    expect(sdk.als.createRequestContext).not.toHaveBeenCalled();
+    expect(sdk.captureError).toHaveBeenCalledWith(boom);
+  });
+
+  it('passes inbound tracestate into ALS context creation', async () => {
+    const sdk = makeFakeActiveSDK();
+    const traceparent = `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`;
+    const tracestate = 'vendor=state';
+    const wrapped = withNextMiddleware(async () => ({ status: 200 }), sdk as never);
+
+    await wrapped(makeFakeRequest({
+      method: 'GET',
+      url: '/',
+      headers: { traceparent, tracestate }
+    }));
+
+    expect(sdk.als.createRequestContext).toHaveBeenCalledWith(
+      expect.objectContaining({ traceparent, tracestate })
+    );
+  });
+
   it('undefined middleware return is pass-through regardless of captureMiddlewareStatusCodes', async () => {
     const sdk = makeFakeActiveSDK({ captureMiddlewareStatusCodes: 'all' });
     const wrapped = withNextMiddleware(async () => undefined, sdk as never);

@@ -121,6 +121,9 @@ export function renderHTML(apiToken?: string): string {
     .detail-header { padding: 20px 24px; border-bottom: 1px solid var(--border-subtle); }
     .detail-header h2 { font-size: 16px; color: var(--accent-primary); letter-spacing: -0.03em; font-weight: 600; margin-bottom: 6px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .detail-header .meta { color: var(--text-secondary); font-size: 12px; font-family: var(--font-mono); }
+    .origin-summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin-top: 12px; font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
+    .origin-summary dt { color: var(--text-secondary); }
+    .origin-summary dd { color: var(--text-primary); overflow-wrap: anywhere; }
 
     .section { padding: 16px 24px; border-bottom: 1px solid var(--border-subtle); }
     .section:last-child { border-bottom: none; }
@@ -129,6 +132,7 @@ export function renderHTML(apiToken?: string): string {
 
     .stack { background: var(--bg-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 12px 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; overflow-x: auto; white-space: pre; color: var(--text-secondary); }
     .stack .frame-app { color: var(--accent-primary); }
+    .stack .frame-collapsed, .expansion-stack .frame-collapsed { color: var(--text-secondary); font-style: italic; }
 
     .io-item { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); font-size: 13px; }
     .io-item:last-child { border-bottom: none; }
@@ -223,20 +227,65 @@ export function renderHTML(apiToken?: string): string {
       if (ms < 1000) return Math.round(ms) + 'ms';
       return (ms/1000).toFixed(2) + 's';
     }
-    function highlightStack(stack) {
+    function isExternalStackLine(line) {
+      const normalized = String(line || '').replace(/\\\\/g, '/');
+      return normalized.includes('/node_modules/') || normalized.includes('node:') || normalized.includes('(node:');
+    }
+    function isStackFrameLine(line) {
+      return /^\\s*at\\s/.test(line);
+    }
+    function isAppStackLine(line) {
+      return isStackFrameLine(line) && !isExternalStackLine(line) && /\\.[cm]?[jt]sx?:\\d+:\\d+/.test(line);
+    }
+    function renderStackLines(stack, options = {}) {
       if (!stack) return '';
-      return stack.split('\\n').map(line => {
-        const isApp = !line.includes('node_modules') && (line.includes('.ts:') || line.includes('.js:') || line.includes('.tsx:'));
-        return html\`<span class=\${isApp ? 'frame-app' : ''}>\${line}\\n</span>\`;
-      });
+      const collapseExternal = options.collapseExternal !== false;
+      const limit = options.limit || Infinity;
+      const nodes = [];
+      let externalCount = 0;
+      let shown = 0;
+      const flushExternal = () => {
+        if (externalCount > 0) {
+          nodes.push(html\`<span class="frame-collapsed">\${externalCount} external library frame\${externalCount === 1 ? '' : 's'} collapsed\\n</span>\`);
+          externalCount = 0;
+        }
+      };
+
+      for (const line of stack.split('\\n')) {
+        if (shown >= limit) break;
+        if (collapseExternal && isExternalStackLine(line)) {
+          externalCount += 1;
+          continue;
+        }
+        flushExternal();
+        nodes.push(html\`<span class=\${isAppStackLine(line) ? 'frame-app' : ''}>\${line}\\n</span>\`);
+        shown += 1;
+      }
+      flushExternal();
+      return nodes;
+    }
+    function highlightStack(stack) {
+      return renderStackLines(stack, { collapseExternal: true });
     }
     function truncateStack(stack, lines) {
-      if (!stack) return '';
-      const arr = stack.split('\\n').slice(0, lines);
-      return arr.map(line => {
-        const isApp = !line.includes('node_modules') && (line.includes('.ts:') || line.includes('.js:') || line.includes('.tsx:'));
-        return html\`<span class=\${isApp ? 'frame-app' : ''}>\${line}\\n</span>\`;
-      });
+      return renderStackLines(stack, { collapseExternal: true, limit: lines });
+    }
+    function formatBoundaryFrame(frame) {
+      if (!frame || typeof frame !== 'object' || !frame.filePath) return '';
+      const location = frame.lineNumber
+        ? frame.filePath + ':' + frame.lineNumber + (frame.columnNumber ? ':' + frame.columnNumber : '')
+        : frame.filePath;
+      return (frame.functionName ? frame.functionName + ' ' : '') + location;
+    }
+    function OriginSummary({ pkg, summary }) {
+      const origin = pkg?.errorOrigin || {};
+      const appBoundary = formatBoundaryFrame(origin.appBoundaryFrame) || summary?.appBoundary;
+      const library = origin.package || summary?.originPackage;
+      if (!appBoundary && !library) return null;
+      return html\`<dl class="origin-summary">
+        \${appBoundary ? html\`<dt>App boundary</dt><dd>\${escapeHtml(appBoundary)}</dd>\` : ''}
+        \${library ? html\`<dt>Origin</dt><dd>external library: \${escapeHtml(library)}</dd>\` : ''}
+      </dl>\`;
     }
 
     /* ---- Icons ---- */
@@ -385,6 +434,7 @@ export function renderHTML(apiToken?: string): string {
                 </tr>
                 \${isOpen ? html\`<tr class="row-expansion"><td colspan="5">
                   <div class="expansion-inner">
+                    <\${OriginSummary} summary=\${e} />
                     <div class="expansion-stack">\${truncateStack(e.stack, 5)}</div>
                     <div class="expansion-actions">
                       <button class="expansion-link" onClick=\${(ev) => { ev.stopPropagation(); openDetail(e.id); }}>View full detail \\u2192</button>
@@ -434,11 +484,15 @@ export function renderHTML(apiToken?: string): string {
           <div class="detail-header">
             <h2><span class="type-badge \${typeClass(pkg.error?.type)}">\${escapeHtml(pkg.error?.type)}</span> \${escapeHtml(pkg.error?.message)}</h2>
             <div class="meta">\${fmtTime(pkg.capturedAt)}\${req ? ' \\u2014 ' + escapeHtml(req.method + ' ' + req.url) : ''}</div>
+            <\${OriginSummary} pkg=\${pkg} />
           </div>
 
           <div class="section">
             <h3 onClick=\${() => toggle('stack')}>\${collapsed.stack ? '\\u25b6' : '\\u25bc'} Stack Trace</h3>
             \${!collapsed.stack && html\`<div class="stack">\${highlightStack(pkg.error?.stack)}</div>\`}
+            \${!collapsed.stack && pkg.error?.stack && html\`
+              <details style="margin-top:8px"><summary style="color:var(--text-secondary);font-size:12px;cursor:pointer">Show library frames</summary>
+              <div class="stack" style="margin-top:4px">\${renderStackLines(pkg.error.stack, { collapseExternal: false })}</div></details>\`}
             \${!collapsed.stack && pkg.error?.rawStack && html\`
               <details style="margin-top:8px"><summary style="color:var(--text-secondary);font-size:12px;cursor:pointer">Raw (unresolved) stack</summary>
               <div class="stack" style="margin-top:4px">\${pkg.error.rawStack}</div></details>\`}

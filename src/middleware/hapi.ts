@@ -5,6 +5,33 @@ import {
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
+import { registerRequestCleanup } from '../context/request-tracker';
+import type { RequestContext } from '../types';
+
+function enterPersistentContext(
+  instance: SDKInstanceLike,
+  ctx: RequestContext
+): (() => void) | undefined {
+  const alsWithStore = instance.als as SDKInstanceLike['als'] & {
+    getStore?: () => {
+      enterWith(context: RequestContext | undefined): void;
+    };
+  };
+  const store = alsWithStore.getStore?.();
+
+  if (store === undefined) {
+    return undefined;
+  }
+
+  const previous = instance.als.getContext?.();
+  store.enterWith(ctx);
+
+  return () => {
+    if (instance.als.getContext?.()?.requestId === ctx.requestId) {
+      store.enterWith(previous);
+    }
+  };
+}
 
 export const hapiPlugin = {
   name: 'errorcore',
@@ -17,7 +44,10 @@ export const hapiPlugin = {
             method: string;
             url: { pathname: string };
             headers: Record<string, unknown>;
-            raw: { res: { finished?: boolean; on(event: 'finish', listener: () => void): void } };
+            raw: {
+              req?: unknown;
+              res: { finished?: boolean; on(event: 'finish', listener: () => void): void };
+            };
           },
           h: { continue: symbol }
         ) => symbol
@@ -37,23 +67,46 @@ export const hapiPlugin = {
         return h.continue;
       }
 
-      try {
-        const ctx = instance.als.createRequestContext({
-          method: request.method.toUpperCase(),
-          url: request.url.pathname,
-          headers: filterHeaders(instance, request.headers),
-          traceparent: request.headers['traceparent'] as string | undefined,
-          tracestate: request.headers['tracestate'] as string | undefined
-        });
+      const ctx = (() => {
+        try {
+          return instance.als.createRequestContext({
+            method: request.method.toUpperCase(),
+            url: request.url.pathname,
+            headers: filterHeaders(instance, request.headers),
+            traceparent: request.headers['traceparent'] as string | undefined,
+            tracestate: request.headers['tracestate'] as string | undefined
+          });
+        } catch {
+          return null;
+        }
+      })();
 
-        instance.requestTracker.add(ctx);
-        request.raw.res.on('finish', () => {
-          instance.requestTracker.remove(ctx.requestId);
-        });
-        return instance.als.runWithContext(ctx, () => h.continue);
-      } catch {
+      if (ctx === null) {
         return h.continue;
       }
+
+      let restoreContext: (() => void) | undefined;
+
+      try {
+        instance.requestTracker.add(ctx);
+        restoreContext = enterPersistentContext(instance, ctx);
+        registerRequestCleanup({
+          requestTracker: instance.requestTracker,
+          requestId: ctx.requestId,
+          request: request.raw.req,
+          response: request.raw.res,
+          onCleanup: restoreContext
+        });
+      } catch {
+        restoreContext?.();
+        return h.continue;
+      }
+
+      if (restoreContext !== undefined) {
+        return h.continue;
+      }
+
+      return instance.als.runWithContext(ctx, () => h.continue);
     });
   }
 };

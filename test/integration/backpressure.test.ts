@@ -327,6 +327,7 @@ describe('backpressure contract', () => {
     const store = new DeadLetterStore(dlqPath, {
       integrityKey: 'x'.repeat(32),
       maxSizeBytes: 512,
+      maxBackups: 0,
       onInternalWarning: record
     });
 

@@ -144,7 +144,7 @@ errorcore.init({
 });
 ```
 
-`undefined` returns (pass-through middleware) are never captured regardless of this setting. The ALS context started by `withNextMiddleware` propagates automatically into the downstream route handler.
+`undefined` returns (pass-through middleware) are never captured regardless of this setting. `withNextMiddleware` captures middleware execution; wrap route handlers separately when route-handler ALS context is required.
 
 ## Documentation
 

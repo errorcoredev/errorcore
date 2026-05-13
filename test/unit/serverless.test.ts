@@ -2,6 +2,8 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 import { resolveConfig, detectServerlessEnvironment } from '../../src/config';
 import { ALSManager } from '../../src/context/als-manager';
+import type { SDKInstanceLike } from '../../src/middleware/common';
+import type { RequestContext } from '../../src/types';
 import { resolveTestConfig } from '../helpers/test-config';
 
 describe('Phase 1: Serverless Mode Configuration', () => {
@@ -391,82 +393,154 @@ describe('Phase 3: Lambda Handler Wrapper', () => {
     expect(handler).toHaveBeenCalledOnce();
   });
 
-  describe('extractRequestContext', () => {
-    it('correctly parses API Gateway v2 events', async () => {
-      const { extractRequestContext } = await getExtractFunction();
-      const event = {
-        requestContext: { http: { method: 'POST' } },
-        rawPath: '/api/test',
-        headers: { 'content-type': 'application/json' }
-      };
-
-      const result = extractRequestContext(event, makeLambdaContext());
-      expect(result.method).toBe('POST');
-      expect(result.url).toBe('/api/test');
-      expect(result.eventSource).toBe('apigateway-v2');
+  it('tracks API Gateway v2 context through wrapLambda', async () => {
+    const sdk = makeActiveSdk();
+    const handler = vi.fn().mockImplementation(async () => {
+      expect(sdk.als.getContext?.()?.method).toBe('POST');
+      return { statusCode: 201 };
     });
 
-    it('correctly parses API Gateway v1 events', async () => {
-      const { extractRequestContext } = await getExtractFunction();
-      const event = {
+    const wrapped = wrapLambda(handler, sdk);
+    await expect(wrapped(
+      {
+        requestContext: { http: { method: 'POST' } },
+        rawPath: '/api/test',
+        headers: {
+          'content-type': 'application/json',
+          traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`,
+          tracestate: 'vendor=value'
+        }
+      },
+      makeLambdaContext()
+    )).resolves.toEqual({ statusCode: 201 });
+
+    expect(sdk.als.createRequestContext).toHaveBeenCalledWith({
+      method: 'POST',
+      url: '/api/test',
+      headers: {
+        'content-type': 'application/json',
+        traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`,
+        tracestate: 'vendor=value'
+      },
+      traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`,
+      tracestate: 'vendor=value'
+    });
+    expect(sdk.requestTracker.add).toHaveBeenCalledOnce();
+    expect(sdk.requestTracker.remove).toHaveBeenCalledWith('lambda-request');
+    expect(sdk.flush).toHaveBeenCalledOnce();
+  });
+
+  it('tracks API Gateway v1 multi-value headers through wrapLambda', async () => {
+    const sdk = makeActiveSdk();
+    const handler = vi.fn().mockResolvedValue({ statusCode: 204 });
+    const wrapped = wrapLambda(handler, sdk);
+
+    await wrapped(
+      {
         httpMethod: 'GET',
         path: '/api/users',
         requestContext: { stage: 'prod' },
-        headers: { host: 'api.example.com' }
-      };
+        headers: { host: 'api.example.com' },
+        multiValueHeaders: { 'x-request-id': ['a', 'b'] }
+      },
+      makeLambdaContext()
+    );
 
-      const result = extractRequestContext(event, makeLambdaContext());
-      expect(result.method).toBe('GET');
-      expect(result.url).toBe('/api/users');
-      expect(result.eventSource).toBe('apigateway-v1');
-    });
+    expect(sdk.als.createRequestContext).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'GET',
+      url: '/api/users',
+      headers: {
+        host: 'api.example.com',
+        'x-request-id': 'a, b'
+      }
+    }));
+  });
 
-    it('correctly parses ALB events', async () => {
-      const { extractRequestContext } = await getExtractFunction();
-      const event = {
+  it('reports ALB event source to the watchdog', async () => {
+    const sdk = makeActiveSdk();
+    const wrapped = wrapLambda(vi.fn().mockResolvedValue({ statusCode: 200 }), sdk);
+
+    await wrapped(
+      {
         httpMethod: 'GET',
         path: '/health',
         requestContext: { elb: { targetGroupArn: 'arn:aws:elasticloadbalancing:...' } },
         headers: {}
-      };
+      },
+      makeLambdaContext()
+    );
 
-      const result = extractRequestContext(event, makeLambdaContext());
-      expect(result.method).toBe('GET');
-      expect(result.eventSource).toBe('alb');
-    });
+    expect(sdk.getWatchdog?.()?.notifyInvokeStart).toHaveBeenCalledWith(expect.objectContaining({
+      eventSource: 'alb',
+      lambdaRequestId: 'req-123'
+    }));
+  });
 
-    it('produces synthetic context for SQS events', async () => {
-      const { extractRequestContext } = await getExtractFunction();
-      const event = {
-        Records: [{ eventSource: 'aws:sqs', body: '{}' }]
-      };
+  it('extracts SQS trace attributes and reports the synthetic event source', async () => {
+    const sdk = makeActiveSdk();
+    const wrapped = wrapLambda(vi.fn().mockResolvedValue('ok'), sdk);
 
-      const result = extractRequestContext(event, makeLambdaContext());
-      expect(result.method).toBe('INVOKE');
-      expect(result.eventSource).toBe('sqs');
-    });
+    await wrapped(
+      {
+        Records: [{
+          eventSource: 'aws:sqs',
+          body: '{}',
+          messageAttributes: {
+            traceparent: { stringValue: `00-${'c'.repeat(32)}-${'d'.repeat(16)}-00` },
+            tracestate: { stringValue: 'queue=alpha' }
+          }
+        }]
+      },
+      makeLambdaContext()
+    );
 
-    it('produces synthetic context for SNS events', async () => {
-      const { extractRequestContext } = await getExtractFunction();
-      const event = {
-        Records: [{ EventSource: 'aws:sns', Sns: { Message: 'test' } }]
-      };
+    expect(sdk.als.createRequestContext).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'INVOKE',
+      url: 'sqs/test-function',
+      traceparent: `00-${'c'.repeat(32)}-${'d'.repeat(16)}-00`,
+      tracestate: 'queue=alpha'
+    }));
+    expect(sdk.getWatchdog?.()?.notifyInvokeStart).toHaveBeenCalledWith(expect.objectContaining({
+      eventSource: 'sqs'
+    }));
+  });
 
-      const result = extractRequestContext(event, makeLambdaContext());
-      expect(result.eventSource).toBe('sns');
-    });
+  it('captures thrown handler errors and removes request context once', async () => {
+    const sdk = makeActiveSdk();
+    const thrown = new Error('lambda failed');
+    const wrapped = wrapLambda(vi.fn().mockRejectedValue(thrown), sdk);
 
-    it('produces synthetic context for EventBridge events', async () => {
-      const { extractRequestContext } = await getExtractFunction();
-      const event = {
+    await expect(wrapped(
+      { Records: [{ EventSource: 'aws:sns', Sns: { Message: 'test' } }] },
+      makeLambdaContext()
+    )).rejects.toThrow('lambda failed');
+
+    expect(sdk.captureError).toHaveBeenCalledWith(thrown);
+    expect(sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+    expect(sdk.getWatchdog?.()?.notifyInvokeEnd).toHaveBeenCalledOnce();
+  });
+
+  it('captures 5xx API Gateway results', async () => {
+    const sdk = makeActiveSdk();
+    const wrapped = wrapLambda(vi.fn().mockResolvedValue({ statusCode: 503 }), sdk);
+
+    await expect(wrapped(
+      {
         source: 'aws.ec2',
         'detail-type': 'EC2 Instance State-change Notification',
         detail: {}
-      };
+      },
+      makeLambdaContext()
+    )).resolves.toEqual({ statusCode: 503 });
 
-      const result = extractRequestContext(event, makeLambdaContext());
-      expect(result.eventSource).toBe('eventbridge');
-    });
+    expect(sdk.als.createRequestContext).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'INVOKE',
+      url: 'eventbridge/test-function'
+    }));
+    expect(sdk.captureError).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'ServerError',
+      message: 'HTTP 503'
+    }));
   });
 });
 
@@ -483,51 +557,76 @@ function makeLambdaContext(): import('../../src/middleware/lambda').LambdaContex
   };
 }
 
-async function getExtractFunction() {
-  // Access the non-exported function via module internals for testing
-  const mod = await import('../../src/middleware/lambda');
-  // extractRequestContext is not exported, so we test it indirectly through wrapLambda
-  // For direct testing, we can re-implement the detection logic in tests
-  // or use the module's internal behavior
+function makeRequestContext(input?: Partial<RequestContext>): RequestContext {
+  return {
+    requestId: 'lambda-request',
+    startTime: 1n,
+    method: input?.method ?? 'GET',
+    url: input?.url ?? '/',
+    headers: input?.headers ?? {},
+    body: null,
+    bodyTruncated: false,
+    ioEvents: [],
+    stateReads: [],
+    stateWrites: [],
+    traceId: 'a'.repeat(32),
+    spanId: 'b'.repeat(16),
+    parentSpanId: null,
+    traceFlags: 1,
+    isEntrySpan: true,
+    ...input
+  };
+}
 
-  // Since extractRequestContext is not exported, we'll create a lightweight test version
-  function extractRequestContext(event: unknown, lambdaContext: import('../../src/middleware/lambda').LambdaContext) {
-    if (event == null || typeof event !== 'object') {
-      return { method: 'INVOKE', url: `invoke/${lambdaContext.functionName}`, headers: {}, eventSource: 'invoke' };
-    }
+function makeActiveSdk(): SDKInstanceLike {
+  let currentContext: RequestContext | undefined;
+  const watchdog = {
+    notifyInvokeStart: vi.fn(),
+    notifyInvokeEnd: vi.fn()
+  };
 
-    const ev = event as Record<string, unknown>;
+  const sdk: SDKInstanceLike = {
+    isActive: vi.fn(() => true),
+    captureError: vi.fn(),
+    flush: vi.fn().mockResolvedValue(undefined),
+    als: {
+      createRequestContext: vi.fn((input) => makeRequestContext({
+        method: input.method,
+        url: input.url,
+        headers: input.headers,
+        inboundTracestate: input.tracestate
+      })),
+      getContext: vi.fn(() => currentContext),
+      runWithContext: vi.fn((ctx, fn) => {
+        const previous = currentContext;
+        currentContext = ctx;
+        try {
+          return fn();
+        } finally {
+          currentContext = previous;
+        }
+      })
+    },
+    requestTracker: {
+      add: vi.fn(),
+      remove: vi.fn()
+    },
+    headerFilter: {
+      filterAndNormalizeHeaders: vi.fn((headers: unknown) => {
+        const result: Record<string, string> = {};
+        if (headers != null && typeof headers === 'object') {
+          for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+            if (typeof value === 'string') result[key.toLowerCase()] = value;
+          }
+        }
+        return result;
+      })
+    },
+    processMetadata: {
+      setServerlessMetadata: vi.fn()
+    },
+    getWatchdog: vi.fn(() => watchdog)
+  };
 
-    if (ev.requestContext != null && typeof ev.requestContext === 'object' &&
-      typeof (ev.requestContext as Record<string, unknown>).http === 'object') {
-      const http = (ev.requestContext as Record<string, unknown>).http as Record<string, unknown>;
-      const method = typeof http.method === 'string' ? http.method : 'GET';
-      const url = typeof ev.rawPath === 'string' ? ev.rawPath : typeof ev.path === 'string' ? ev.path : '/';
-      return { method, url, headers: {}, eventSource: 'apigateway-v2' };
-    }
-
-    if (typeof ev.httpMethod === 'string' && ev.requestContext != null && typeof ev.requestContext === 'object' &&
-      typeof (ev.requestContext as Record<string, unknown>).http !== 'object') {
-      const method = ev.httpMethod as string;
-      const url = typeof ev.path === 'string' ? ev.path : '/';
-      const isAlb = (ev.requestContext as Record<string, unknown>).elb != null;
-      return { method, url, headers: {}, eventSource: isAlb ? 'alb' : 'apigateway-v1' };
-    }
-
-    // Non-HTTP events
-    let eventSource = 'invoke';
-    if (Array.isArray(ev.Records) && ev.Records.length > 0) {
-      const first = ev.Records[0] as Record<string, unknown>;
-      if (first.eventSource === 'aws:sqs') eventSource = 'sqs';
-      if (first.EventSource === 'aws:sns') eventSource = 'sns';
-      if (first.eventSource === 'aws:s3') eventSource = 's3';
-      if (first.eventSource === 'aws:dynamodb') eventSource = 'dynamodb';
-      if (first.eventSource === 'aws:kinesis') eventSource = 'kinesis';
-    }
-    if (ev.source && ev['detail-type']) eventSource = 'eventbridge';
-
-    return { method: 'INVOKE', url: `${eventSource}/${lambdaContext.functionName}`, headers: {}, eventSource };
-  }
-
-  return { extractRequestContext };
+  return sdk;
 }

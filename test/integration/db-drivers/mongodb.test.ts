@@ -107,11 +107,8 @@ describe.skipIf(mongodb === null || memoryServer === null)(
       }
     });
 
-    it('does not record raw user values verbatim in dbMeta.query', async () => {
+    it('captures scrubbed user values in dbMeta.params when enabled', async () => {
       const buffer = makeBuffer();
-      // The mongodb patch summarizes filter shape (key list) and never
-      // emits values. Asserting this on a real driver guarantees we
-      // never regress that contract by adding a verbose-mode shortcut.
       const config = resolveTestConfig({ captureDbBindParams: true });
       const { uninstall } = installMongodbPatch({
         buffer,
@@ -135,6 +132,8 @@ describe.skipIf(mongodb === null || memoryServer === null)(
         const recordedParams = insertEvent!.dbMeta?.params ?? '';
         expect(recordedQuery).not.toContain('super-secret-token');
         expect(recordedParams).not.toContain('super-secret-token');
+        expect(recordedParams).toContain('[REDACTED]');
+        expect(recordedParams).toContain('_id');
       } finally {
         uninstall();
       }

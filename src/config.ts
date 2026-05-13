@@ -103,7 +103,9 @@ const DEFAULT_ENV_ALLOWLIST = [
   'REPLICA_SET'
 ];
 
-const DEFAULT_ENV_BLOCKLIST = [/key|secret|token|password|credential|auth|private/i];
+const DEFAULT_ENV_BLOCKLIST = [/key|secret|token|password|passcode|passphrase|passwd|credential|auth|private/i];
+const DEFAULT_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
+const DEFAULT_DEAD_LETTER_MAX_BACKUPS = 5;
 
 const DEFAULT_BODY_CAPTURE_CONTENT_TYPES = [
   'application/json',
@@ -152,7 +154,7 @@ export function detectServerlessEnvironment(): boolean {
   if (process.env.FUNCTIONS_WORKER_RUNTIME) return true;
   if (process.env.K_SERVICE && process.env.K_REVISION) return true;
   if (process.env.VERCEL) return true;
-  if (process.env.AWS_EXECUTION_ENV) return true;
+  if (/^AWS_Lambda_/i.test(process.env.AWS_EXECUTION_ENV ?? '')) return true;
   return false;
 }
 
@@ -212,6 +214,16 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   let bufferSize = userConfig.bufferSize ?? (serverless ? 50 : 200);
   let bufferMaxBytes = userConfig.bufferMaxBytes ?? (serverless ? 5242880 : 52428800);
   const maxPayloadSize = userConfig.maxPayloadSize ?? 32768;
+  const payloadSpoolConfig = userConfig.payloadSpool ?? {};
+  const payloadSpoolEnabled = payloadSpoolConfig.enabled ?? true;
+  const payloadSpoolGlobalMaxBytes =
+    payloadSpoolConfig.globalMaxBytes ?? (serverless ? 8 * 1024 * 1024 : 64 * 1024 * 1024);
+  const payloadSpoolPerRequestMaxBytes =
+    payloadSpoolConfig.perRequestMaxBytes ?? (serverless ? 512 * 1024 : 2 * 1024 * 1024);
+  const payloadSpoolPerBlobMaxBytes =
+    payloadSpoolConfig.perBlobMaxBytes ?? 512 * 1024;
+  const payloadSpoolPreviewBytes = payloadSpoolConfig.previewBytes ?? 8 * 1024;
+  const payloadSpoolCompletedTtlMs = payloadSpoolConfig.completedTtlMs ?? 60000;
   const maxConcurrentRequests = userConfig.maxConcurrentRequests ?? 50;
   const rateLimitPerMinute = userConfig.rateLimitPerMinute ?? 60;
   const rateLimitWindowMs = userConfig.rateLimitWindowMs ?? 60000;
@@ -279,6 +291,11 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
 
     return null;
   });
+  assertPositiveInteger(payloadSpoolGlobalMaxBytes, 'payloadSpool.globalMaxBytes');
+  assertPositiveInteger(payloadSpoolPerRequestMaxBytes, 'payloadSpool.perRequestMaxBytes');
+  assertPositiveInteger(payloadSpoolPerBlobMaxBytes, 'payloadSpool.perBlobMaxBytes');
+  assertPositiveInteger(payloadSpoolPreviewBytes, 'payloadSpool.previewBytes');
+  assertPositiveInteger(payloadSpoolCompletedTtlMs, 'payloadSpool.completedTtlMs');
 
   assertPositiveInteger(maxConcurrentRequests, 'maxConcurrentRequests');
   assertPositiveInteger(rateLimitPerMinute, 'rateLimitPerMinute');
@@ -300,6 +317,14 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     'uncaughtExceptionExitDelayMs'
   );
   assertNonNegativeInteger(maxDrainOnStartup, 'maxDrainOnStartup');
+
+  const deadLetterMaxBytes =
+    userConfig.deadLetterMaxBytes ?? DEFAULT_DEAD_LETTER_MAX_BYTES;
+  assertPositiveInteger(deadLetterMaxBytes, 'deadLetterMaxBytes');
+
+  const deadLetterMaxBackups =
+    userConfig.deadLetterMaxBackups ?? DEFAULT_DEAD_LETTER_MAX_BACKUPS;
+  assertNonNegativeInteger(deadLetterMaxBackups, 'deadLetterMaxBackups');
 
   if (transport === undefined) {
     throw new Error(
@@ -372,6 +397,15 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
   const previousEncryptionKeys = userConfig.previousEncryptionKeys ?? [];
   if (!Array.isArray(previousEncryptionKeys)) {
     throw new Error('previousEncryptionKeys must be an array of 64-character hex strings');
+  }
+
+  const previousTransportAuthorizations =
+    userConfig.previousTransportAuthorizations ?? [];
+  if (!Array.isArray(previousTransportAuthorizations)) {
+    throw new Error('previousTransportAuthorizations must be an array of strings');
+  }
+  if (!previousTransportAuthorizations.every((value) => typeof value === 'string')) {
+    throw new Error('previousTransportAuthorizations must be an array of strings');
   }
   if (previousEncryptionKeys.length > 5) {
     throw new Error('previousEncryptionKeys must contain at most 5 entries');
@@ -627,6 +661,7 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     macKey: resolvedMacKey,
     encryptionKeyCallback: userConfig.encryptionKeyCallback,
     previousEncryptionKeys: [...previousEncryptionKeys],
+    previousTransportAuthorizations: [...previousTransportAuthorizations],
     // Default matches the transport default above (isProduction() gate): in
     // development (NODE_ENV !== 'production') plaintext is allowed and the
     // stdout transport is injected automatically; in production encryption
@@ -642,6 +677,14 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     captureResponseBodies,
     captureBody: captureRequestBodies && captureResponseBodies,
     captureBodyDigest: userConfig.captureBodyDigest ?? false,
+    payloadSpool: {
+      enabled: payloadSpoolEnabled,
+      globalMaxBytes: payloadSpoolGlobalMaxBytes,
+      perRequestMaxBytes: payloadSpoolPerRequestMaxBytes,
+      perBlobMaxBytes: payloadSpoolPerBlobMaxBytes,
+      previewBytes: payloadSpoolPreviewBytes,
+      completedTtlMs: payloadSpoolCompletedTtlMs
+    },
     bodyCaptureContentTypes: [
       ...(userConfig.bodyCaptureContentTypes ?? DEFAULT_BODY_CAPTURE_CONTENT_TYPES)
     ],
@@ -655,6 +698,8 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     allowPlainHttpTransport,
     allowInvalidCollectorCertificates,
     deadLetterPath,
+    deadLetterMaxBytes,
+    deadLetterMaxBackups,
     maxDrainOnStartup,
     useWorkerAssembly,
     flushIntervalMs,

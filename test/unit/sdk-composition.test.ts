@@ -288,6 +288,99 @@ describe('SDK composition', () => {
     }
   });
 
+  it('replays auth-only dead-letter entries signed with previous collector authorization', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-auth-previous-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const payload = '{"ok":"previous-auth"}';
+    const store = new DeadLetterStore(deadLetterPath, {
+      integrityKey: 'Bearer old-replay-secret'
+    });
+
+    store.appendPayloadSync(payload);
+
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer current-replay-secret'
+      },
+      previousTransportAuthorizations: ['Bearer old-replay-secret'],
+      deadLetterPath
+    });
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy).toHaveBeenCalledWith({
+        serialized: payload,
+        envelope: undefined
+      });
+      expect(fs.existsSync(deadLetterPath)).toBe(false);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+    }
+  });
+
+  it('passes configured dead-letter rotation limits into the SDK-created store', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-sdk-dlq-rotate-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer rotation-secret'
+      },
+      deadLetterPath,
+      deadLetterMaxBytes: 1,
+      deadLetterMaxBackups: 1
+    });
+    const store = (sdk as unknown as {
+      deadLetterStore: DeadLetterStore | null;
+    }).deadLetterStore;
+
+    try {
+      expect(store).not.toBeNull();
+
+      store!.appendPayloadSync('{"p":1}');
+      store!.appendPayloadSync('{"p":2}');
+      store!.appendPayloadSync('{"p":3}');
+
+      const backups = fs
+        .readdirSync(path.dirname(deadLetterPath))
+        .filter((entry) =>
+          entry.startsWith(path.basename(deadLetterPath)) &&
+          entry.endsWith('.bak')
+        );
+
+      expect(backups).toHaveLength(1);
+      expect(store!.drain().entries.map((entry) => entry.payload)).toEqual([
+        '{"p":3}'
+      ]);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+      for (const backup of fs
+        .readdirSync(path.dirname(deadLetterPath))
+        .filter((entry) =>
+          entry.startsWith(path.basename(deadLetterPath)) &&
+          entry.endsWith('.bak')
+        )) {
+        fs.rmSync(path.join(path.dirname(deadLetterPath), backup), { force: true });
+      }
+    }
+  });
+
   it('activate subscribes channels, installs patches, registers handlers, and starts lag measurement', async () => {
     const onSpy = vi.spyOn(process, 'on');
     const sdk = createTestSDK();
@@ -754,6 +847,11 @@ describe('SDKInstance.getHealth', () => {
         deadLetterWriteFailed: 0
       });
       expect(health.transportFailures).toBe(0);
+      expect(health.payloadSpool).toEqual({
+        pressureWarnings: 0,
+        previewFallbacks: 0,
+        drops: 0
+      });
       expect(health.transportQueueDepth).toBe(0);
       expect(health.deadLetterDepth).toBe(0);
       expect(health.ioBufferDepth).toBe(0);

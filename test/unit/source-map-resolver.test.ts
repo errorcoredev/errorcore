@@ -419,11 +419,44 @@ describe('SourceMapResolver', () => {
       vi.restoreAllMocks();
     });
   });
+
+  describe('audit cache bounds and invalidation', () => {
+    it('bounds total cache entries, including missing source maps', async () => {
+      existsSync.mockReturnValue(false);
+
+      const resolver = new SourceMapResolver();
+
+      for (let index = 0; index < 300; index += 1) {
+        resolver.resolveStack(`Error\n    at fn (/app/missing-${index}.js:1:1)`);
+      }
+      await resolver.flushWarmQueue();
+
+      const cacheSize = (resolver as unknown as { cache: Map<string, unknown> }).cache.size;
+      expect(cacheSize).toBeLessThanOrEqual(256);
+    });
+
+    it('sweeps expired negative entries when resolving later paths', async () => {
+      let now = 1_000;
+      vi.spyOn(Date, 'now').mockImplementation(() => now);
+      existsSync.mockReturnValue(false);
+
+      const resolver = new SourceMapResolver();
+
+      resolver.resolveStack('Error\n    at fn (/app/old-missing.js:1:1)');
+      await resolver.flushWarmQueue();
+
+      now += 60 * 60 * 1000 + 1;
+      resolver.resolveStack('Error\n    at fn (/app/new-missing.js:1:1)');
+      await resolver.flushWarmQueue();
+
+      const cache = (resolver as unknown as { cache: Map<string, unknown> }).cache;
+      expect([...cache.keys()].join('\n')).not.toContain('old-missing');
+    });
+  });
 });
 
-// Helpers for the Task 16 sync-on-miss path (planning doc:
-// docs/superpowers/plans/2026-04-20-errorcore-gap-fixes.md). The 2 MB gate
-// keeps the synchronous JSON.parse off the hot path for large maps.
+// Helpers for the sync-on-miss source-map path. The 2 MB gate keeps the
+// synchronous JSON.parse off the hot path for large maps.
 
 function writeSmallValidSourceMap(): { filePath: string; mapPath: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ec-smap-'));
@@ -458,6 +491,17 @@ function writeLargeSourceMap(byteSize: number): { filePath: string; mapPath: str
   };
   fs.writeFileSync(mapPath, JSON.stringify(smap));
   return { filePath, mapPath };
+}
+
+function overwriteSourceMapSource(mapPath: string, source: string): void {
+  const smap = {
+    version: 3,
+    file: 'file.js',
+    sources: [source],
+    names: [],
+    mappings: 'AAAA'
+  };
+  fs.writeFileSync(mapPath, JSON.stringify(smap));
 }
 
 describe('G3 — sync-on-miss with size gate', () => {
@@ -509,5 +553,17 @@ describe('G3 — sync-on-miss with size gate', () => {
     await resolver.flushWarmQueue();
     const result2 = resolver.resolveStack(stack);
     expect(result2).toContain('webpack://my-app/src/file.ts');
+  });
+
+  it('invalidates a cached source map when file contents change at the same path', () => {
+    const { filePath, mapPath } = writeSmallValidSourceMap();
+    const resolver = new SourceMapResolver({ sourceMapSyncThresholdBytes: 2 * 1024 * 1024 });
+    const stack = `Error: x\n    at foo (${filePath}:1:1)`;
+
+    expect(resolver.resolveStack(stack)).toContain('webpack://my-app/src/file.ts');
+
+    overwriteSourceMapSource(mapPath, 'webpack://my-app/src/replaced.ts');
+
+    expect(resolver.resolveStack(stack)).toContain('webpack://my-app/src/replaced.ts');
   });
 });

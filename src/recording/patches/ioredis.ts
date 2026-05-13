@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import type { IOEventSlot, RequestContext } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+import { scrubCacheKey } from '../../pii/scrubber';
 import { pushIOEvent } from '../utils';
 import type { RecorderState } from '../../sdk-diagnostics';
 import { detectBundler } from '../../sdk-diagnostics';
@@ -54,7 +55,12 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
   try {
     const Redis = (deps.explicitDriver ?? appRequire('ioredis')) as { prototype?: object };
 
-    if (Redis.prototype !== undefined) {
+    let wrappedMethods = 0;
+
+    if (
+      Redis.prototype !== undefined &&
+      typeof (Redis.prototype as Record<string, unknown>).sendCommand === 'function'
+    ) {
       wrapMethod(Redis.prototype, 'sendCommand', (original) => {
         return function patchedSendCommand(this: unknown, command: {
           name?: string;
@@ -73,7 +79,10 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
             Array.isArray(command?.args) && typeof command.args[0] === 'string'
               ? command.args[0]
               : undefined;
-          const key = isCredentialCommand ? undefined : rawKey;
+          const key =
+            isCredentialCommand || rawKey === undefined
+              ? undefined
+              : scrubCacheKey(rawKey);
           const event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'> = {
             phase: 'active',
             startTime,
@@ -148,6 +157,7 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
           }
         };
       });
+      wrappedMethods += 1;
     }
 
     const uninstall = () => {
@@ -155,6 +165,11 @@ export function install(deps: PatchInstallDeps): { uninstall: () => void; state:
         unwrapMethod(Redis.prototype, 'sendCommand');
       }
     };
+
+    if (wrappedMethods === 0) {
+      return { uninstall, state: { state: 'warn', reason: 'no-supported-methods' } };
+    }
+
     return { uninstall, state: { state: 'ok' } };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {

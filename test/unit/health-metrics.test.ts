@@ -14,6 +14,11 @@ describe('HealthMetrics', () => {
         captureFailed: 0,
         deadLetterWriteFailed: 0
       });
+      expect(m.getPayloadSpoolBreakdown()).toEqual({
+        pressureWarnings: 0,
+        previewFallbacks: 0,
+        drops: 0
+      });
     });
 
     it('reports zero percentiles when no latency samples are recorded', () => {
@@ -66,6 +71,21 @@ describe('HealthMetrics', () => {
 
       expect(m.getTransportFailures()).toBe(2);
       expect(m.getLastFailure()).toEqual({ reason: 'HTTP 503', at: 2000 });
+    });
+
+    it('records payload spool pressure, preview fallback, and drop counters independently', () => {
+      const m = new HealthMetrics();
+
+      m.recordPayloadSpoolPressure();
+      m.recordPayloadSpoolPreviewFallback();
+      m.recordPayloadSpoolPreviewFallback();
+      m.recordPayloadSpoolDrop();
+
+      expect(m.getPayloadSpoolBreakdown()).toEqual({
+        pressureWarnings: 1,
+        previewFallbacks: 2,
+        drops: 1
+      });
     });
 
     it('truncates the recorded failure reason at 200 characters', () => {

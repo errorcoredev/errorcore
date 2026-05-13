@@ -152,7 +152,7 @@ The rate limiter tracks captures per window (default: 60 per 60 seconds). When t
 
 ## Tuning defaults from telemetry
 
-Three defaults are intentionally conservative and are expected to be raised once a deployment has real traffic. The SDK reports each as a counter in `completeness` and `getHealth()` so you can detect when a default is biting before a customer reports it. See `defaults-todo.md` in the repo for the full reasoning.
+Three defaults are intentionally conservative and are expected to be raised once a deployment has real traffic. The SDK reports each as a counter in `completeness` and `getHealth()` so you can detect when a default is biting before a customer reports it.
 
 | Default | Current | Signal that it's too low | Knob to turn |
 |---------|---------|--------------------------|--------------|

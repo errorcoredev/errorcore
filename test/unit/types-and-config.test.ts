@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { resolveConfig, __resetLegacyInsecureTransportWarning } from '../../src/config';
+import {
+  resolveConfig,
+  detectServerlessEnvironment,
+  __resetLegacyInsecureTransportWarning
+} from '../../src/config';
 import type {
   ErrorInfo,
   ErrorPackage,
@@ -83,11 +87,12 @@ describe('resolveConfig', () => {
         'IMAGE_TAG',
         'REPLICA_SET'
       ],
-      envBlocklist: [/key|secret|token|password|credential|auth|private/i],
+      envBlocklist: [/key|secret|token|password|passcode|passphrase|passwd|credential|auth|private/i],
       encryptionKey: undefined,
       macKey: undefined,
       encryptionKeyCallback: undefined,
       previousEncryptionKeys: [],
+      previousTransportAuthorizations: [],
       allowUnencrypted: true, // set explicitly by resolveTestConfig
       allowProductionPlaintext: false,
       hardCapBytes: 1_048_576,
@@ -121,11 +126,21 @@ describe('resolveConfig', () => {
       allowPlainHttpTransport: false,
       allowInvalidCollectorCertificates: false,
       deadLetterPath: undefined,
+      deadLetterMaxBytes: 50 * 1024 * 1024,
+      deadLetterMaxBackups: 5,
       maxDrainOnStartup: 100,
       useWorkerAssembly: true,
       flushIntervalMs: 5000,
       resolveSourceMaps: true,
       serverless: false,
+      payloadSpool: {
+        enabled: true,
+        globalMaxBytes: 64 * 1024 * 1024,
+        perRequestMaxBytes: 2 * 1024 * 1024,
+        perBlobMaxBytes: 512 * 1024,
+        previewBytes: 8 * 1024,
+        completedTtlMs: 60000
+      },
       onInternalWarning: undefined,
       drivers: {},
       silent: false,
@@ -314,6 +329,16 @@ describe('resolveConfig', () => {
     ).toBe(true);
   });
 
+  it('blocks PASS-style environment names by default', () => {
+    const resolved = resolveTestConfig();
+
+    for (const name of ['PASSWORD', 'PASSCODE', 'PASSPHRASE', 'PASSWD']) {
+      expect(
+        resolved.envBlocklist.some((pattern) => pattern.test(name))
+      ).toBe(true);
+    }
+  });
+
   it('ignores unknown keys', () => {
     const resolved = resolveTestConfig({
       bufferSize: 250,
@@ -431,6 +456,10 @@ describe('resolveConfig', () => {
     expect(template).not.toMatch(/^\s*transport:\s*\{\s*type:\s*'stdout'/m);
     expect(template).toContain('captureRequestBodies: false');
     expect(template).toContain('captureResponseBodies: false');
+    expect(template).not.toMatch(/^\s*headerAllowlist:\s*\[/m);
+    expect(template).not.toMatch(/^\s*headerBlocklist:\s*\[/m);
+    expect(template).toContain('deadLetterMaxBytes: 50 * 1024 * 1024');
+    expect(template).toContain('previousTransportAuthorizations: []');
   });
 
   it('maps legacy captureBody to both request and response capture for compatibility', () => {
@@ -453,6 +482,50 @@ describe('resolveConfig', () => {
     expect(resolved.captureBody).toBe(false);
     expect(resolved.captureRequestBodies).toBe(true);
     expect(resolved.captureResponseBodies).toBe(false);
+  });
+
+  it('does not treat generic AWS execution environments as Lambda serverless', () => {
+    const previousAwsExecutionEnv = process.env.AWS_EXECUTION_ENV;
+    const previousAwsLambdaFunctionName = process.env.AWS_LAMBDA_FUNCTION_NAME;
+    try {
+      process.env.AWS_EXECUTION_ENV = 'AWS_ECS_FARGATE';
+      delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+
+      expect(detectServerlessEnvironment()).toBe(false);
+    } finally {
+      if (previousAwsExecutionEnv === undefined) {
+        delete process.env.AWS_EXECUTION_ENV;
+      } else {
+        process.env.AWS_EXECUTION_ENV = previousAwsExecutionEnv;
+      }
+      if (previousAwsLambdaFunctionName === undefined) {
+        delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+      } else {
+        process.env.AWS_LAMBDA_FUNCTION_NAME = previousAwsLambdaFunctionName;
+      }
+    }
+  });
+
+  it('treats Lambda-shaped AWS execution environments as serverless', () => {
+    const previousAwsExecutionEnv = process.env.AWS_EXECUTION_ENV;
+    const previousAwsLambdaFunctionName = process.env.AWS_LAMBDA_FUNCTION_NAME;
+    try {
+      process.env.AWS_EXECUTION_ENV = 'AWS_Lambda_nodejs20.x';
+      delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+
+      expect(detectServerlessEnvironment()).toBe(true);
+    } finally {
+      if (previousAwsExecutionEnv === undefined) {
+        delete process.env.AWS_EXECUTION_ENV;
+      } else {
+        process.env.AWS_EXECUTION_ENV = previousAwsExecutionEnv;
+      }
+      if (previousAwsLambdaFunctionName === undefined) {
+        delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+      } else {
+        process.env.AWS_LAMBDA_FUNCTION_NAME = previousAwsLambdaFunctionName;
+      }
+    }
   });
 });
 
@@ -631,6 +704,49 @@ describe('0.2.0 config surface', () => {
       allowUnencrypted: true,
       captureMiddlewareStatusCodes: 401 as never
     })).toThrow(/captureMiddlewareStatusCodes/);
+  });
+
+  it('accepts DLQ size/backups and previous transport authorization config', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      deadLetterMaxBytes: 12 * 1024 * 1024,
+      deadLetterMaxBackups: 7,
+      previousTransportAuthorizations: ['Bearer old-token', 'Bearer older-token']
+    });
+
+    expect(resolved.deadLetterMaxBytes).toBe(12 * 1024 * 1024);
+    expect(resolved.deadLetterMaxBackups).toBe(7);
+    expect(resolved.previousTransportAuthorizations).toEqual([
+      'Bearer old-token',
+      'Bearer older-token'
+    ]);
+  });
+
+  it('rejects invalid DLQ and previous transport authorization config', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        deadLetterMaxBytes: 0
+      })
+    ).toThrow(/deadLetterMaxBytes/);
+
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        deadLetterMaxBackups: -1
+      })
+    ).toThrow(/deadLetterMaxBackups/);
+
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        previousTransportAuthorizations: [42]
+      } as never)
+    ).toThrow(/previousTransportAuthorizations/);
   });
 });
 

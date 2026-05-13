@@ -5,6 +5,12 @@ import { safeConsole } from '../debug-log';
 import { pendingFetchResolvers } from './undici';
 
 interface BodyCaptureLike {
+  captureUndiciResponseStream(
+    slot: IOEventSlot,
+    body: ReadableStream<Uint8Array> | null,
+    headers: Record<string, string> | null,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): Promise<void>;
   captureUndiciResponseBuffer(
     slot: IOEventSlot,
     body: Buffer,
@@ -96,10 +102,11 @@ export function installFetchWrapper(deps: FetchWrapperDeps): FetchWrapperHandle 
       timeoutHandle.unref();
     }
 
-    pendingFetchResolvers.push((slot) => {
+    const bindFetchSlot = (slot: IOEventSlot | null) => {
       clearTimeout(timeoutHandle);
       resolveSlot(slot);
-    });
+    };
+    pendingFetchResolvers.push(bindFetchSlot);
 
     let response: Response;
     try {
@@ -107,37 +114,17 @@ export function installFetchWrapper(deps: FetchWrapperDeps): FetchWrapperHandle 
     } catch (err) {
       // Drain our resolver if it hasn't been popped yet (the dispatch never
       // fired, e.g., URL parse error). Otherwise the queue grows unbounded.
+      const resolverIndex = pendingFetchResolvers.indexOf(bindFetchSlot);
+      if (resolverIndex !== -1) {
+        pendingFetchResolvers.splice(resolverIndex, 1);
+      }
+      clearTimeout(timeoutHandle);
       resolveSlot(null);
       throw err;
     }
 
     const slot = await slotPromise;
     if (slot === null) {
-      return response;
-    }
-
-    // Drain the body inline and reconstruct a fresh Response from the
-    // buffered bytes. Earlier prototype used response.clone() + a
-    // backgrounded arrayBuffer() so the wrapper returned the original
-    // response immediately — but the parse-failure scenarios the SDK is
-    // designed to observe (scenario 07: payments.json() throws) capture
-    // synchronously after fetch returns, before the backgrounded drain
-    // settles, so slot.responseBody stays null.
-    //
-    // Tradeoff: this buffers the entire body in memory before the
-    // application sees it, breaking streaming-style response handling.
-    // For the demo's content types (application/json, text/plain,
-    // x-www-form-urlencoded) bounded by maxPayloadSize, this is
-    // acceptable. Streaming consumers and very large bodies would need a
-    // tee'd ReadableStream — out of scope for this pass.
-    let buf: Buffer;
-    try {
-      const arrayBuffer = await response.arrayBuffer();
-      buf = Buffer.from(arrayBuffer);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      safeConsole.warn(`[ErrorCore] fetch wrapper drain failed: ${message}`);
-      slot.responseBodyTruncated = true;
       return response;
     }
 
@@ -158,10 +145,20 @@ export function installFetchWrapper(deps: FetchWrapperDeps): FetchWrapperHandle 
       slot.statusCode = response.status;
     }
 
+    let captureResponse: Response;
     try {
-      deps.bodyCapture.captureUndiciResponseBuffer(
+      captureResponse = response.clone();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      safeConsole.warn(`[ErrorCore] fetch wrapper clone failed: ${message}`);
+      slot.responseBodyTruncated = true;
+      return response;
+    }
+
+    try {
+      await deps.bodyCapture.captureUndiciResponseStream(
         slot,
-        buf,
+        captureResponse.body,
         slot.responseHeaders,
         (oldBytes, newBytes) => {
           deps.buffer.updatePayloadBytes(oldBytes, newBytes);
@@ -172,16 +169,7 @@ export function installFetchWrapper(deps: FetchWrapperDeps): FetchWrapperHandle 
       safeConsole.warn(`[ErrorCore] fetch wrapper capture failed: ${message}`);
     }
 
-    // Reconstruct a Response so the application can still read the body
-    // via .json() / .text() / .arrayBuffer(). Node Buffer extends
-    // Uint8Array which is a valid BodyInit; the cast bypasses a TS lib
-    // version mismatch where Buffer<ArrayBufferLike> is not narrowed
-    // to BodyInit.
-    return new Response(buf as unknown as BodyInit, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers
-    });
+    return response;
   };
 
   target.fetch = patched;

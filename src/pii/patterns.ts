@@ -46,7 +46,10 @@ export const COMBINED_QUICK_TEST_REGEX = new RegExp(
 );
 
 export const SENSITIVE_KEY_EXACT_MATCHES = new Set([
+  'pass',
   'password',
+  'passcode',
+  'passphrase',
   'passwd',
   'secret',
   'token',
@@ -64,7 +67,10 @@ export const SENSITIVE_KEY_EXACT_MATCHES = new Set([
 ]);
 
 export const SENSITIVE_KEY_FRAGMENTS = [
+  'pass',
   'password',
+  'passcode',
+  'passphrase',
   'passwd',
   'secret',
   'token',
@@ -86,7 +92,7 @@ export const SENSITIVE_KEY_COMPLEX_REGEX =
   /social.*security|credit.*card|card.*number/i;
 
 export const SENSITIVE_KEY_REGEX =
-  /(^|[-_.])(passwords?|passwd|secrets?|tokens?|keys?|auth|credentials?|ssn|cvv|cvc|expir(?:y|ation)?|phone|session|cookie|oauth|private)([-_.]|$)|social.*security|credit.*card|card.*number/i;
+  /(^|[-_.])(pass(?:words?|codes?|phrases?)?|passwd|secrets?|tokens?|keys?|auth|credentials?|ssn|cvv|cvc|expir(?:y|ation)?|phone|session|cookie|oauth|private)([-_.]|$)|social.*security|credit.*card|card.*number/i;
 
 export function isValidLuhn(digits: string): boolean {
   if (!/^\d{13,19}$/.test(digits)) {

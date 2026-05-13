@@ -5,6 +5,7 @@ import {
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
+import { registerRequestCleanup } from '../context/request-tracker';
 
 export function wrapHandler<
   T extends (
@@ -26,24 +27,40 @@ export function wrapHandler<
       return;
     }
 
-    try {
-      const ctx = instance.als.createRequestContext({
-        method: req.method ?? 'GET',
-        url: req.url ?? '',
-        headers: filterHeaders(instance, req.headers),
-        traceparent: req.headers['traceparent'] as string | undefined,
-        tracestate: req.headers['tracestate'] as string | undefined
-      });
+    const ctx = (() => {
+      try {
+        return instance.als.createRequestContext({
+          method: req.method ?? 'GET',
+          url: req.url ?? '',
+          headers: filterHeaders(instance, req.headers),
+          traceparent: req.headers['traceparent'] as string | undefined,
+          tracestate: req.headers['tracestate'] as string | undefined
+        });
+      } catch {
+        return null;
+      }
+    })();
 
+    if (ctx === null) {
+      handler(req, res);
+      return;
+    }
+
+    try {
       instance.requestTracker.add(ctx);
-      res.on('finish', () => {
-        instance.requestTracker.remove(ctx.requestId);
-      });
-      instance.als.runWithContext(ctx, () => {
-        handler(req, res);
+      registerRequestCleanup({
+        requestTracker: instance.requestTracker,
+        requestId: ctx.requestId,
+        request: req,
+        response: res
       });
     } catch {
       handler(req, res);
+      return;
     }
+
+    instance.als.runWithContext(ctx, () => {
+      handler(req, res);
+    });
   }) as T;
 }

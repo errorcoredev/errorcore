@@ -39,8 +39,12 @@ function createSlot(overrides: Partial<IOEventSlot> = {}): IOEventSlot {
   };
 }
 
-function buildDeps() {
-  const config = resolveTestConfig({ captureRequestBodies: true, captureResponseBodies: true });
+function buildDeps(overrides: Parameters<typeof resolveTestConfig>[0] = {}) {
+  const config = resolveTestConfig({
+    captureRequestBodies: true,
+    captureResponseBodies: true,
+    ...overrides
+  });
   const scrubber = new Scrubber(config);
   const bodyCapture = new BodyCapture({
     maxPayloadSize: config.maxPayloadSize,
@@ -166,6 +170,49 @@ describe('installFetchWrapper', () => {
     expect(slot.responseBody).toBe(malformed);
   });
 
+  it('reads only a capped clone before returning the application response', async () => {
+    const maxPayloadSize = 1024;
+    const deps = buildDeps({ maxPayloadSize });
+    const chunks = Array.from({ length: 1200 }, () => 'a');
+    const fullBody = chunks.join('');
+    const capturedBody = fullBody.slice(0, maxPayloadSize);
+    let nextChunk = 0;
+    let pulls = 0;
+
+    globalThis.fetch = vi.fn(async () => {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (nextChunk >= chunks.length) {
+              controller.close();
+              return;
+            }
+
+            pulls += 1;
+            controller.enqueue(new TextEncoder().encode(chunks[nextChunk]));
+            nextChunk += 1;
+          }
+        }),
+        { headers: { 'content-type': 'text/plain' } }
+      );
+    }) as typeof globalThis.fetch;
+
+    installFetchWrapper({ ...deps, captureResponseBodies: true });
+
+    const slot = createSlot({ requestHeaders: { 'content-type': 'text/plain' } });
+    const responsePromise = fetch('http://stripe-mock/stream');
+    const resolver = pendingFetchResolvers.shift();
+    resolver?.(slot);
+
+    const response = await responsePromise;
+    const pullsBeforeApplicationRead = pulls;
+
+    expect(pullsBeforeApplicationRead).toBeLessThan(chunks.length);
+    expect(await response.text()).toBe(fullBody);
+    expect(slot.responseBody).toBe(capturedBody);
+    expect(slot.responseBodyTruncated).toBe(true);
+  });
+
   it('does not break the application when no slot is bound', async () => {
     const deps = buildDeps();
     globalThis.fetch = vi.fn(async () => new Response('hello')) as typeof globalThis.fetch;
@@ -179,6 +226,21 @@ describe('installFetchWrapper', () => {
     );
 
     expect(await response.text()).toBe('hello');
+  });
+
+  it('removes its pending resolver when the original fetch throws synchronously', async () => {
+    const deps = buildDeps();
+    globalThis.fetch = vi.fn(() => {
+      throw new TypeError('invalid fetch input');
+    }) as typeof globalThis.fetch;
+
+    installFetchWrapper({ ...deps, captureResponseBodies: true });
+
+    await expect(fetch('http://stripe-mock/charge')).rejects.toThrow(
+      'invalid fetch input'
+    );
+
+    expect(pendingFetchResolvers).toHaveLength(0);
   });
 
   it('uninstalls cleanly and restores the original fetch', async () => {

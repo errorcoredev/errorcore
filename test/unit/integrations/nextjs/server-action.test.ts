@@ -112,6 +112,28 @@ describe('withServerAction', () => {
     expect(sdk.requestTracker.add).not.toHaveBeenCalled();
   });
 
+  it('captures action errors when parent ALS context already exists', async () => {
+    const { sdk, als } = createSdk();
+    const existing = als.createRequestContext({
+      method: 'GET',
+      url: '/parent',
+      headers: { host: 'service.local' },
+    });
+    const boom = new Error('nested action boom');
+
+    await als.runWithContext(existing, async () => {
+      await expect(
+        withServerAction(() => {
+          throw boom;
+        }, undefined, sdk)(),
+      ).rejects.toBe(boom);
+    });
+
+    expect(sdk.als.createRequestContext).not.toHaveBeenCalled();
+    expect(sdk.requestTracker.add).not.toHaveBeenCalled();
+    expect(sdk.captureError).toHaveBeenCalledWith(boom);
+  });
+
   it('still runs the action when SDK throws during context setup', async () => {
     const { sdk } = createSdk({ throwOnCreate: true });
     const result = await withServerAction(async () => 'recovered', undefined, sdk)();

@@ -61,7 +61,7 @@ export class FileTransport {
   public async flush(): Promise<void> {
     // fsync to ensure all prior appendFile writes are durable on disk.
     const fd = await new Promise<number>((resolve, reject) => {
-      fs.open(this.path, 'r', (error, value) => {
+      fs.open(this.path, 'r+', (error, value) => {
         if (error) {
           // File may not exist yet if nothing was written. That's fine.
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') {

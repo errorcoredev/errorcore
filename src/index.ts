@@ -176,10 +176,12 @@ export async function shutdown(): Promise<void> {
   }
 
   await instance.shutdown();
-  setGlobalInstance(null);
-  setCaptureWarningEmitted(false);
-  setInitializing(false);
-  resetMiddlewareWarning();
+  if (getGlobalInstance() === instance) {
+    setGlobalInstance(null);
+    setCaptureWarningEmitted(false);
+    setInitializing(false);
+    resetMiddlewareWarning();
+  }
 }
 
 /**

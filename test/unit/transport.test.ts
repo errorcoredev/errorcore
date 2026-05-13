@@ -209,6 +209,34 @@ describe('HttpTransport', () => {
     });
   });
 
+  it('marks payload blob envelopes with a transport kind header', async () => {
+    const requestSpy = createMockRequest({ statuses: [200] });
+    httpsModule.request = requestSpy as typeof httpsModule.request;
+
+    const transport = createHttp1Transport({
+      url: 'https://example.com/collect',
+      authorization: 'Bearer secret-key'
+    });
+
+    await transport.send({
+      kind: 'payload_blob',
+      serialized: '{"kind":"payload_blob"}',
+      envelope: {
+        v: 1,
+        eventId: 'evt-blob',
+        sdk: { name: 'errorcore', version: '0.2.0' },
+        keyId: 'key-transport'
+      }
+    });
+
+    expect(requestSpy.mock.calls[0]?.[0]).toMatchObject({
+      headers: {
+        'X-Errorcore-Payload-Kind': 'payload_blob',
+        'X-Errorcore-Event-Id': 'evt-blob'
+      }
+    });
+  });
+
   it('marks HTTP transport requests as SDK-internal during creation', async () => {
     const requestSpy = vi.fn((requestOptions: unknown, callback: (response: EventEmitter) => void) => {
       expect(isInternalCallActive()).toBe(true);
@@ -689,6 +717,81 @@ describe('HttpTransport', () => {
 
     expect(http2Module.connect).toHaveBeenCalled();
     expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries explicit HTTP/2 requests after GOAWAY by opening a fresh session', async () => {
+    const sessions: Array<EventEmitter & {
+      destroyed: boolean;
+      closed: boolean;
+      request: ReturnType<typeof vi.fn>;
+      destroy: ReturnType<typeof vi.fn>;
+    }> = [];
+    let requestCount = 0;
+
+    vi.spyOn(http2Module, 'connect').mockImplementation((() => {
+      const session = new EventEmitter() as EventEmitter & {
+        destroyed: boolean;
+        closed: boolean;
+        request: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      session.destroyed = false;
+      session.closed = false;
+      session.destroy = vi.fn(() => {
+        session.destroyed = true;
+        session.closed = true;
+        session.emit('close');
+      });
+      session.request = vi.fn(() => {
+        requestCount += 1;
+        const stream = new EventEmitter() as EventEmitter & {
+          setTimeout: ReturnType<typeof vi.fn>;
+          close: ReturnType<typeof vi.fn>;
+          end: ReturnType<typeof vi.fn>;
+        };
+        stream.setTimeout = vi.fn(() => stream);
+        stream.close = vi.fn();
+        stream.end = vi.fn(() => {
+          process.nextTick(() => {
+            if (requestCount === 1) {
+              const goaway = Object.assign(new Error('HTTP/2 GOAWAY'), {
+                code: 'ERR_HTTP2_GOAWAY_SESSION'
+              });
+              session.emit('goaway');
+              stream.emit('error', goaway);
+            } else {
+              stream.emit('response', {
+                [http2Module.constants.HTTP2_HEADER_STATUS]: 200
+              });
+              stream.emit('end');
+            }
+          });
+          return stream;
+        });
+        return stream;
+      });
+      sessions.push(session);
+      process.nextTick(() => session.emit('connect'));
+      return session;
+    }) as typeof http2Module.connect);
+
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler, ms?: number) => {
+      if (typeof ms === 'number' && ms !== 1234 && ms > 0 && typeof fn === 'function') fn();
+      return { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    }) as typeof setTimeout);
+
+    const transport = new HttpTransport({
+      url: 'https://example.com/collect',
+      protocol: 'http2',
+      timeoutMs: 1234
+    });
+
+    await transport.send('payload');
+    await transport.shutdown();
+
+    expect(http2Module.connect).toHaveBeenCalledTimes(2);
+    expect(sessions[0]!.destroy).toHaveBeenCalled();
+    expect(requestCount).toBe(2);
   });
 
   it('rejects explicit HTTP/2 for plain HTTP collectors', () => {
@@ -1204,13 +1307,51 @@ describe('TransportDispatcher', () => {
     expect(worker.postMessage).toHaveBeenCalledTimes(1);
     expect(stdoutWrite).toHaveBeenCalled();
   });
+
+  it('real worker file transport rotates with unique backups and flushes before resolving', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errorcore-worker-file-'));
+    const filePath = path.join(dir, 'transport.log');
+
+    try {
+      fs.writeFileSync(filePath, 'x'.repeat(32));
+
+      const dispatcher = new TransportDispatcher({
+        config: resolveTestConfig({
+          transport: {
+            type: 'file',
+            path: filePath,
+            maxSizeBytes: 8,
+            maxBackups: 1
+          }
+        }),
+        encryption: null
+      });
+
+      await dispatcher.send('first');
+      await dispatcher.flush();
+      fs.writeFileSync(filePath, 'y'.repeat(32));
+      await dispatcher.send('second');
+      await dispatcher.flush();
+      await dispatcher.shutdown();
+
+      const files = fs
+        .readdirSync(dir)
+        .filter((entry) => entry.startsWith('transport.log'));
+      const backups = files.filter((entry) => entry.endsWith('.bak'));
+
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(filePath, 'utf8')).toBe('second\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('DeadLetterStore', async () => {
   const fs = await import('node:fs');
   const path = await import('node:path');
   const os = await import('node:os');
-  const { DeadLetterStore } = await import('../../src/transport/dead-letter-store');
+  const { DeadLetterStore, createHmacVerifier } = await import('../../src/transport/dead-letter-store');
 
   function tmpPath(): string {
     return path.join(os.tmpdir(), `errorcore-dl-test-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`);
@@ -1325,6 +1466,75 @@ describe('DeadLetterStore', async () => {
     expect(reader.drain().entries).toEqual([]);
 
     writer.clear();
+  });
+
+  it('skips large drains by default but permits CLI-sized drains when allowLargeFile is true', () => {
+    const filePath = tmpPath();
+    const store = new DeadLetterStore(filePath, {
+      integrityKey: 'test-secret',
+      maxPayloadBytes: 12 * 1024 * 1024,
+      maxSizeBytes: 60 * 1024 * 1024
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const largePayload = 'x'.repeat(11 * 1024 * 1024);
+
+    store.appendPayloadSync(largePayload);
+
+    expect(store.drain().entries).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('skipping automatic drain at startup')
+    );
+    expect(store.drain({ allowLargeFile: true }).entries.map((entry) => entry.payload)).toEqual([
+      largePayload
+    ]);
+
+    store.clear();
+  });
+
+  it('verifies auth-only DLQ signatures with current and previous authorizations', () => {
+    const filePath = tmpPath();
+    const previousWriter = new DeadLetterStore(filePath, { integrityKey: 'Bearer old' });
+    const rotatedReader = new DeadLetterStore(filePath, {
+      verifier: createHmacVerifier([
+        'Bearer current',
+        'Bearer old'
+      ])
+    });
+
+    previousWriter.appendPayloadSync('{"auth":"old"}');
+
+    expect(rotatedReader.drain().entries.map((entry) => entry.payload)).toEqual([
+      '{"auth":"old"}'
+    ]);
+
+    rotatedReader.clear();
+  });
+
+  it('rotates dead-letter files when maxSizeBytes is exceeded and keeps maxBackups', () => {
+    const filePath = tmpPath();
+    const store = new DeadLetterStore(filePath, {
+      integrityKey: 'test-secret',
+      maxSizeBytes: 1,
+      maxBackups: 1
+    });
+
+    store.appendPayloadSync('{"p":1}');
+    store.appendPayloadSync('{"p":2}');
+    store.appendPayloadSync('{"p":3}');
+
+    const backups = fs
+      .readdirSync(path.dirname(filePath))
+      .filter((entry) => entry.startsWith(path.basename(filePath)) && entry.endsWith('.bak'));
+
+    expect(backups).toHaveLength(1);
+    expect(store.drain().entries.map((entry) => entry.payload)).toEqual([
+      '{"p":3}'
+    ]);
+
+    store.clear();
+    for (const backup of backups) {
+      fs.rmSync(path.join(path.dirname(filePath), backup), { force: true });
+    }
   });
 
   describe('getPendingCount', () => {

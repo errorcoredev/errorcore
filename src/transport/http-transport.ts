@@ -229,6 +229,9 @@ export class HttpTransport {
                 ...(payload.envelope?.eventId === undefined
                   ? {}
                   : { 'X-Errorcore-Event-Id': payload.envelope.eventId }),
+                ...(payload.kind === undefined
+                  ? {}
+                  : { 'X-Errorcore-Payload-Kind': payload.kind }),
                 ...(this.authorization === undefined
                   ? {}
                   : { Authorization: this.authorization })
@@ -298,6 +301,9 @@ export class HttpTransport {
               ...(payload.envelope?.eventId === undefined
                 ? {}
                 : { 'x-errorcore-event-id': payload.envelope.eventId }),
+              ...(payload.kind === undefined
+                ? {}
+                : { 'x-errorcore-payload-kind': payload.kind }),
               ...(this.authorization === undefined
                 ? {}
                 : { authorization: this.authorization })
@@ -413,6 +419,12 @@ export class HttpTransport {
             this.http2Session = null;
           }
         });
+        session.once('goaway', () => {
+          if (this.http2Session === session) {
+            this.http2Session = null;
+          }
+          session.destroy();
+        });
         resolve(session);
       });
 
@@ -456,7 +468,10 @@ export class HttpTransport {
         'EAI_AGAIN',
         'EHOSTUNREACH',
         'ENETUNREACH',
-        'EPIPE'
+        'EPIPE',
+        'ERR_HTTP2_GOAWAY_SESSION',
+        'ERR_HTTP2_STREAM_ERROR',
+        'ERR_HTTP2_INVALID_SESSION'
       ]);
       return RETRYABLE_NET_CODES.has(error.code);
     }

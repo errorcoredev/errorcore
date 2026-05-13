@@ -58,23 +58,11 @@ module.exports = {
   // Local-development only. This disables TLS certificate validation for HTTPS collectors.
   allowInvalidCollectorCertificates: false,
 
-  headerAllowlist: [
-    'content-type',
-    'content-length',
-    'accept',
-    'user-agent',
-    'x-request-id',
-    'x-correlation-id',
-    'host',
-    'traceparent',
-    'tracestate',
-    'retry-after'
-  ],
-
-  headerBlocklist: [
-    /authorization|cookie|set-cookie|x-api-key|x-auth-token/i,
-    /auth|token|key|secret|password|credential/i
-  ],
+  // By default, ErrorCore captures a curated set of operational headers
+  // and blocks auth/cookie/secret-bearing headers. Leave these unset unless
+  // you need a service-specific override.
+  // headerAllowlist: undefined,
+  // headerBlocklist: undefined,
 
   envAllowlist: [
     'NODE_ENV',
@@ -105,7 +93,7 @@ module.exports = {
   ],
 
   envBlocklist: [
-    /key|secret|token|password|credential|auth|private/i
+    /key|secret|token|password|passcode|passphrase|passwd|credential|auth|private/i
   ],
 
   piiScrubber: undefined,
@@ -133,6 +121,9 @@ module.exports = {
   uncaughtExceptionExitDelayMs: 1500,
   // useWorkerAssembly: true,  // default: true (non-serverless), false (serverless)
   deadLetterPath: undefined,
+  deadLetterMaxBytes: 50 * 1024 * 1024,
+  deadLetterMaxBackups: 5,
+  previousTransportAuthorizations: [],
 
   // Resolve minified stack traces using source maps at capture time.
   // Requires your bundler to emit .map files for server-side code.

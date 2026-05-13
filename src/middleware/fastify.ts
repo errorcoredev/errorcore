@@ -5,6 +5,7 @@ import {
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
+import { registerRequestCleanup } from '../context/request-tracker';
 
 export function fastifyPlugin(sdk?: SDKInstanceLike) {
   return (
@@ -35,25 +36,41 @@ export function fastifyPlugin(sdk?: SDKInstanceLike) {
         return;
       }
 
-      try {
-        const ctx = instance.als.createRequestContext({
-          method: request.raw.method,
-          url: request.raw.url,
-          headers: filterHeaders(instance, request.raw.headers),
-          traceparent: request.raw.headers['traceparent'] as string | undefined,
-          tracestate: request.raw.headers['tracestate'] as string | undefined
-        });
+      const ctx = (() => {
+        try {
+          return instance.als.createRequestContext({
+            method: request.raw.method,
+            url: request.raw.url,
+            headers: filterHeaders(instance, request.raw.headers),
+            traceparent: request.raw.headers['traceparent'] as string | undefined,
+            tracestate: request.raw.headers['tracestate'] as string | undefined
+          });
+        } catch {
+          return null;
+        }
+      })();
 
+      if (ctx === null) {
+        next();
+        return;
+      }
+
+      try {
         instance.requestTracker.add(ctx);
-        reply.raw.on('finish', () => {
-          instance.requestTracker.remove(ctx.requestId);
-        });
-        instance.als.runWithContext(ctx, () => {
-          next();
+        registerRequestCleanup({
+          requestTracker: instance.requestTracker,
+          requestId: ctx.requestId,
+          request: request.raw,
+          response: reply.raw
         });
       } catch {
         next();
+        return;
       }
+
+      instance.als.runWithContext(ctx, () => {
+        next();
+      });
     });
 
     done();

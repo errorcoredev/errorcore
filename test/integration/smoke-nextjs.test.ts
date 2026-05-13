@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import net from 'node:net';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -13,6 +14,49 @@ function smokeReady(): boolean {
 }
 
 const enabled = process.env.EC_SMOKE_NEXTJS === '1' && smokeReady();
+
+describe('tmp-nextjs-smoke harness guardrails', () => {
+  it('fails fast when SMOKE_PORT is already occupied', async () => {
+    const server = net.createServer((_socket) => {
+      // Keep the port occupied until the harness preflight has completed.
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+
+    try {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        throw new Error('expected TCP server address');
+      }
+
+      const started = Date.now();
+      const result = spawnSync(process.execPath, [RUN], {
+        cwd: REPO_ROOT,
+        encoding: 'utf8',
+        timeout: 15_000,
+        env: {
+          ...process.env,
+          SMOKE_PORT: String(address.port),
+        },
+      });
+      const durationMs = Date.now() - started;
+      const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+
+      expect(result.status).toBe(1);
+      expect(result.error).toBeUndefined();
+      expect(durationMs).toBeLessThan(5_000);
+      expect(output).toMatch(/SMOKE_PORT .*already in use|EADDRINUSE/);
+      expect(output).not.toContain('[smoke] building...');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  }, 20_000);
+});
 
 describe.skipIf(!enabled)(
   'tmp-nextjs-smoke harness (EC_SMOKE_NEXTJS=1, node_modules installed)',

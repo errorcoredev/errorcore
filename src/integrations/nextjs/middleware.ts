@@ -23,6 +23,8 @@ interface MiddlewareSDKLike extends SDKInstanceLike {
   config: { captureMiddlewareStatusCodes: number[] | 'none' | 'all' };
 }
 
+type MaybePromise<T> = T | Promise<T>;
+
 function shouldCapture(
   config: { captureMiddlewareStatusCodes: number[] | 'none' | 'all' },
   status: number,
@@ -33,8 +35,42 @@ function shouldCapture(
   return (setting as number[]).includes(status);
 }
 
+async function runMiddlewareWithCapture<TReq extends NextRequestLike, TResult>(
+  instance: MiddlewareSDKLike,
+  req: TReq,
+  middleware: (req: TReq) => MaybePromise<TResult>,
+): Promise<TResult> {
+  let result: TResult;
+  try {
+    result = await middleware(req);
+  } catch (middlewareError) {
+    if (instance.captureError !== undefined && middlewareError instanceof Error) {
+      try { instance.captureError(middlewareError); } catch {}
+    }
+    throw middlewareError;
+  }
+
+  // Optionally capture non-2xx responses.
+  if (
+    result != null &&
+    instance.captureError !== undefined &&
+    typeof (result as unknown as ResponseLike).status === 'number'
+  ) {
+    const status = (result as unknown as ResponseLike).status;
+    if (shouldCapture(instance.config, status)) {
+      try {
+        const err = new Error(`HTTP ${status}`);
+        err.name = 'MiddlewareRejection';
+        instance.captureError(err);
+      } catch {}
+    }
+  }
+
+  return result;
+}
+
 export function withNextMiddleware<TReq extends NextRequestLike, TResult>(
-  middleware: (req: TReq) => Promise<TResult>,
+  middleware: (req: TReq) => MaybePromise<TResult>,
   sdk?: MiddlewareSDKLike,
 ): (req: TReq) => Promise<TResult> {
   return async (req: TReq): Promise<TResult> => {
@@ -47,16 +83,20 @@ export function withNextMiddleware<TReq extends NextRequestLike, TResult>(
 
     // Reuse existing ALS context if we are nested inside another wrapper.
     if (instance.als.getContext?.() !== undefined) {
-      return middleware(req);
+      return runMiddlewareWithCapture(instance, req, middleware);
     }
 
     // Collect headers from the request.
     const rawHeaders: Record<string, string> = {};
     let traceparent: string | undefined;
+    let tracestate: string | undefined;
     req.headers.forEach((value, key) => {
       rawHeaders[key] = value;
-      if (key === 'traceparent') {
+      const normalizedKey = key.toLowerCase();
+      if (normalizedKey === 'traceparent') {
         traceparent = value;
+      } else if (normalizedKey === 'tracestate') {
+        tracestate = value;
       }
     });
 
@@ -67,6 +107,7 @@ export function withNextMiddleware<TReq extends NextRequestLike, TResult>(
         url: req.url,
         headers: filterHeaders(instance, rawHeaders),
         traceparent,
+        tracestate,
       });
     } catch {
       return middleware(req);
@@ -76,33 +117,7 @@ export function withNextMiddleware<TReq extends NextRequestLike, TResult>(
 
     try {
       return await instance.als.runWithContext(context, async () => {
-        let result: TResult;
-        try {
-          result = await middleware(req);
-        } catch (middlewareError) {
-          if (instance.captureError !== undefined && middlewareError instanceof Error) {
-            try { instance.captureError(middlewareError); } catch {}
-          }
-          throw middlewareError;
-        }
-
-        // Optionally capture non-2xx responses.
-        if (
-          result != null &&
-          instance.captureError !== undefined &&
-          typeof (result as unknown as ResponseLike).status === 'number'
-        ) {
-          const status = (result as unknown as ResponseLike).status;
-          if (shouldCapture(instance.config, status)) {
-            try {
-              const err = new Error(`HTTP ${status}`);
-              err.name = 'MiddlewareRejection';
-              instance.captureError(err);
-            } catch {}
-          }
-        }
-
-        return result;
+        return runMiddlewareWithCapture(instance, req, middleware);
       });
     } finally {
       instance.requestTracker.remove(context.requestId);

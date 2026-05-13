@@ -4,6 +4,31 @@ import * as crypto from 'node:crypto';
 
 import type { Encryption } from '../security/encryption';
 
+function formatBoundaryFrame(frame: unknown): string | undefined {
+  if (frame === null || typeof frame !== 'object') {
+    return undefined;
+  }
+
+  const value = frame as Record<string, unknown>;
+  const filePath = typeof value.filePath === 'string' ? value.filePath : undefined;
+  if (filePath === undefined || filePath === '') {
+    return undefined;
+  }
+
+  const lineNumber = typeof value.lineNumber === 'number' ? value.lineNumber : undefined;
+  const columnNumber = typeof value.columnNumber === 'number' ? value.columnNumber : undefined;
+  const functionName =
+    typeof value.functionName === 'string' && value.functionName !== ''
+      ? `${value.functionName} `
+      : '';
+  const location =
+    lineNumber === undefined
+      ? filePath
+      : `${filePath}:${lineNumber}${columnNumber === undefined ? '' : `:${columnNumber}`}`;
+
+  return `${functionName}${location}`;
+}
+
 export interface ErrorSummary {
   id: string;
   capturedAt: string;
@@ -12,6 +37,9 @@ export interface ErrorSummary {
   url: string | undefined;
   stack: string;
   rawStack?: string;
+  fingerprint?: string;
+  originPackage?: string;
+  appBoundary?: string;
 }
 
 export interface IndexEntry {
@@ -26,6 +54,8 @@ export class NdjsonReader {
   private readonly encryption: Encryption | null;
 
   private readonly index = new Map<string, IndexEntry>();
+
+  private readonly blobIndex = new Map<string, unknown>();
 
   private watcher: fs.FSWatcher | null = null;
 
@@ -99,6 +129,10 @@ export class NdjsonReader {
     }
   }
 
+  public getBlob(eventId: string, blobId: string): unknown | null {
+    return this.blobIndex.get(`${eventId}:${blobId}`) ?? null;
+  }
+
   public getStats(): {
     total: number;
     byType: Record<string, number>;
@@ -107,7 +141,7 @@ export class NdjsonReader {
   } {
     const byType: Record<string, number> = {};
     const byHour: Record<string, number> = {};
-    const byMessage: Record<string, number> = {};
+    const byMessage = new Map<string, { message: string; count: number }>();
 
     for (const entry of this.index.values()) {
       const { summary } = entry;
@@ -117,14 +151,22 @@ export class NdjsonReader {
       const hour = summary.capturedAt.slice(0, 13);
       byHour[hour] = (byHour[hour] ?? 0) + 1;
 
-      const msgKey = `${summary.errorType}: ${summary.errorMessage.slice(0, 100)}`;
-      byMessage[msgKey] = (byMessage[msgKey] ?? 0) + 1;
+      const message = `${summary.errorType}: ${summary.errorMessage.slice(0, 100)}`;
+      const msgKey =
+        summary.fingerprint ??
+        `${message}:${summary.appBoundary ?? summary.originPackage ?? ''}`;
+      const current = byMessage.get(msgKey);
+      if (current === undefined) {
+        byMessage.set(msgKey, { message, count: 1 });
+      } else {
+        current.count += 1;
+      }
     }
 
-    const topErrors = Object.entries(byMessage)
-      .sort(([, a], [, b]) => b - a)
+    const topErrors = [...byMessage.values()]
+      .sort((a, b) => b.count - a.count)
       .slice(0, 5)
-      .map(([message, count]) => ({ message, count }));
+      .map(({ message, count }) => ({ message, count }));
 
     return { total: this.index.size, byType, byHour, topErrors };
   }
@@ -164,6 +206,7 @@ export class NdjsonReader {
     }
 
     this.index.clear();
+    this.blobIndex.clear();
     this.fileSize = stat.size;
 
     const content = fs.readFileSync(this.filePath, 'utf8');
@@ -178,6 +221,15 @@ export class NdjsonReader {
 
           if (parsed !== null && typeof parsed === 'object') {
             const pkg = parsed as Record<string, unknown>;
+            if (pkg.kind === 'payload_blob') {
+              const eventId = typeof pkg.eventId === 'string' ? pkg.eventId : '';
+              const blobId = typeof pkg.blobId === 'string' ? pkg.blobId : '';
+              if (eventId !== '' && blobId !== '') {
+                this.blobIndex.set(`${eventId}:${blobId}`, pkg);
+              }
+              offset += lineBytes;
+              continue;
+            }
             const id = crypto
               .createHash('sha256')
               .update(line.trim())
@@ -186,6 +238,11 @@ export class NdjsonReader {
 
             const error = pkg.error as Record<string, unknown> | undefined;
             const request = pkg.request as Record<string, unknown> | undefined;
+            const errorOrigin = pkg.errorOrigin as Record<string, unknown> | undefined;
+            const originPackage =
+              typeof errorOrigin?.package === 'string'
+                ? errorOrigin.package
+                : undefined;
 
             this.index.set(id, {
               offset,
@@ -197,7 +254,10 @@ export class NdjsonReader {
                 errorMessage: (error?.message as string) ?? '',
                 url: request?.url as string | undefined,
                 stack: (error?.stack as string) ?? '',
-                rawStack: error?.rawStack as string | undefined
+                rawStack: error?.rawStack as string | undefined,
+                fingerprint: typeof pkg.fingerprint === 'string' ? pkg.fingerprint : undefined,
+                originPackage,
+                appBoundary: formatBoundaryFrame(errorOrigin?.appBoundaryFrame)
               }
             });
           }
@@ -225,6 +285,21 @@ export class NdjsonReader {
         // the rotation chain via keyId; throws on HMAC/authTag failure.
         const decrypted = this.encryption.decrypt(parsed as import('../types').EncryptedEnvelope);
         return JSON.parse(decrypted);
+      }
+
+      if (
+        this.encryption === null &&
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { v?: unknown }).v === 1 &&
+        (parsed as { iv?: unknown }).iv === 'unencrypted' &&
+        typeof (parsed as { ciphertext?: unknown }).ciphertext === 'string'
+      ) {
+        const plaintext = Buffer.from(
+          (parsed as { ciphertext: string }).ciphertext,
+          'base64'
+        ).toString('utf8');
+        return JSON.parse(plaintext);
       }
 
       return parsed;

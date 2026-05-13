@@ -1,9 +1,37 @@
+import type { IOEventSlot } from '../../src/types';
 import { describe, expect, it } from 'vitest';
 
 import { ALSManager } from '../../src/context/als-manager';
 import { EventClock } from '../../src/context/event-clock';
 import { parseTracestate, formatTracestate } from '../../src/context/tracestate';
+import { HeaderFilter } from '../../src/pii/header-filter';
+import { Scrubber } from '../../src/pii/scrubber';
+import { UndiciRecorder } from '../../src/recording/undici';
 import { createSDK } from '../../src/sdk';
+import { resolveTestConfig } from '../helpers/test-config';
+
+function makeUndiciBuffer() {
+  const slots: IOEventSlot[] = [];
+
+  return {
+    push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>) {
+      const slot = {
+        ...event,
+        seq: slots.length + 1,
+        hrtimeNs: process.hrtime.bigint(),
+        estimatedBytes: 0
+      } as IOEventSlot;
+      slots.push(slot);
+      return { slot, seq: slot.seq };
+    },
+    updatePayloadBytes(_oldBytes: number, _newBytes: number) {},
+    drain() {
+      return slots.splice(0);
+    }
+  };
+}
+
+const VALID_TRACEPARENT = `00-${'1'.repeat(32)}-${'2'.repeat(16)}-01`;
 
 describe('parseTracestate', () => {
   it('parses a well-formed header with our vendor entry first', () => {
@@ -169,6 +197,70 @@ describe('formatTracestate', () => {
 });
 
 describe('ALSManager — tracestate ingest and egress (module 21)', () => {
+  it('ignores tracestate when traceparent is missing', () => {
+    const eventClock = new EventClock();
+    const als = new ALSManager({
+      eventClock,
+      config: { traceContext: { vendorKey: 'ec' } }
+    });
+
+    const ctx = als.createRequestContext({
+      method: 'GET',
+      url: '/',
+      headers: {},
+      tracestate: 'ec=clk:100,foreign=x'
+    });
+
+    expect(eventClock.current()).toBe(0);
+    expect(ctx.inboundTracestate).toBeUndefined();
+    expect(ctx.inheritedTracestate).toBeUndefined();
+    expect(als.runWithContext(ctx, () => als.formatOutboundTracestate())).toBe('ec=clk:0');
+  });
+
+  it('ignores tracestate when traceparent is invalid', () => {
+    const eventClock = new EventClock();
+    const als = new ALSManager({
+      eventClock,
+      config: { traceContext: { vendorKey: 'ec' } }
+    });
+
+    const ctx = als.createRequestContext({
+      method: 'GET',
+      url: '/',
+      headers: {},
+      traceparent: 'not-a-valid-traceparent',
+      tracestate: 'ec=clk:100,foreign=x'
+    });
+
+    expect(eventClock.current()).toBe(0);
+    expect(ctx.inboundTracestate).toBeUndefined();
+    expect(ctx.inheritedTracestate).toBeUndefined();
+    expect(als.runWithContext(ctx, () => als.formatOutboundTracestate())).toBe('ec=clk:0');
+  });
+
+  it('rejects version 00 traceparent values with extra fields', () => {
+    const traceId = 'a'.repeat(32);
+    const parentSpanId = 'b'.repeat(16);
+    const als = new ALSManager({
+      eventClock: new EventClock(),
+      config: { traceContext: { vendorKey: 'ec' } }
+    });
+
+    const ctx = als.createRequestContext({
+      method: 'GET',
+      url: '/',
+      headers: {},
+      traceparent: `00-${traceId}-${parentSpanId}-01-extra`,
+      tracestate: 'foreign=x'
+    });
+
+    expect(ctx.traceId).not.toBe(traceId);
+    expect(ctx.parentSpanId).toBeNull();
+    expect(ctx.isEntrySpan).toBe(true);
+    expect(ctx.inboundTracestate).toBeUndefined();
+    expect(ctx.inheritedTracestate).toBeUndefined();
+  });
+
   it('merges peer clk: into the local EventClock on ingress', () => {
     const eventClock = new EventClock();
     const als = new ALSManager({
@@ -180,6 +272,7 @@ describe('ALSManager — tracestate ingest and egress (module 21)', () => {
       method: 'GET',
       url: '/',
       headers: {},
+      traceparent: VALID_TRACEPARENT,
       tracestate: 'ec=clk:100,foreign=x'
     });
     // After merge(100), value -> max(1, 100) + 1 = 101.
@@ -195,6 +288,7 @@ describe('ALSManager — tracestate ingest and egress (module 21)', () => {
       method: 'GET',
       url: '/',
       headers: {},
+      traceparent: VALID_TRACEPARENT,
       tracestate: 'ec=clk:5,vendor1=foo,vendor2=bar'
     });
     expect(ctx.inheritedTracestate).toEqual(['vendor1=foo', 'vendor2=bar']);
@@ -209,6 +303,7 @@ describe('ALSManager — tracestate ingest and egress (module 21)', () => {
       method: 'GET',
       url: '/',
       headers: {},
+      traceparent: VALID_TRACEPARENT,
       tracestate: 'ec=clk:5'
     });
     expect(ctx.inheritedTracestate).toBeUndefined();
@@ -232,6 +327,7 @@ describe('ALSManager — tracestate ingest and egress (module 21)', () => {
       method: 'GET',
       url: '/',
       headers: {},
+      traceparent: VALID_TRACEPARENT,
       tracestate: 'foreign1=a,foreign2=b'
     });
     eventClock.tick();
@@ -253,6 +349,7 @@ describe('ALSManager — tracestate ingest and egress (module 21)', () => {
     clockA.tick();
     clockA.tick(); // value=3
     const egress = alsA.runWithContext(ctxA, () => alsA.formatOutboundTracestate());
+    const egressTraceparent = alsA.runWithContext(ctxA, () => alsA.formatTraceparent());
     expect(egress).toBe('ec=clk:3');
 
     // Service B receives.
@@ -265,11 +362,80 @@ describe('ALSManager — tracestate ingest and egress (module 21)', () => {
       method: 'GET',
       url: '/b',
       headers: {},
+      traceparent: egressTraceparent ?? undefined,
       tracestate: egress ?? undefined
     });
     // After merge(3), B's clock is max(0, 3) + 1 = 4.
     expect(clockB.current()).toBe(4);
     // Any subsequent tick on B is strictly greater than A's egress value.
     expect(clockB.tick()).toBeGreaterThan(3);
+  });
+});
+
+describe('Undici trace propagation and URL storage', () => {
+  it('does not append duplicate trace headers when the caller supplied them', () => {
+    const config = resolveTestConfig();
+    const buffer = makeUndiciBuffer();
+    const als = new ALSManager({
+      eventClock: new EventClock(),
+      config: { traceContext: { vendorKey: 'ec' } }
+    });
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter: new HeaderFilter(config),
+      scrubber: new Scrubber(config)
+    });
+    const context = als.createRequestContext({
+      method: 'GET',
+      url: '/origin',
+      headers: {},
+      traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01`,
+      tracestate: 'vendor=upstream'
+    });
+    const addedHeaders: Array<{ name: string; value: string }> = [];
+    const request = {
+      method: 'GET',
+      origin: 'https://api.example.com',
+      path: '/items',
+      headers: {
+        TraceParent: `00-${'c'.repeat(32)}-${'d'.repeat(16)}-01`,
+        tracestate: 'caller=state'
+      },
+      addHeader(name: string, value: string) {
+        addedHeaders.push({ name, value });
+      }
+    };
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestCreate({ request });
+    });
+
+    expect(addedHeaders.find((h) => h.name.toLowerCase() === 'traceparent')).toBeUndefined();
+    expect(addedHeaders.find((h) => h.name.toLowerCase() === 'tracestate')).toBeUndefined();
+  });
+
+  it('scrubs undici URLs before storing them in the live buffer', () => {
+    const config = resolveTestConfig();
+    const buffer = makeUndiciBuffer();
+    const recorder = new UndiciRecorder({
+      buffer,
+      als: new ALSManager(),
+      headerFilter: new HeaderFilter(config),
+      scrubber: new Scrubber(config)
+    });
+    const request = {
+      method: 'GET',
+      url: 'https://api.example.com/reset?token=secret-token&email=alice%40example.com',
+      headers: {}
+    };
+
+    recorder.handleRequestCreate({ request });
+
+    const [slot] = buffer.drain();
+    expect(slot?.url).not.toContain('secret-token');
+    expect(slot?.url).not.toContain('alice%40example.com');
+    expect(slot?.target).not.toContain('secret-token');
+    expect(slot?.url).toContain('token=%5BREDACTED%5D');
   });
 });

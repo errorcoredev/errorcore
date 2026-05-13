@@ -237,18 +237,115 @@ const SENSITIVE_SQL_LABELS: ReadonlyArray<[RegExp, string]> = [
   [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*REVOKE\b/i, 'REVOKE'],
 ];
 
-export function redactSensitiveQueryText(query: string): string {
-  if (!SENSITIVE_SQL_QUICK_TEST.test(query)) {
+const SQL_QUOTED_LITERAL_REGEX = /(?:\b[ENX])?'(?:''|\\.|[^'\\])*'/gi;
+const SQL_NUMERIC_LITERAL_REGEX =
+  /(^|[^\w$])(-?(?:(?:\d+\.\d+|\d+\.|\.\d+|\d+)(?:[eE][+-]?\d+)?))(?![\w])/g;
+
+const KEY_VALUE_ASSIGNMENT_REGEX =
+  /(^|[\r\n;&,])(\s*(?:export\s+)?)([A-Za-z][A-Za-z0-9_.-]{0,127})(\s*[:=]\s*)([^\r\n;&,]*)/gi;
+
+const CACHE_KEY_SEGMENT_SEPARATOR_REGEX = /([:/|])/g;
+
+function redactSqlLiterals(query: string): string {
+  try {
+    return query
+      .replace(SQL_QUOTED_LITERAL_REGEX, REDACTED)
+      .replace(SQL_NUMERIC_LITERAL_REGEX, (_match, prefix: string) => `${prefix}${REDACTED}`);
+  } catch {
     return query;
   }
+}
 
-  for (const [pattern, label] of SENSITIVE_SQL_LABELS) {
-    if (pattern.test(query)) {
-      return `[REDACTED: ${label} statement]`;
+export function redactSensitiveQueryText(query: string): string {
+  try {
+    if (SENSITIVE_SQL_QUICK_TEST.test(query)) {
+      for (const [pattern, label] of SENSITIVE_SQL_LABELS) {
+        if (pattern.test(query)) {
+          return `[REDACTED: ${label} statement]`;
+        }
+      }
     }
+
+    return redactSqlLiterals(query);
+  } catch {
+    return query;
+  }
+}
+
+function scrubStringPatterns(value: string): string {
+  // Reset lastIndex before .test() on the global COMBINED_QUICK_TEST_REGEX.
+  // This function is synchronous end-to-end; do not introduce await between here and the .test() below.
+  COMBINED_QUICK_TEST_REGEX.lastIndex = 0;
+  if (!COMBINED_QUICK_TEST_REGEX.test(value)) {
+    return looksLikeHighEntropySecret(value) ? REDACTED : value;
   }
 
-  return query;
+  let scrubbed = value;
+
+  scrubbed = replacePattern(scrubbed, EMAIL_REGEX);
+  scrubbed = replaceCreditCards(scrubbed);
+  scrubbed = replacePattern(scrubbed, SSN_REGEX);
+  scrubbed = replacePattern(scrubbed, JWT_REGEX);
+  scrubbed = replacePattern(scrubbed, BEARER_REGEX);
+  scrubbed = replacePattern(scrubbed, BASIC_AUTH_REGEX);
+  scrubbed = replacePattern(scrubbed, AWS_ACCESS_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, GITHUB_TOKEN_REGEX);
+  scrubbed = replacePattern(scrubbed, STRIPE_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, GENERIC_SK_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, PHONE_REGEX);
+  // IPv4 redaction: only scrub public/routable IPs. Loopback, private,
+  // link-local, and multicast addresses are infrastructure metadata,
+  // not PII; redacting them produces noise like host: "[REDACTED]:3000"
+  // (was 127.0.0.1:3000) that buries real signal.
+  scrubbed = scrubbed.replace(IPV4_REGEX, (match) =>
+    isPrivateOrInfrastructureIp(match) ? match : REDACTED
+  );
+
+  if (looksLikeHighEntropySecret(scrubbed)) {
+    return REDACTED;
+  }
+
+  return scrubbed;
+}
+
+export function scrubKeyValueAssignments(text: string): string {
+  try {
+    return text.replace(
+      KEY_VALUE_ASSIGNMENT_REGEX,
+      (
+        match: string,
+        prefix: string,
+        leader: string,
+        key: string,
+        separator: string
+      ) => {
+        if (!matchesSensitiveKey(key)) {
+          return match;
+        }
+
+        return `${prefix}${leader}${key}${separator}${REDACTED}`;
+      }
+    );
+  } catch {
+    return text;
+  }
+}
+
+export function scrubCacheKey(key: string): string {
+  try {
+    return key
+      .split(CACHE_KEY_SEGMENT_SEPARATOR_REGEX)
+      .map((segment) => {
+        if (segment === ':' || segment === '/' || segment === '|') {
+          return segment;
+        }
+
+        return scrubStringPatterns(scrubKeyValueAssignments(segment));
+      })
+      .join('');
+  } catch {
+    return key;
+  }
 }
 
 export class Scrubber {
@@ -418,7 +515,8 @@ export class Scrubber {
         }
       }
 
-      const scrubbed = this.scrubString(decoded);
+      const assignmentScrubbed = scrubKeyValueAssignments(decoded);
+      const scrubbed = this.scrubString(assignmentScrubbed);
 
       if (scrubbed === decoded) {
         return buffer;
@@ -722,39 +820,7 @@ export class Scrubber {
   }
 
   private scrubString(value: string): string {
-    // Reset lastIndex before .test() on the global COMBINED_QUICK_TEST_REGEX.
-    // This function is synchronous end-to-end — do not introduce await between here and the .test() below.
-    COMBINED_QUICK_TEST_REGEX.lastIndex = 0;
-    if (!COMBINED_QUICK_TEST_REGEX.test(value)) {
-      return looksLikeHighEntropySecret(value) ? REDACTED : value;
-    }
-
-    let scrubbed = value;
-
-    scrubbed = replacePattern(scrubbed, EMAIL_REGEX);
-    scrubbed = replaceCreditCards(scrubbed);
-    scrubbed = replacePattern(scrubbed, SSN_REGEX);
-    scrubbed = replacePattern(scrubbed, JWT_REGEX);
-    scrubbed = replacePattern(scrubbed, BEARER_REGEX);
-    scrubbed = replacePattern(scrubbed, BASIC_AUTH_REGEX);
-    scrubbed = replacePattern(scrubbed, AWS_ACCESS_KEY_REGEX);
-    scrubbed = replacePattern(scrubbed, GITHUB_TOKEN_REGEX);
-    scrubbed = replacePattern(scrubbed, STRIPE_KEY_REGEX);
-    scrubbed = replacePattern(scrubbed, GENERIC_SK_KEY_REGEX);
-    scrubbed = replacePattern(scrubbed, PHONE_REGEX);
-    // IPv4 redaction: only scrub public/routable IPs. Loopback, private,
-    // link-local, and multicast addresses are infrastructure metadata,
-    // not PII; redacting them produces noise like host: "[REDACTED]:3000"
-    // (was 127.0.0.1:3000) that buries real signal.
-    scrubbed = scrubbed.replace(IPV4_REGEX, (match) =>
-      isPrivateOrInfrastructureIp(match) ? match : REDACTED
-    );
-
-    if (looksLikeHighEntropySecret(scrubbed)) {
-      return REDACTED;
-    }
-
-    return scrubbed;
+    return scrubStringPatterns(value);
   }
 
   private scrubRelativeUrl(rawUrl: string): string {

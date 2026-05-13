@@ -32,18 +32,21 @@ export class StateTracker {
 
   private readonly stateTrackingConfig: ResolvedConfig['stateTracking'];
 
+  private readonly serializationConfig: ResolvedConfig['serialization'];
+
   private trackingEnabled = false;
 
   public constructor(deps: {
     als: ALSManagerLike;
     eventClock?: EventClock;
-    config?: Pick<ResolvedConfig, 'stateTracking'>;
+    config?: Pick<ResolvedConfig, 'stateTracking' | 'serialization'>;
   }) {
     this.als = deps.als;
     // EventClock is optional for test ergonomics; the SDK composition root
     // always passes one shared instance (module 19 contract).
     this.eventClock = deps.eventClock ?? new EventClock();
     this.stateTrackingConfig = deps.config?.stateTracking ?? DEFAULT_STATE_TRACKING_CONFIG;
+    this.serializationConfig = deps.config?.serialization ?? TIGHT_LIMITS;
   }
 
   public track<T extends Map<unknown, unknown> | Record<string, unknown>>(
@@ -287,8 +290,8 @@ export class StateTracker {
       seq: this.eventClock.tick(),
       container,
       operation,
-      key: cloneAndLimit(key, TIGHT_LIMITS),
-      value: cloneAndLimit(value, TIGHT_LIMITS),
+      key: cloneAndLimit(key, this.serializationConfig),
+      value: cloneAndLimit(value, this.serializationConfig),
       timestamp: process.hrtime.bigint()
     };
 
@@ -336,8 +339,8 @@ export class StateTracker {
       hrtimeNs: process.hrtime.bigint(),
       container,
       operation,
-      key: cloneAndLimit(key, TIGHT_LIMITS),
-      value: operation === 'delete' ? undefined : cloneAndLimit(value, TIGHT_LIMITS)
+      key: cloneAndLimit(key, this.serializationConfig),
+      value: operation === 'delete' ? undefined : cloneAndLimit(value, this.serializationConfig)
     };
 
     context.stateWrites.push(stateWrite);

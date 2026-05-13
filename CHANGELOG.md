@@ -509,7 +509,7 @@ unsafe implicit behaviors removed, and three previously-dark features restored
 - README mirrors the three-tier block and documents the 3–6-line verbose
   startup output and Next.js middleware usage.
 
-### Deferred (tracked in followups.md)
+### Deferred
 
 - Byte-size budget for source-map cache (secondary eviction criterion beyond
   count-of-128).

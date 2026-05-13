@@ -14,12 +14,14 @@ interface NextLikeRequest {
   };
 }
 
+type MaybePromise<T> = T | Promise<T>;
+
 export function withErrorcore<
   TReq extends NextLikeRequest,
   TCtx,
   TResult
 >(
-  handler: (req: TReq, ctx: TCtx) => Promise<TResult>,
+  handler: (req: TReq, ctx: TCtx) => MaybePromise<TResult>,
   sdk?: SDKInstanceLike
 ): (req: TReq, ctx: TCtx) => Promise<TResult> {
   return async (req, routeContext) => {

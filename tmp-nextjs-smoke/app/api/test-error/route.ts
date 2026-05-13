@@ -11,17 +11,18 @@ function lookupPromo(code: string): number {
   return code === 'WELCOME10' ? 0.1 : 0;
 }
 
-function computeUserDiscount(user: User, cart: Cart): number {
+function computeUserDiscount(user: User, cart: Cart, runId: string): number {
   const base = cart.items.reduce((s, it) => s + it.price * it.qty, 0);
   const tierMultiplier = user.tier === 'gold' ? 0.8 : 1.0;
   const promoDiscount = cart.promoCode ? lookupPromo(cart.promoCode) : 0;
-  throw new Error(`discount computation boom — base=${base} mult=${tierMultiplier} promo=${promoDiscount}`);
+  throw new Error(`discount computation boom — runId=${runId} base=${base} mult=${tierMultiplier} promo=${promoDiscount}`);
 }
 
-async function handler(_req: NextRequest) {
+async function handler(req: NextRequest) {
+  const runId = req.nextUrl.searchParams.get('runId') ?? 'missing-run-id';
   const user: User = { id: 'u1', tier: 'gold' };
   const cart: Cart = { items: [{ price: 100, qty: 2 }, { price: 50, qty: 1 }], promoCode: 'WELCOME10' };
-  computeUserDiscount(user, cart);
+  computeUserDiscount(user, cart, runId);
   return NextResponse.json({ ok: true });
 }
 

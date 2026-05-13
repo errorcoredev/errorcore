@@ -1,18 +1,10 @@
-import { beforeAll, describe, expect, it } from 'vitest';
-import { spawn, execSync } from 'node:child_process';
+import { describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const REPO_ROOT = path.join(__dirname, '..', '..');
 const FIXTURE = path.join(__dirname, 'fixtures', 'concurrent-rewriter.js');
-
-beforeAll(() => {
-  const compiledLock = path.join(REPO_ROOT, 'dist', 'transport', 'file-lock.js');
-  if (!fs.existsSync(compiledLock)) {
-    execSync('npm run build', { cwd: REPO_ROOT, stdio: 'inherit' });
-  }
-}, 120_000);
 
 describe('dead-letter cross-process lock', () => {
   it('two concurrent rewriters produce a consistent file', async () => {

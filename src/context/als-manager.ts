@@ -34,6 +34,7 @@ function parseTraceparent(header: string | undefined): {
   // forbidden by §3.2.2.1. Anything else is treated as a possibly-future
   // version we attempt to parse using the version-00 layout.
   if (!version || !/^[0-9a-f]{2}$/.test(version) || version === 'ff') return null;
+  if (version === '00' && parts.length !== 4) return null;
 
   // trace-id: 32 lowercase hex chars, not all-zero.
   if (!traceId || traceId.length !== 32 || !/^[0-9a-f]{32}$/.test(traceId)) return null;
@@ -112,7 +113,8 @@ export class ALSManager {
     // W3C tracestate ingest (module 21): merge any peer clock value before
     // any seq is consumed in this request, so subsequent stamps within this
     // request are guaranteed to exceed the peer's clk:<n>.
-    const parsedTs = parseTracestate(req.tracestate, this.vendorKey);
+    const acceptedTracestate = parsed !== null ? req.tracestate : undefined;
+    const parsedTs = parseTracestate(acceptedTracestate, this.vendorKey);
     if (parsedTs.receivedSeq !== null) {
       this.eventClock.merge(parsedTs.receivedSeq);
     }
@@ -133,7 +135,7 @@ export class ALSManager {
       // Stored verbatim for echo into ErrorPackage.trace.tracestate. Stays
       // separate from `inheritedTracestate`, which has our own-vendor entry
       // stripped for clean re-emission.
-      inboundTracestate: req.tracestate,
+      inboundTracestate: acceptedTracestate,
       inheritedTracestate,
       traceId,
       spanId,

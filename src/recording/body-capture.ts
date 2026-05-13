@@ -2,8 +2,12 @@
 import { createHash } from 'node:crypto';
 import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http';
 
-import { getBodyEncoding, isTextualContentType } from '../pii/scrubber';
-import type { IOEventSlot, RequestContext } from '../types';
+import {
+  getBodyEncoding,
+  isTextualContentType,
+  scrubKeyValueAssignments
+} from '../pii/scrubber';
+import type { IOEventSlot, PayloadBlobRef, RequestContext } from '../types';
 
 const METADATA_OVERHEAD = 256;
 const MAX_STATE_POOL_SIZE = 200;
@@ -24,7 +28,21 @@ interface BodyCaptureConfig {
       headers: Record<string, string> | null | undefined
     ): Buffer;
   };
+  payloadSpool?: {
+    getMaxCaptureBytes(): number;
+    store(input: {
+      requestId: string | null;
+      lineageId: string | null;
+      mimeType: string | null;
+      bytes: Buffer;
+      originalSize: number;
+      sha256: string;
+      complete?: boolean;
+    }): { ref: PayloadBlobRef; preview: Buffer };
+  };
 }
+
+type BodyPayloadSpool = NonNullable<BodyCaptureConfig['payloadSpool']>;
 
 interface AccumulatorState {
   chunks: Buffer[];
@@ -101,6 +119,42 @@ function toBufferView(chunk: unknown, encoding?: BufferEncoding): Buffer | null 
   return Buffer.from(String(chunk));
 }
 
+function isPlainTextContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) {
+    return false;
+  }
+
+  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'text/plain';
+}
+
+function scrubPlainTextKeyValues(buffer: Buffer, contentType: string | undefined): Buffer {
+  if (!isPlainTextContentType(contentType)) {
+    return buffer;
+  }
+
+  const encoding = getBodyEncoding(contentType);
+  const decoded = buffer.toString(encoding);
+  const scrubbed = scrubKeyValueAssignments(decoded);
+
+  if (scrubbed === decoded) {
+    return buffer;
+  }
+
+  return Buffer.from(scrubbed, encoding);
+}
+
+function cancelReadableStream(stream: ReadableStream<Uint8Array> | null): void {
+  if (stream === null) {
+    return;
+  }
+
+  try {
+    void stream.cancel().catch(() => undefined);
+  } catch {
+    // Best effort: capture cleanup must not interfere with application fetch.
+  }
+}
+
 export class BodyCapture {
   private readonly maxPayloadSize: number;
 
@@ -116,6 +170,8 @@ export class BodyCapture {
 
   private readonly scrubber?: BodyCaptureConfig['scrubber'];
 
+  private readonly payloadSpool?: BodyCaptureConfig['payloadSpool'];
+
   public constructor(config: BodyCaptureConfig) {
     this.maxPayloadSize = config.maxPayloadSize;
     this.captureRequestBodies = config.captureRequestBodies;
@@ -125,6 +181,7 @@ export class BodyCapture {
       value.trim().toLowerCase()
     );
     this.scrubber = config.scrubber;
+    this.payloadSpool = config.payloadSpool;
   }
 
   private static handleInboundRequestOn(
@@ -666,6 +723,82 @@ export class BodyCapture {
   }
 
   /**
+   * Capture a cloned fetch response stream without materializing the entire
+   * response in memory. The clone branch is read only until the payload cap is
+   * exceeded unless digest capture requires continuing through the full stream.
+   */
+  public async captureUndiciResponseStream(
+    slot: IOEventSlot,
+    stream: ReadableStream<Uint8Array> | null,
+    headers: Record<string, string> | null,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): Promise<void> {
+    if (!this.isResponseCaptureEnabled()) {
+      cancelReadableStream(stream);
+      return;
+    }
+    if (!this.shouldCaptureHeaders(headers)) {
+      cancelReadableStream(stream);
+      return;
+    }
+
+    const state = this.createState(headers);
+    this.setState(slot, 'response', state);
+
+    if (stream !== null) {
+      const reader = stream.getReader();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          this.captureChunk(
+            state,
+            slot,
+            'responseBody',
+            'responseBodyTruncated',
+            'responseBodyOriginalSize',
+            value
+          );
+
+          if (state.truncated && !this.shouldTrackAfterTruncation(state)) {
+            try {
+              void reader.cancel().catch(() => undefined);
+            } catch {
+              // Best effort: do not let capture cancellation affect fetch().
+            }
+            break;
+          }
+        }
+      } catch (err) {
+        slot.responseBodyTruncated = true;
+        delete this.getState(slot).response;
+        this.releaseState(state);
+        throw err;
+      } finally {
+        reader.releaseLock();
+      }
+    }
+
+    this.finalizeCapture({
+      slot,
+      seq: slot.seq,
+      bodyKey: 'responseBody',
+      digestKey: 'responseBodyDigest',
+      truncatedKey: 'responseBodyTruncated',
+      originalSizeKey: 'responseBodyOriginalSize',
+      state,
+      headers,
+      onBytesChanged
+    });
+
+    this.materializeBody(slot, 'responseBody', 'responseBodyDigest', headers);
+  }
+
+  /**
    * Capture an already-buffered outbound response body. Used by the fetch
    * wrapper, which obtains the full body via `response.clone().arrayBuffer()`
    * and hands it to BodyCapture in one shot — no incremental stream.
@@ -810,7 +943,7 @@ export class BodyCapture {
       state.truncated = false;
       state.finalized = false;
       state.contentTypeChecked = false;
-      state.digest = this.captureDigest ? createHash('sha256') : null;
+      state.digest = this.shouldHashBodies() ? createHash('sha256') : null;
       state.digestHex = null;
       state.headers = headers;
       return state;
@@ -823,7 +956,7 @@ export class BodyCapture {
       truncated: false,
       finalized: false,
       contentTypeChecked: false,
-      digest: this.captureDigest ? createHash('sha256') : null,
+      digest: this.shouldHashBodies() ? createHash('sha256') : null,
       digestHex: null,
       headers
     };
@@ -896,7 +1029,7 @@ export class BodyCapture {
     }
 
     state.totalBytesSeen += buffer.length;
-    const remaining = this.maxPayloadSize - state.capturedBytes;
+    const remaining = this.getCaptureByteLimit() - state.capturedBytes;
 
     if (remaining <= 0) {
       state.truncated = true;
@@ -954,7 +1087,7 @@ export class BodyCapture {
   }
 
   private shouldTrackAfterTruncation(state: AccumulatorState): boolean {
-    return state.digest !== null;
+    return state.digest !== null || this.getPayloadSpool() !== undefined;
   }
 
   private releaseState(state: AccumulatorState): void {
@@ -1010,7 +1143,7 @@ export class BodyCapture {
 
     slot[bodyKey] = null;
     slot[digestKey] = state.digestHex;
-    slot.estimatedBytes = oldBytes + state.capturedBytes;
+    slot.estimatedBytes = oldBytes + Math.min(state.capturedBytes, this.maxPayloadSize);
 
     onBytesChanged(oldBytes, slot.estimatedBytes);
 
@@ -1032,6 +1165,30 @@ export class BodyCapture {
     state: AccumulatorState
   ): void {
     this.getState(slot)[bodyType] = state;
+  }
+
+  private shouldHashBodies(): boolean {
+    return this.captureDigest || this.getPayloadSpool() !== undefined;
+  }
+
+  private getCaptureByteLimit(): number {
+    const payloadSpool = this.getPayloadSpool();
+    return payloadSpool !== undefined
+      ? payloadSpool.getMaxCaptureBytes()
+      : this.maxPayloadSize;
+  }
+
+  private shouldSpoolPayload(state: AccumulatorState): boolean {
+    return this.getPayloadSpool() !== undefined && state.totalBytesSeen > this.maxPayloadSize;
+  }
+
+  private getPayloadSpool(): BodyPayloadSpool | undefined {
+    return (
+      typeof this.payloadSpool?.getMaxCaptureBytes === 'function' &&
+      typeof this.payloadSpool.store === 'function'
+    )
+      ? this.payloadSpool
+      : undefined;
   }
 
   private materializeBody(
@@ -1067,13 +1224,53 @@ export class BodyCapture {
     }
 
     const body = Buffer.concat(state.chunks, state.capturedBytes);
-    const scrubbed = this.scrubber?.scrubBodyBuffer(body, headers ?? state.headers) ?? body;
+    const bodyHeaders = headers ?? state.headers;
+    const contentType = bodyHeaders?.['content-type'];
+    const scrubberScrubbed = this.scrubber?.scrubBodyBuffer(body, bodyHeaders) ?? body;
+    const scrubbed = scrubPlainTextKeyValues(scrubberScrubbed, contentType);
+    const refKey = bodyKey === 'requestBody' ? 'requestPayloadRef' : 'responsePayloadRef';
+
+    if (this.shouldSpoolPayload(state)) {
+      const payloadSpool = this.getPayloadSpool();
+      if (payloadSpool === undefined) {
+        return;
+      }
+      const digest = state.digestHex ?? createHash('sha256').update(scrubbed).digest('hex');
+      const result = payloadSpool.store({
+        requestId: slot.requestId,
+        lineageId: slot.requestId,
+        mimeType: contentType ?? null,
+        bytes: scrubbed,
+        originalSize: state.totalBytesSeen,
+        sha256: digest,
+        complete: state.capturedBytes >= state.totalBytesSeen
+      });
+      slot[refKey] = result.ref;
+      const preview = result.preview;
+
+      if (isTextualContentType(contentType)) {
+        slot[bodyKey] = preview.toString(getBodyEncoding(contentType));
+      } else {
+        slot[bodyKey] = preview;
+      }
+      slot[digestKey] = digest;
+      if (bodyKey === 'requestBody') {
+        slot.requestBodyTruncated = result.ref.previewTruncated;
+        slot.requestBodyOriginalSize = state.totalBytesSeen;
+      } else {
+        slot.responseBodyTruncated = result.ref.previewTruncated;
+        slot.responseBodyOriginalSize = state.totalBytesSeen;
+      }
+      slot.estimatedBytes = estimateBytes(slot);
+      delete this.getState(slot)[bodyKey === 'requestBody' ? 'request' : 'response'];
+      this.releaseState(state);
+      return;
+    }
 
     // For textual content-types, decode UTF-8 (or charset-declared encoding)
     // so the body lands in the package as a readable string, not as a typed-
     // array byte sample that the JSON serializer would clamp to maxArrayItems.
     // Binary content stays as a Buffer.
-    const contentType = (headers ?? state.headers)?.['content-type'];
     if (isTextualContentType(contentType)) {
       slot[bodyKey] = scrubbed.toString(getBodyEncoding(contentType));
     } else {

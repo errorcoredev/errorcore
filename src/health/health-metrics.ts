@@ -19,6 +19,12 @@ export interface LastFailureSample {
   at: number | null;
 }
 
+export interface PayloadSpoolBreakdown {
+  pressureWarnings: number;
+  previewFallbacks: number;
+  drops: number;
+}
+
 const LATENCY_CAPACITY = 512;
 const FAILURE_REASON_MAX_LENGTH = 200;
 
@@ -32,6 +38,12 @@ export class HealthMetrics {
   private droppedDlqWriteFailed = 0;
 
   private transportFailures = 0;
+
+  private payloadSpoolPressureWarnings = 0;
+
+  private payloadSpoolPreviewFallbacks = 0;
+
+  private payloadSpoolDrops = 0;
 
   private readonly latencySamples: number[] = [];
 
@@ -63,6 +75,18 @@ export class HealthMetrics {
     this.lastFailureAt = atUnixMs;
   }
 
+  public recordPayloadSpoolPressure(): void {
+    this.payloadSpoolPressureWarnings += 1;
+  }
+
+  public recordPayloadSpoolPreviewFallback(): void {
+    this.payloadSpoolPreviewFallbacks += 1;
+  }
+
+  public recordPayloadSpoolDrop(): void {
+    this.payloadSpoolDrops += 1;
+  }
+
   public recordFlushLatency(ms: number): void {
     if (this.latencySamples.length < LATENCY_CAPACITY) {
       this.latencySamples.push(ms);
@@ -88,6 +112,14 @@ export class HealthMetrics {
 
   public getTransportFailures(): number {
     return this.transportFailures;
+  }
+
+  public getPayloadSpoolBreakdown(): PayloadSpoolBreakdown {
+    return {
+      pressureWarnings: this.payloadSpoolPressureWarnings,
+      previewFallbacks: this.payloadSpoolPreviewFallbacks,
+      drops: this.payloadSpoolDrops
+    };
   }
 
   public getLatencyPercentile(p: number): number {

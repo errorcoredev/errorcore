@@ -17,8 +17,25 @@ import {
 } from '../../middleware/common';
 import type { WithServerActionOptions } from './types';
 
+type MaybePromise<T> = T | Promise<T>;
+
+async function runActionWithCapture<TArgs extends unknown[], TResult>(
+  instance: SDKInstanceLike,
+  action: (...args: TArgs) => MaybePromise<TResult>,
+  args: TArgs,
+): Promise<TResult> {
+  try {
+    return await action(...args);
+  } catch (error) {
+    if (instance.captureError !== undefined && error instanceof Error) {
+      try { instance.captureError(error); } catch {}
+    }
+    throw error;
+  }
+}
+
 export function withServerAction<TArgs extends unknown[], TResult>(
-  action: (...args: TArgs) => Promise<TResult>,
+  action: (...args: TArgs) => MaybePromise<TResult>,
   options?: WithServerActionOptions,
   sdk?: SDKInstanceLike,
 ): (...args: TArgs) => Promise<TResult> {
@@ -31,7 +48,7 @@ export function withServerAction<TArgs extends unknown[], TResult>(
     }
 
     if (instance.als.getContext?.() !== undefined) {
-      return action(...args);
+      return runActionWithCapture(instance, action, args);
     }
 
     let context: import('../../types').RequestContext;
@@ -48,12 +65,9 @@ export function withServerAction<TArgs extends unknown[], TResult>(
 
     instance.requestTracker.add(context);
     try {
-      return await instance.als.runWithContext(context, async () => action(...args));
-    } catch (error) {
-      if (instance.captureError !== undefined && error instanceof Error) {
-        try { instance.captureError(error); } catch {}
-      }
-      throw error;
+      return await instance.als.runWithContext(context, async () =>
+        runActionWithCapture(instance, action, args)
+      );
     } finally {
       instance.requestTracker.remove(context.requestId);
     }

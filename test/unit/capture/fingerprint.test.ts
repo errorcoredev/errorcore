@@ -45,4 +45,67 @@ describe('computeFingerprint', () => {
     const fp = computeFingerprint(new Error('boom'), [makeFrame()]);
     expect(fp).toMatch(/^[0-9a-f]{16}$/);
   });
+
+  it('uses parsed application stack frames when captured locals are unavailable', () => {
+    const first = new Error('same message');
+    first.stack = [
+      'Error: same message',
+      '    at fromLibrary (/app/node_modules/pkg/index.js:1:1)',
+      '    at firstHandler (/app/src/first.ts:12:3)'
+    ].join('\n');
+
+    const second = new Error('same message');
+    second.stack = [
+      'Error: same message',
+      '    at fromLibrary (/app/node_modules/pkg/index.js:1:1)',
+      '    at secondHandler (/app/src/second.ts:98:7)'
+    ].join('\n');
+
+    expect(computeFingerprint(first, [])).not.toBe(computeFingerprint(second, []));
+  });
+
+  it('prefers captured locals over parsed stack frames when locals are present', () => {
+    const first = new Error('same message');
+    first.stack = 'Error: same message\n    at firstHandler (/app/src/first.ts:12:3)';
+    const second = new Error('same message');
+    second.stack = 'Error: same message\n    at secondHandler (/app/src/second.ts:98:7)';
+
+    const localsFrame = makeFrame({ filePath: '/app/src/shared.ts', lineNumber: 44 });
+
+    expect(computeFingerprint(first, [localsFrame])).toBe(
+      computeFingerprint(second, [localsFrame])
+    );
+  });
+
+  it('groups library-only errors by package instead of internal line number', () => {
+    const first = new Error('same message');
+    first.stack = [
+      'Error: same message',
+      '    at parse (/app/node_modules/zod/index.js:12:3)'
+    ].join('\n');
+
+    const second = new Error('same message');
+    second.stack = [
+      'Error: same message',
+      '    at run (/app/node_modules/zod/helpers.js:98:7)'
+    ].join('\n');
+
+    expect(computeFingerprint(first, [])).toBe(computeFingerprint(second, []));
+  });
+
+  it('keeps library-only errors from different packages in different groups', () => {
+    const first = new Error('same message');
+    first.stack = [
+      'Error: same message',
+      '    at parse (/app/node_modules/zod/index.js:12:3)'
+    ].join('\n');
+
+    const second = new Error('same message');
+    second.stack = [
+      'Error: same message',
+      '    at request (/app/node_modules/@prisma/client/runtime.js:98:7)'
+    ].join('\n');
+
+    expect(computeFingerprint(first, [])).not.toBe(computeFingerprint(second, []));
+  });
 });

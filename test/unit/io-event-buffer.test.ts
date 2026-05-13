@@ -183,6 +183,29 @@ describe('IOEventBuffer', () => {
     expect(buffer.getStats().payloadBytes).toBe(261);
   });
 
+  it('evicts oldest slots when live body backfill exceeds the byte budget', () => {
+    const buffer = makeBuffer({ capacity: 3, maxBytes: 800 });
+
+    buffer.push(createEvent({ requestId: 'req-1' }));
+    buffer.push(createEvent({ requestId: 'req-2' }));
+    const { slot, seq } = buffer.push(createEvent({ requestId: 'req-3' }));
+
+    expect(buffer.filterByRequestId('req-1')).toHaveLength(1);
+
+    const applied = applyBackfill(buffer, slot, seq, Buffer.alloc(300, 1));
+
+    expect(applied).toBe(true);
+    expect(buffer.drain().map((liveSlot) => liveSlot.requestId)).toEqual(['req-3']);
+    expect(buffer.filterByRequestId('req-1')).toEqual([]);
+    expect(buffer.getStats()).toEqual({
+      slotCount: 1,
+      payloadBytes: 556,
+      overflowCount: 2,
+      capacity: 3,
+      maxBytes: 800
+    });
+  });
+
   it('silently discards recycled-slot backfill when the seq mismatches', () => {
     const buffer = makeBuffer({ capacity: 1, maxBytes: 4096 });
 

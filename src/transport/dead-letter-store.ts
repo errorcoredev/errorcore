@@ -58,22 +58,30 @@ export interface IntegrityVerifier {
   verifyKeyIndex(payload: string, mac: string): number | null;
 }
 
-export function createHmacVerifier(integrityKey: string): IntegrityVerifier {
+export function createHmacVerifier(integrityKey: string | string[]): IntegrityVerifier {
+  const keys = Array.isArray(integrityKey) ? integrityKey : [integrityKey];
+  const primaryKey = keys[0];
+  if (primaryKey === undefined) {
+    throw new Error('createHmacVerifier requires at least one integrity key');
+  }
+
   return {
     sign(payload) {
-      return createHmac('sha256', integrityKey).update(payload).digest('base64');
+      return createHmac('sha256', primaryKey).update(payload).digest('base64');
     },
     verifyKeyIndex(payload, mac) {
       try {
-        const expected = createHmac('sha256', integrityKey)
-          .update(payload)
-          .digest();
         const actual = Buffer.from(mac, 'base64');
-        if (
-          expected.length === actual.length &&
-          timingSafeEqual(expected, actual)
-        ) {
-          return 0;
+        for (let index = 0; index < keys.length; index += 1) {
+          const expected = createHmac('sha256', keys[index]!)
+            .update(payload)
+            .digest();
+          if (
+            expected.length === actual.length &&
+            timingSafeEqual(expected, actual)
+          ) {
+            return index;
+          }
         }
         return null;
       } catch {
@@ -102,6 +110,10 @@ export interface DeadLetterDrainEntry {
 export interface DrainResult {
   entries: DeadLetterDrainEntry[];
   lineCount: number;
+}
+
+export interface DeadLetterDrainOptions {
+  allowLargeFile?: boolean;
 }
 
 interface DeadLetterEnvelopeBase {
@@ -137,6 +149,7 @@ interface DeadLetterStoreOptions {
    */
   verifier?: IntegrityVerifier;
   maxSizeBytes?: number;
+  maxBackups?: number;
   maxPayloadBytes?: number;
   requireEncryptedPayload?: boolean;
   // Optional callback invoked when the store hits a documented
@@ -190,11 +203,15 @@ export class DeadLetterStore {
 
   private readonly maxSizeBytes: number;
 
+  private readonly maxBackups: number;
+
   private readonly maxPayloadBytes: number;
 
   private readonly requireEncryptedPayload: boolean;
 
   private readonly onInternalWarning?: (warning: InternalWarning) => void;
+
+  private rotateCounter = 0;
 
   // Serialize concurrent clearSent calls inside the same process. Each
   // call takes the latest promise and chains its work. Cross-process
@@ -221,6 +238,7 @@ export class DeadLetterStore {
       );
     }
     this.maxSizeBytes = options.maxSizeBytes ?? DEFAULT_MAX_SIZE_BYTES;
+    this.maxBackups = options.maxBackups ?? 5;
     this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
     this.requireEncryptedPayload = options.requireEncryptedPayload ?? false;
     this.onInternalWarning = options.onInternalWarning;
@@ -294,14 +312,14 @@ export class DeadLetterStore {
     });
   }
 
-  public drain(): DrainResult {
+  public drain(options: DeadLetterDrainOptions = {}): DrainResult {
     try {
       if (!fs.existsSync(this.filePath)) {
         return { entries: [], lineCount: 0 };
       }
 
       const stats = fs.statSync(this.filePath);
-      if (stats.size > 10 * 1024 * 1024) {
+      if (stats.size > 10 * 1024 * 1024 && options.allowLargeFile !== true) {
         safeConsole.warn(
           `[ErrorCore] Dead-letter store is ${Math.round(stats.size / 1024 / 1024)}MB; ` +
           'skipping automatic drain at startup. Run `errorcore drain` to process manually.'
@@ -465,13 +483,9 @@ export class DeadLetterStore {
 
       return withLockSync(this.lockPath, () => {
         if (this.exceedsMaxSize()) {
-          safeConsole.warn('[ErrorCore] Dead-letter store at capacity; dropping payload');
-          this.reportWarning({
-            code: 'EC_DLQ_FULL',
-            message: `Dead-letter store at capacity (>= ${this.maxSizeBytes} bytes); dropping payload.`,
-            context: { maxSizeBytes: this.maxSizeBytes, reason: 'size_cap' }
-          });
-          return false;
+          if (!this.rotateIfNeededSync()) {
+            return false;
+          }
         }
 
         const envelope: DeadLetterEnvelope =
@@ -619,6 +633,56 @@ export class DeadLetterStore {
       return stats.size >= this.maxSizeBytes;
     } catch {
       return false;
+    }
+  }
+
+  private rotateIfNeededSync(): boolean {
+    if (!this.exceedsMaxSize()) {
+      return true;
+    }
+
+    if (this.maxBackups <= 0) {
+      this.reportWarning({
+        code: 'EC_DLQ_FULL',
+        message: `Dead-letter store exceeded maximum size (${this.maxSizeBytes} bytes); dropping payload.`,
+        context: { maxSizeBytes: this.maxSizeBytes, reason: 'size_cap' }
+      });
+      return false;
+    }
+
+    const stamp = Date.now();
+    const seq = ++this.rotateCounter;
+    const rotatedPath = `${this.filePath}.${stamp}-${seq}.bak`;
+    fs.renameSync(this.filePath, rotatedPath);
+    this.pendingPayloadCount = 0;
+    this.cleanupOldBackupsSync();
+    return true;
+  }
+
+  private cleanupOldBackupsSync(): void {
+    if (this.maxBackups < 0) {
+      return;
+    }
+
+    const dir = path.dirname(this.filePath);
+    const base = path.basename(this.filePath);
+    const prefix = `${base}.`;
+    const suffix = '.bak';
+
+    try {
+      const backups = fs
+        .readdirSync(dir)
+        .filter((entry) => entry.startsWith(prefix) && entry.endsWith(suffix))
+        .sort()
+        .reverse();
+
+      for (const backup of backups.slice(this.maxBackups)) {
+        try {
+          fs.unlinkSync(path.join(dir, backup));
+        } catch {
+        }
+      }
+    } catch {
     }
   }
 

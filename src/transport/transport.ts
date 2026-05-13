@@ -135,19 +135,41 @@ function createTransport(config) {
     const filePath = config.transport.path;
     const maxSizeBytes = config.transport.maxSizeBytes ?? 100 * 1024 * 1024;
     const maxBackups = config.transport.maxBackups ?? 5;
+    let rotateCounter = 0;
+    let rotatePromise = null;
+
+    async function rotateOnce() {
+      const stats = await new Promise((resolve) => {
+        fs.stat(filePath, (error, value) => resolve(error ? null : value));
+      });
+
+      if (!stats || stats.size <= maxSizeBytes) {
+        return;
+      }
+
+      const rotatedPath = filePath + '.' + Date.now() + '-' + (++rotateCounter) + '.bak';
+      await new Promise((resolve, reject) => {
+        fs.rename(filePath, rotatedPath, (error) => error ? reject(error) : resolve());
+      });
+      cleanupOldBackups(filePath, maxBackups);
+    }
+
+    async function rotateIfNeeded() {
+      if (rotatePromise !== null) {
+        await rotatePromise;
+      }
+
+      rotatePromise = rotateOnce();
+      try {
+        await rotatePromise;
+      } finally {
+        rotatePromise = null;
+      }
+    }
 
     return {
       async send(payload) {
-        const stats = await new Promise((resolve) => {
-          fs.stat(filePath, (error, value) => resolve(error ? null : value));
-        });
-
-        if (stats && stats.size > maxSizeBytes) {
-          await new Promise((resolve, reject) => {
-            fs.rename(filePath, filePath + '.' + Date.now() + '.bak', (error) => error ? reject(error) : resolve());
-          });
-          cleanupOldBackups(filePath, maxBackups);
-        }
+        await rotateIfNeeded();
 
         await new Promise((resolve, reject) => {
           fs.appendFile(
@@ -157,7 +179,35 @@ function createTransport(config) {
           );
         });
       },
-      async flush() {},
+      async flush() {
+        const fd = await new Promise((resolve, reject) => {
+          fs.open(filePath, 'r+', (error, value) => {
+            if (error) {
+              if (error.code === 'ENOENT') {
+                resolve(-1);
+                return;
+              }
+              reject(error);
+              return;
+            }
+            resolve(value);
+          });
+        });
+
+        if (fd === -1) {
+          return;
+        }
+
+        try {
+          await new Promise((resolve, reject) => {
+            fs.fsync(fd, (error) => error ? reject(error) : resolve());
+          });
+        } finally {
+          await new Promise((resolve) => {
+            fs.close(fd, () => resolve());
+          });
+        }
+      },
       async shutdown() {}
     };
   }

@@ -1,5 +1,7 @@
 
 import type { IOEventSlot, RequestContext } from '../types';
+import { resolveConfig } from '../config';
+import { Scrubber } from '../pii/scrubber';
 import { isSdkInternalRequest } from './internal';
 import { pushIOEvent, toDurationMs } from './utils';
 import type { RecorderState } from '../sdk-diagnostics';
@@ -50,10 +52,126 @@ interface HeaderFilterLike {
   filterAndNormalizeHeaders(headers: unknown): Record<string, string>;
 }
 
+interface UrlScrubberLike {
+  scrubUrl(rawUrl: string): string;
+}
+
+let defaultUrlScrubber: UrlScrubberLike | null = null;
+
+function getDefaultUrlScrubber(): UrlScrubberLike {
+  if (defaultUrlScrubber === null) {
+    defaultUrlScrubber = new Scrubber(resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true
+    }));
+  }
+  return defaultUrlScrubber;
+}
+
 function getRequestRecord(request: unknown): Record<string, unknown> | null {
   return typeof request === 'object' && request !== null
     ? (request as Record<string, unknown>)
     : null;
+}
+
+function hasHeader(headers: unknown, headerName: string): boolean {
+  const expected = headerName.toLowerCase();
+
+  try {
+    if (Array.isArray(headers)) {
+      if (headers.length === 0) return false;
+      if (typeof headers[0] === 'string') {
+        for (let index = 0; index + 1 < headers.length; index += 2) {
+          if (typeof headers[index] === 'string' && headers[index].toLowerCase() === expected) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      if (Array.isArray(headers[0])) {
+        for (const entry of headers) {
+          if (Array.isArray(entry) && typeof entry[0] === 'string' && entry[0].toLowerCase() === expected) {
+            return true;
+          }
+        }
+        return false;
+      }
+    }
+
+    if (headers instanceof Map) {
+      for (const key of headers.keys()) {
+        if (typeof key === 'string' && key.toLowerCase() === expected) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (typeof headers !== 'object' || headers === null) {
+      return false;
+    }
+
+    const headersObject = headers as {
+      has?: unknown;
+      forEach?: unknown;
+    };
+
+    if (typeof headersObject.has === 'function') {
+      try {
+        if ((headersObject.has as (name: string) => boolean)(headerName)) {
+          return true;
+        }
+        if ((headersObject.has as (name: string) => boolean)(expected)) {
+          return true;
+        }
+      } catch {
+        // Fall through to shape-based inspection below.
+      }
+    }
+
+    if (typeof headersObject.forEach === 'function') {
+      let found = false;
+      try {
+        (headersObject.forEach as (cb: (value: unknown, key: unknown) => void) => void)(
+          (_value, key) => {
+            if (typeof key === 'string' && key.toLowerCase() === expected) {
+              found = true;
+            }
+          }
+        );
+        if (found) return true;
+      } catch {
+        // Fall through to plain object inspection.
+      }
+    }
+
+    for (const key in headers as Record<string, unknown>) {
+      if (key.toLowerCase() === expected) {
+        return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
+function scrubUrl(scrubber: UrlScrubberLike | undefined, rawUrl: string): string {
+  try {
+    return (scrubber ?? getDefaultUrlScrubber()).scrubUrl(rawUrl);
+  } catch {
+    return rawUrl;
+  }
+}
+
+function scrubNullableUrl(
+  scrubber: UrlScrubberLike | undefined,
+  rawUrl: string | null
+): string | null {
+  return rawUrl === null ? null : scrubUrl(scrubber, rawUrl);
 }
 
 function extractTarget(request: Record<string, unknown>): {
@@ -89,6 +207,8 @@ export class UndiciRecorder {
 
   private readonly bodyCapture: BodyCaptureLike | undefined;
 
+  private readonly scrubber: UrlScrubberLike | undefined;
+
   // Fallback WeakMap kept for the rare case where the Request object refuses
   // Symbol property writes (frozen / Proxy-trapped). Primary lookup is the
   // UNDICI_SLOT_REF Symbol on the request itself.
@@ -99,11 +219,13 @@ export class UndiciRecorder {
     als: ALSManagerLike;
     headerFilter: HeaderFilterLike;
     bodyCapture?: BodyCaptureLike;
+    scrubber?: UrlScrubberLike;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
     this.headerFilter = deps.headerFilter;
     this.bodyCapture = deps.bodyCapture;
+    this.scrubber = deps.scrubber;
   }
 
   public handleRequestCreate(message: { request: unknown }): void {
@@ -132,8 +254,13 @@ export class UndiciRecorder {
         })();
         try {
           if (traceHeaders !== null && typeof (request as any).addHeader === 'function') {
-            (request as any).addHeader('traceparent', traceHeaders.traceparent);
-            if (traceHeaders.tracestate !== undefined) {
+            if (!hasHeader(request.headers, 'traceparent')) {
+              (request as any).addHeader('traceparent', traceHeaders.traceparent);
+            }
+            if (
+              traceHeaders.tracestate !== undefined &&
+              !hasHeader(request.headers, 'tracestate')
+            ) {
               (request as any).addHeader('tracestate', traceHeaders.tracestate);
             }
           }
@@ -152,9 +279,9 @@ export class UndiciRecorder {
         direction: 'outbound',
         requestId: context?.requestId ?? null,
         contextLost: context === undefined,
-        target: extracted.target,
+        target: scrubUrl(this.scrubber, extracted.target),
         method: extracted.method,
-        url: extracted.url,
+        url: scrubNullableUrl(this.scrubber, extracted.url),
         statusCode: null,
         fd: null,
         requestHeaders: this.headerFilter.filterAndNormalizeHeaders(extracted.requestHeaders),

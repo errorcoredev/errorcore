@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { Scrubber } from '../pii/scrubber';
 import { Encryption, buildTransparentEnvelope } from '../security/encryption';
 import { getSdkVersion } from '../version';
+import { analyzeStackOwnership } from './stack-ownership';
 import type {
   CapturedFrame,
   Completeness,
@@ -13,6 +14,7 @@ import type {
   ErrorInfo,
   ErrorPackage,
   ErrorPackageParts,
+  PayloadBlobEnvelope,
   IOEventSlot,
   IOEventSerialized,
   PackageAssemblyResult,
@@ -71,6 +73,8 @@ function serializeIOEvent(event: IOEventSlot, scrubber: Scrubber): IOEventSerial
     responseBody: event.responseBody,
     requestBodyDigest: event.requestBodyDigest ?? null,
     responseBodyDigest: event.responseBodyDigest ?? null,
+    requestPayloadRef: event.requestPayloadRef ?? null,
+    responsePayloadRef: event.responsePayloadRef ?? null,
     requestBodyTruncated: event.requestBodyTruncated,
     responseBodyTruncated: event.responseBodyTruncated,
     requestBodyOriginalSize: event.requestBodyOriginalSize,
@@ -134,6 +138,61 @@ function countRenderedStackFrames(stack: string): number {
     if (line.trim().startsWith('at ')) count++;
   }
   return count;
+}
+
+const V8_STACK_FRAME_RE = /^(\s+at\s+)(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?$/;
+
+function scrubStackFilePaths(stack: string, scrubber: Scrubber): string {
+  if (stack === '') {
+    return stack;
+  }
+
+  return stack
+    .split('\n')
+    .map((line) => {
+      const match = V8_STACK_FRAME_RE.exec(line);
+      if (match === null) {
+        return line;
+      }
+
+      const [, indent, functionName, filePath, lineNumber, columnNumber] = match;
+      const scrubbedPath = scrubber.scrubFilePath(filePath);
+      if (scrubbedPath === filePath) {
+        return line;
+      }
+
+      return functionName
+        ? `${indent}${functionName} (${scrubbedPath}:${lineNumber}:${columnNumber})`
+        : `${indent}${scrubbedPath}:${lineNumber}:${columnNumber}`;
+    })
+    .join('\n');
+}
+
+function scrubErrorInfoFilePaths(error: ErrorInfo, scrubber: Scrubber): ErrorInfo {
+  return {
+    ...error,
+    stack: scrubStackFilePaths(error.stack, scrubber),
+    ...(error.rawStack === undefined
+      ? {}
+      : { rawStack: scrubStackFilePaths(error.rawStack, scrubber) }),
+    ...(error.cause === undefined
+      ? {}
+      : { cause: scrubErrorInfoFilePaths(error.cause, scrubber) })
+  };
+}
+
+function scrubCapturedFrameFilePaths(
+  frames: CapturedFrame[] | null,
+  scrubber: Scrubber
+): CapturedFrame[] | null {
+  if (frames === null) {
+    return null;
+  }
+
+  return frames.map((frame) => ({
+    ...frame,
+    filePath: scrubber.scrubFilePath(frame.filePath)
+  }));
 }
 
 /**
@@ -216,6 +275,32 @@ export function finalizePackageAssemblyResult(input: {
   };
 }
 
+export function finalizePayloadBlobAssemblyResult(input: {
+  envelopeObject: PayloadBlobEnvelope;
+  config: ResolvedConfig;
+  encryption?: Encryption | null;
+  sdkVersion?: string;
+}): PackageAssemblyResult {
+  const serializedPackage = JSON.stringify(input.envelopeObject);
+  const plaintextBuf = Buffer.from(serializedPackage, 'utf8');
+  const sdkVersion = input.sdkVersion ?? getSdkVersion();
+  const encrypted = input.encryption !== null && input.encryption !== undefined;
+  const envelope = encrypted
+    ? input.encryption!.encryptToEnvelope(plaintextBuf, {
+        eventId: input.envelopeObject.eventId
+      })
+    : buildTransparentEnvelope(plaintextBuf, {
+        eventId: input.envelopeObject.eventId,
+        sdkVersion
+      });
+
+  return {
+    packageObject: undefined as never,
+    payload: JSON.stringify(envelope),
+    envelope
+  };
+}
+
 export function buildPackageAssemblyResult(input: {
   parts: ErrorPackageParts;
   config: ResolvedConfig;
@@ -284,9 +369,14 @@ export class PackageBuilder {
       if (w.seq > maxSeq) maxSeq = w.seq;
     }
     const eventClockRange = { min: minSeq, max: maxSeq };
+    const serializedError = scrubErrorInfoFilePaths(parts.error, this.scrubber);
+    const scrubbedLocalVariables = scrubCapturedFrameFilePaths(
+      alignedLocalVariables,
+      this.scrubber
+    );
 
     const packageObject: ErrorPackage = {
-      schemaVersion: '1.1.0',
+      schemaVersion: '1.2.0',
       eventId: randomUUID(),
       service: this.config.service,
       capturedAt: new Date().toISOString(),
@@ -294,11 +384,12 @@ export class PackageBuilder {
       errorEventHrtimeNs: parts.errorEventHrtimeNs.toString(),
       eventClockRange,
       fingerprint: parts.fingerprint,
+      errorOrigin: analyzeStackOwnership(parts.error.stack, parts.error.type),
       timeAnchor: { ...parts.timeAnchor },
       error: {
-        ...parts.error
+        ...serializedError
       },
-      localVariables: alignedLocalVariables ?? undefined,
+      localVariables: scrubbedLocalVariables ?? undefined,
       request:
         parts.requestContext === undefined
           ? undefined

@@ -1,115 +1,308 @@
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 process.chdir(here);
 
-fs.rmSync('./smoke-errors.ndjson', { force: true });
+const nextBin = path.join(here, 'node_modules', 'next', 'dist', 'bin', 'next');
+const capturePath = path.resolve(here, process.env.ERRORCORE_SMOKE_FILE || './smoke-errors.ndjson');
+const host = '127.0.0.1';
+const runId = `nextjs-smoke-${Date.now()}-${crypto.randomUUID()}`;
 
-// Port can be overridden via SMOKE_PORT so a developer with 3099 already
-// bound (another Next.js dev server, an HTTP echo, etc.) is not blocked.
-const port = process.env.SMOKE_PORT || '3099';
+fs.mkdirSync(path.dirname(capturePath), { recursive: true });
+fs.rmSync(capturePath, { force: true });
 
-console.log('[smoke] building...');
-const build = spawnSync('npx', ['next', 'build'], { stdio: 'inherit', shell: true });
-if (build.status !== 0) {
-  console.error('[smoke] build failed');
+function fail(message) {
+  console.error(`[smoke] FAIL: ${message}`);
   process.exit(1);
 }
 
-console.log(`[smoke] starting server on port ${port}...`);
-const server = spawn('npx', ['next', 'start', '-p', port], { stdio: 'inherit', shell: true });
+function parsePort(value) {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    fail(`SMOKE_PORT must be an integer between 1 and 65535, got ${JSON.stringify(value)}`);
+  }
+  return port;
+}
 
-// Poll a throwaway request until the server is up. Next.js 14 with `next
-// start` routes the first request through a cold-start path that does not
-// emit the http.server.request.start diagnostic channel; subsequent
-// requests use the normal hot path. The smoke hits the test endpoint
-// twice so the ioTimeline assertion sees the hot path.
-const deadline = Date.now() + 30_000;
-let ready = false;
-while (Date.now() < deadline && !ready) {
+function withTemporaryServer(port) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(port, host, () => {
+      const address = server.address();
+      server.close((closeError) => {
+        if (closeError) {
+          reject(closeError);
+          return;
+        }
+        resolve(address);
+      });
+    });
+  });
+}
+
+async function choosePort() {
+  if (process.env.SMOKE_PORT !== undefined && process.env.SMOKE_PORT !== '') {
+    const port = parsePort(process.env.SMOKE_PORT);
+    try {
+      await withTemporaryServer(port);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      fail(`SMOKE_PORT ${port} is already in use or unavailable: ${detail}`);
+    }
+    return port;
+  }
+
+  const address = await withTemporaryServer(0);
+  if (address === null || typeof address === 'string') {
+    fail('could not allocate an ephemeral smoke port');
+  }
+  return address.port;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 2_500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    await fetch(`http://localhost:${port}/api/test-error`);
-    ready = true;
-    break;
-  } catch {
-    await new Promise((r) => setTimeout(r, 500));
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
   }
 }
-if (!ready) {
-  console.error('[smoke] server did not become ready within 30s');
-  server.kill();
-  process.exit(1);
+
+async function waitFor(condition, description, timeoutMs, intervalMs = 250) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    try {
+      const result = await condition();
+      if (result) return result;
+    } catch (error) {
+      if (error instanceof Error && error.fatal === true) {
+        throw error;
+      }
+      lastError = error;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  const suffix = lastError instanceof Error ? ` Last error: ${lastError.message}` : '';
+  throw new Error(`Timed out waiting for ${description} after ${timeoutMs}ms.${suffix}`);
 }
 
-// Second, hot-path request — the one the assertions are made against.
-await fetch(`http://localhost:${port}/api/test-error`).catch(() => undefined);
+function decodeCaptureLine(line) {
+  const parsed = JSON.parse(line);
+  if (
+    parsed !== null &&
+    typeof parsed === 'object' &&
+    parsed.v === 1 &&
+    typeof parsed.ciphertext === 'string'
+  ) {
+    const decoded = Buffer.from(parsed.ciphertext, 'base64').toString('utf8');
+    return JSON.parse(decoded);
+  }
+  return parsed;
+}
 
-// Wait for flush interval
-await new Promise((r) => setTimeout(r, 3000));
+function readDecodedCaptures() {
+  if (!fs.existsSync(capturePath)) return [];
+
+  const raw = fs.readFileSync(capturePath, 'utf8').trim();
+  if (raw.length === 0) return [];
+
+  return raw
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => decodeCaptureLine(line));
+}
+
+function captureMatchesRun(entry) {
+  return typeof entry?.error?.message === 'string' && entry.error.message.includes(runId);
+}
+
+function runNextSync(args, label) {
+  if (!fs.existsSync(nextBin)) {
+    fail(`Next.js CLI not found at ${nextBin}; run npm install in tmp-nextjs-smoke first`);
+  }
+
+  const result = spawnSync(process.execPath, [nextBin, ...args], {
+    cwd: here,
+    env: {
+      ...process.env,
+      ERRORCORE_SMOKE_FILE: capturePath,
+    },
+    stdio: 'inherit',
+    shell: false,
+  });
+
+  if (result.error) {
+    fail(`${label} failed to start: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail(`${label} failed with exit ${result.status}`);
+  }
+}
+
+function spawnNextServer(port) {
+  const outputTail = [];
+  const server = spawn(process.execPath, [nextBin, 'start', '-p', String(port), '-H', host], {
+    cwd: here,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      ERRORCORE_SMOKE_FILE: capturePath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
+
+  function pipe(stream, sink) {
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk) => {
+      outputTail.push(chunk);
+      while (outputTail.join('').length > 4_000) outputTail.shift();
+      sink.write(chunk);
+    });
+  }
+
+  pipe(server.stdout, process.stdout);
+  pipe(server.stderr, process.stderr);
+
+  let exitInfo = null;
+  server.once('exit', (code, signal) => {
+    exitInfo = { code, signal };
+  });
+  server.once('error', (error) => {
+    exitInfo = { error };
+  });
+
+  return {
+    server,
+    getExitInfo: () => exitInfo,
+    getOutputTail: () => outputTail.join('').slice(-4_000),
+  };
+}
+
+async function stopServer(server) {
+  if (server.exitCode !== null || server.signalCode !== null) return;
+
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      try {
+        server.kill('SIGKILL');
+      } catch {}
+    }, 2_000);
+    timer.unref();
+
+    server.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+
+    try {
+      server.kill('SIGTERM');
+    } catch {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+}
+
+const port = await choosePort();
+const baseUrl = `http://${host}:${port}`;
+
+console.log(`[smoke] runId=${runId}`);
+console.log(`[smoke] capture file=${capturePath}`);
+console.log('[smoke] building...');
+runNextSync(['build'], 'next build');
+
+console.log(`[smoke] starting server on port ${port}...`);
+const { server, getExitInfo, getOutputTail } = spawnNextServer(port);
 
 try {
-  server.kill();
-  await new Promise((r) => setTimeout(r, 1000));
-} catch {}
+  await waitFor(async () => {
+    const exitInfo = getExitInfo();
+    if (exitInfo !== null) {
+      const reason = exitInfo.error instanceof Error
+        ? `spawn error=${exitInfo.error.message}`
+        : `code=${exitInfo.code}, signal=${exitInfo.signal}`;
+      throw Object.assign(new Error(
+        `Next server exited before readiness (${reason}). ${getOutputTail()}`
+      ), { fatal: true });
+    }
 
-function fail(msg) {
-  console.error('[smoke] FAIL:', msg);
-  process.exit(1);
+    try {
+      const response = await fetchWithTimeout(
+        `${baseUrl}/api/smoke-health?runId=${encodeURIComponent(runId)}`
+      );
+      if (!response.ok) return false;
+      const body = await response.json();
+      return body?.ok === true && body?.service === 'tmp-nextjs-smoke' && body?.runId === runId;
+    } catch {
+      return false;
+    }
+  }, 'Next.js smoke health route', 30_000);
+
+  const response = await fetchWithTimeout(
+    `${baseUrl}/api/test-error?runId=${encodeURIComponent(runId)}`
+  );
+  if (response.status < 500) {
+    fail(`test-error route returned ${response.status}; expected a 5xx response`);
+  }
+
+  const entries = await waitFor(() => {
+    const decoded = readDecodedCaptures();
+    const currentRunEntries = decoded.filter(captureMatchesRun);
+    return currentRunEntries.length > 0 ? currentRunEntries : false;
+  }, 'current-run decoded smoke capture', 10_000);
+
+  if (entries.length !== 1) {
+    fail(`expected exactly 1 current-run capture, found ${entries.length}`);
+  }
+
+  const entry = entries[0];
+  if (entry.completeness?.requestCaptured !== true) {
+    fail('current-run capture is missing request metadata');
+  }
+  if (
+    entry.completeness?.ioTimelineCaptured !== true ||
+    !entry.ioTimeline?.some((event) => event.type === 'http-server')
+  ) {
+    fail('current-run capture is missing http-server inbound ioTimeline');
+  }
+
+  const hasLocals =
+    entry.completeness?.localVariablesCaptured === true &&
+    (entry.localVariables ?? []).some(
+      (frame) => frame.locals && Object.keys(frame.locals).length >= 2
+    );
+  if (!hasLocals) {
+    fail(`current-run capture is missing locals; failures=${JSON.stringify(entry.completeness?.captureFailures ?? [])}`);
+  }
+
+  if (!['tag', 'identity'].includes(entry.completeness.localVariablesCaptureLayer)) {
+    fail(`locals entry has unexpected captureLayer: ${entry.completeness.localVariablesCaptureLayer}`);
+  }
+
+  const firstFrame = (entry.error.stack ?? '').split('\n')[1] ?? '';
+  if (/\.next[\\/]server[\\/].*route\.js/.test(firstFrame) || !/webpack:|route\.ts/.test(firstFrame)) {
+    fail('current-run capture does not have a source-mapped first frame');
+  }
+
+  if (entry.completeness?.sourceMapResolution === undefined) {
+    fail('current-run capture is missing sourceMapResolution telemetry');
+  }
+
+  console.log(
+    `[smoke] OK - runId=${runId}, captures=${entries.length}, layer=${entry.completeness.localVariablesCaptureLayer}, source-mapped, ioTimeline`
+  );
+} finally {
+  await stopServer(server);
 }
-
-if (!fs.existsSync('./smoke-errors.ndjson')) fail('ndjson not created');
-const raw = fs.readFileSync('./smoke-errors.ndjson', 'utf8').trim();
-if (raw.length === 0) fail('ndjson is empty');
-
-const entries = raw.split('\n').map((l) => JSON.parse(l));
-if (entries.length === 0) fail('no entries parsed');
-
-// Cross-entry assertions. Next.js 14 with `next start` routes the first
-// request through a cold path that skips http.server.request.start; the
-// second+ requests use the hot path that emits the channel. Meanwhile,
-// the inspector's rate limiter can saturate under Next.js's internal
-// exception noise, so any one entry may miss locals OR ioTimeline but
-// not both. The smoke asserts the full capability is exercised across
-// the entries.
-const someHasIo = entries.some((e) =>
-  e.completeness.ioTimelineCaptured === true &&
-  e.ioTimeline.some((ev) => ev.type === 'http-server')
-);
-if (!someHasIo) fail('no entry has http-server inbound ioTimeline — G2 regression');
-
-// G1 assertion: at least one entry has locals captured via Layer 1 or
-// Layer 2. We don't assert on specific variable NAMES because production
-// webpack builds minify them (user → e, cart → t, etc.). Proving the
-// mechanism works = >=1 entry with >=1 frame with >=2 local variables.
-const localsEntry = entries.find((e) => {
-  if (e.completeness.localVariablesCaptured !== true) return false;
-  const frames = e.localVariables ?? [];
-  return frames.some((f) => f.locals && Object.keys(f.locals).length >= 2);
-});
-if (!localsEntry) fail('no entry has locals captured — G1 regression');
-
-if (!['tag', 'identity'].includes(localsEntry.completeness.localVariablesCaptureLayer)) {
-  fail(`locals entry has unexpected captureLayer: ${localsEntry.completeness.localVariablesCaptureLayer}`);
-}
-
-const someSourceMapped = entries.some((e) => {
-  const first = (e.error.stack ?? '').split('\n')[1] ?? '';
-  if (/\.next[\\/]server[\\/].*route\.js/.test(first)) return false;
-  return /webpack:|route\.ts/.test(first);
-});
-if (!someSourceMapped) fail('no entry has a source-mapped first frame — G3 regression');
-
-// G3 telemetry assertion: sourceMapResolution is present on every entry.
-// framesResolved counts errorcore's own resolutions; under Node's
-// --enable-source-maps flag the native Error.prepareStackTrace hook runs
-// first and errorcore sees an already-resolved stack (framesResolved=0).
-// someSourceMapped above already validates the outcome; here we only
-// require the telemetry structure exists.
-const allHaveSmTelemetry = entries.every((e) => e.completeness.sourceMapResolution !== undefined);
-if (!allHaveSmTelemetry) fail('some entry missing sourceMapResolution telemetry — G3 regression');
-
-const layers = new Set(entries.map((e) => e.completeness.localVariablesCaptureLayer).filter(Boolean));
-console.log(`[smoke] OK — ${entries.length} entries, layers=${[...layers].join(',') || 'none'}, source-mapped ✓, ioTimeline ✓`);

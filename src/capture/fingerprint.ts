@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { CapturedFrame } from '../types';
+import {
+  analyzeStackOwnership,
+  classifyFramePath,
+  parseStackFrames as parseOwnershipStackFrames
+} from './stack-ownership';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const DQUOTED_RE = /"[^"]*"/g;
@@ -27,14 +32,31 @@ function pickTopFrame(frames: CapturedFrame[]): CapturedFrame | null {
   return frames[0] ?? null;
 }
 
+function parseStackFrames(stack: string | undefined): CapturedFrame[] {
+  return parseOwnershipStackFrames(stack)
+    .filter((frame) => classifyFramePath(frame.filePath) === 'app')
+    .map((frame) => ({
+      functionName: frame.functionName,
+      filePath: frame.filePath,
+      lineNumber: frame.lineNumber,
+      columnNumber: frame.columnNumber,
+      locals: {}
+    }));
+}
+
 export function computeFingerprint(
   error: Error,
   stackFrames: CapturedFrame[]
 ): string {
   const constructorName = error.constructor?.name || 'Error';
-  const frame = pickTopFrame(stackFrames);
+  const framesForFingerprint =
+    stackFrames.length > 0 ? stackFrames : parseStackFrames(error.stack);
+  const frame = pickTopFrame(framesForFingerprint);
+  const ownership = analyzeStackOwnership(error.stack, constructorName);
   const frameKey = frame
     ? `${frame.filePath}:${frame.functionName}:${frame.lineNumber}`
+    : ownership.package !== undefined
+      ? `external:${ownership.package}`
     : 'unknown:unknown:0';
   const normalized = normalizeMessage(error.message || '');
   const input = `${constructorName}|${frameKey}|${normalized}`;

@@ -22,6 +22,10 @@ import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 import { ERRORCORE_INTERNAL, HttpClientRecorder } from '../../src/recording/http-client';
 import { UndiciRecorder } from '../../src/recording/undici';
 import { NetDnsRecorder, runAsInternal } from '../../src/recording/net-dns';
+import { install as installPgPatch } from '../../src/recording/patches/pg';
+import { install as installMysql2Patch } from '../../src/recording/patches/mysql2';
+import { install as installMongodbPatch } from '../../src/recording/patches/mongodb';
+import { install as installIoredisPatch } from '../../src/recording/patches/ioredis';
 import { fastifyPlugin } from '../../src/middleware/fastify';
 import { createSDK } from '../../src/sdk';
 import type { RequestContext } from '../../src/types';
@@ -276,6 +280,49 @@ describe('Module 08 recorders', () => {
     }
   });
 
+  it('scrubs sensitive inbound URL query values before storing request metadata', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+    const req = new MockIncomingRequest();
+    const res = new MockServerResponse();
+
+    req.url = '/resource?password=hunter2&email=alice%40example.com&safe=ok';
+
+    try {
+      recorder.handleRequestStart({
+        request: req as unknown as IncomingMessage,
+        response: res as unknown as ServerResponse,
+        socket: req.socket as never,
+        server: new Server()
+      });
+
+      const [slot] = buffer.drain();
+
+      expect(slot?.url).toBe(
+        '/resource?password=%5BREDACTED%5D&email=%5BREDACTED%5D&safe=ok'
+      );
+      expect(slot?.url).not.toContain('hunter2');
+      expect(slot?.url).not.toContain('alice%40example.com');
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+    }
+  });
+
   it('reports whether bindStore or the emit patch is active at install time', () => {
     const config = createConfig();
     const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
@@ -520,6 +567,34 @@ describe('Module 08 recorders', () => {
     } finally {
       await sdk.shutdown();
     }
+  });
+
+  it('scrubs sensitive outbound HTTP client URL query values before storing request metadata', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const context = createRequestContext(als);
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture: new BodyCapture(config),
+      headerFilter: new HeaderFilter(config)
+    });
+    const request = new MockClientRequest();
+
+    request.path = '/v1/items?password=hunter2&email=alice%40example.com&safe=ok';
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    const [slot] = buffer.drain();
+
+    expect(slot?.url).toBe(
+      'https://api.example.com:443/v1/items?password=%5BREDACTED%5D&email=%5BREDACTED%5D&safe=ok'
+    );
+    expect(slot?.url).not.toContain('hunter2');
+    expect(slot?.url).not.toContain('alice%40example.com');
   });
 
   it('captures outbound HTTP client request body via wrapped write/end', () => {
@@ -1158,6 +1233,203 @@ describe('Module 08 recorders', () => {
       });
     } finally {
       recorder.shutdown();
+    }
+  });
+
+  it('scrubs captured SQL bind params when opt-in capture is enabled', () => {
+    class FakePgClient {
+      public connectionParameters = {
+        host: 'postgres.local',
+        port: 5432,
+        database: 'app'
+      };
+
+      public query(_text: string, _values?: unknown[]): { rowCount: number } {
+        return { rowCount: 1 };
+      }
+    }
+
+    class FakeMysqlConnection {
+      public config = {
+        host: 'mysql.local',
+        port: 3306,
+        database: 'app'
+      };
+
+      public query(_sql: string, _values?: unknown[]): unknown[] {
+        return [{ affectedRows: 1 }];
+      }
+
+      public execute(_sql: string, _values?: unknown[]): unknown[] {
+        return [{ affectedRows: 1 }];
+      }
+    }
+
+    const config = resolveConfig({ captureDbBindParams: true });
+    const pgBuffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const mysqlBuffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const pgInstall = installPgPatch({
+      buffer: pgBuffer,
+      als: new ALSManager(),
+      config,
+      explicitDriver: { Client: FakePgClient }
+    });
+    const mysqlInstall = installMysql2Patch({
+      buffer: mysqlBuffer,
+      als: new ALSManager(),
+      config,
+      explicitDriver: { Connection: FakeMysqlConnection }
+    });
+
+    try {
+      new FakePgClient().query('SELECT $1::text, $2::text, $3::text, $4::text', [
+        'alice@example.com',
+        '4111111111111111',
+        'password=hunter2',
+        'visible-value'
+      ]);
+      new FakeMysqlConnection().execute('SELECT ?, ?, ?, ?', [
+        'alice@example.com',
+        '4111111111111111',
+        'password=hunter2',
+        'visible-value'
+      ]);
+
+      const [pgSlot] = pgBuffer.drain();
+      const [mysqlSlot] = mysqlBuffer.drain();
+
+      expect(pgSlot?.dbMeta?.params).not.toContain('alice@example.com');
+      expect(pgSlot?.dbMeta?.params).not.toContain('4111111111111111');
+      expect(pgSlot?.dbMeta?.params).not.toContain('hunter2');
+      expect(pgSlot?.dbMeta?.params).toContain('[REDACTED]');
+      expect(pgSlot?.dbMeta?.params).toContain('visible-value');
+      expect(mysqlSlot?.dbMeta?.params).not.toContain('alice@example.com');
+      expect(mysqlSlot?.dbMeta?.params).not.toContain('4111111111111111');
+      expect(mysqlSlot?.dbMeta?.params).not.toContain('hunter2');
+      expect(mysqlSlot?.dbMeta?.params).toContain('[REDACTED]');
+      expect(mysqlSlot?.dbMeta?.params).toContain('visible-value');
+    } finally {
+      pgInstall.uninstall();
+      mysqlInstall.uninstall();
+    }
+  });
+
+  it('scrubs captured MongoDB params when opt-in capture is enabled', () => {
+    class FakeCollection {
+      public collectionName = 'users';
+
+      public db = {
+        databaseName: 'app'
+      };
+
+      public insertOne(_document: unknown): { acknowledged: boolean; insertedId: string } {
+        return { acknowledged: true, insertedId: 'u1' };
+      }
+    }
+
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const install = installMongodbPatch({
+      buffer,
+      als: new ALSManager(),
+      config: resolveConfig({ captureDbBindParams: true }),
+      explicitDriver: { Collection: FakeCollection }
+    });
+
+    try {
+      new FakeCollection().insertOne({
+        email: 'alice@example.com',
+        card: '4111111111111111',
+        displayName: 'Alice'
+      });
+
+      const [slot] = buffer.drain();
+
+      expect(slot?.dbMeta?.params).not.toContain('alice@example.com');
+      expect(slot?.dbMeta?.params).not.toContain('4111111111111111');
+      expect(slot?.dbMeta?.params).toContain('[REDACTED]');
+      expect(slot?.dbMeta?.params).toContain('displayName');
+    } finally {
+      install.uninstall();
+    }
+  });
+
+  it('scrubs Redis cache keys before storing query and collection metadata', () => {
+    class FakeRedis {
+      public options = {
+        host: 'redis.local',
+        port: 6379
+      };
+
+      public sendCommand(_command: { name?: string; args?: unknown[] }): string {
+        return 'OK';
+      }
+    }
+
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const install = installIoredisPatch({
+      buffer,
+      als: new ALSManager(),
+      config: resolveConfig({}),
+      explicitDriver: FakeRedis
+    });
+
+    try {
+      new FakeRedis().sendCommand({
+        name: 'get',
+        args: ['session:alice@example.com:password=hunter2']
+      });
+
+      const [slot] = buffer.drain();
+
+      expect(slot?.dbMeta?.query).toBe('get session:[REDACTED]:password=[REDACTED]');
+      expect(slot?.dbMeta?.collection).toBe('session:[REDACTED]:password=[REDACTED]');
+      expect(slot?.dbMeta?.query).not.toContain('alice@example.com');
+      expect(slot?.dbMeta?.query).not.toContain('hunter2');
+    } finally {
+      install.uninstall();
+    }
+  });
+
+  it('reports driver patch installs with no wrapped methods as warnings', () => {
+    class EmptyRedis {}
+
+    const config = resolveConfig({});
+    const makeDeps = () => ({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config
+    });
+
+    const installs = [
+      installPgPatch({
+        ...makeDeps(),
+        explicitDriver: { Client: { prototype: {} }, Pool: { prototype: {} } }
+      }),
+      installMysql2Patch({
+        ...makeDeps(),
+        explicitDriver: { Connection: { prototype: {} } }
+      }),
+      installMongodbPatch({
+        ...makeDeps(),
+        explicitDriver: { Collection: { prototype: {} } }
+      }),
+      installIoredisPatch({
+        ...makeDeps(),
+        explicitDriver: EmptyRedis
+      })
+    ];
+
+    try {
+      for (const install of installs) {
+        expect(install.state).toEqual({
+          state: 'warn',
+          reason: 'no-supported-methods'
+        });
+      }
+    } finally {
+      for (const install of installs) {
+        install.uninstall();
+      }
     }
   });
 });

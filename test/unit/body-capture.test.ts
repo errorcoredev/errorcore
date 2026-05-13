@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 
 import { Scrubber } from '../../src/pii/scrubber';
+import { PayloadSpool } from '../../src/spool/payload-spool';
 import { BodyCapture } from '../../src/recording/body-capture';
 import type { IOEventSlot, RequestContext } from '../../src/types';
 import { resolveTestConfig } from '../helpers/test-config';
@@ -94,6 +95,7 @@ function createBodyCapture(input: {
   captureBodyDigest?: boolean;
   bodyCaptureContentTypes?: string[];
   scrubber?: InstanceType<typeof Scrubber>;
+  payloadSpool?: PayloadSpool;
 } = {}): BodyCapture {
   return new BodyCapture({
     maxPayloadSize: input.maxPayloadSize ?? 32,
@@ -105,7 +107,8 @@ function createBodyCapture(input: {
     ...(input.bodyCaptureContentTypes === undefined
       ? {}
       : { bodyCaptureContentTypes: input.bodyCaptureContentTypes }),
-    ...(input.scrubber === undefined ? {} : { scrubber: input.scrubber })
+    ...(input.scrubber === undefined ? {} : { scrubber: input.scrubber }),
+    ...(input.payloadSpool === undefined ? {} : { payloadSpool: input.payloadSpool })
   });
 }
 
@@ -162,6 +165,79 @@ describe('BodyCapture', () => {
     expect(slot.requestBody?.toString()).toBe('abcde');
     expect(slot.requestBodyTruncated).toBe(true);
     expect(slot.requestBodyOriginalSize).toBe(6);
+  });
+
+  it('stores oversized scrubbed bodies in the payload spool and leaves a bounded preview ref on the slot', () => {
+    const spool = new PayloadSpool({
+      globalMaxBytes: 1024,
+      perRequestMaxBytes: 1024,
+      perBlobMaxBytes: 512,
+      previewBytes: 8,
+      completedTtlMs: 1000,
+      now: () => 100
+    });
+    const config = resolveTestConfig();
+    const capture = createBodyCapture({
+      maxPayloadSize: 8,
+      payloadSpool: spool,
+      scrubber: new Scrubber(config)
+    });
+    const req = new MockIncomingMessage();
+    const slot = createSlot({
+      requestHeaders: { 'content-type': 'application/json' }
+    });
+
+    capture.captureInboundRequest(req as IncomingMessage, slot, slot.seq, () => undefined);
+    req.on('data', () => undefined);
+    req.emit('data', Buffer.from('{"token":"secret-token","ok":true}'));
+    req.emit('end');
+    capture.materializeSlotBodies(slot);
+
+    expect(slot.requestBody).toBe('{"token"');
+    expect(slot.requestBodyTruncated).toBe(true);
+    expect(slot.requestBodyOriginalSize).toBe(34);
+    expect(slot.requestPayloadRef).toMatchObject({
+      storage: 'spool',
+      requestId: 'req-1',
+      mimeType: 'application/json',
+      size: 34
+    });
+    const entry = spool.get(slot.requestPayloadRef!.blobId);
+    expect(entry?.bytes.toString()).not.toContain('secret-token');
+    expect(entry?.bytes.toString()).toContain('[REDACTED]');
+  });
+
+  it('uses preview-only refs when the spool cannot store the full body', () => {
+    const spool = new PayloadSpool({
+      globalMaxBytes: 1024,
+      perRequestMaxBytes: 1024,
+      perBlobMaxBytes: 10,
+      previewBytes: 4,
+      completedTtlMs: 1000,
+      now: () => 100
+    });
+    const capture = createBodyCapture({
+      maxPayloadSize: 4,
+      payloadSpool: spool
+    });
+    const req = new MockIncomingMessage();
+    const slot = createSlot({
+      requestHeaders: { 'content-type': 'text/plain' }
+    });
+
+    capture.captureInboundRequest(req as IncomingMessage, slot, slot.seq, () => undefined);
+    req.on('data', () => undefined);
+    req.emit('data', Buffer.from('abcdefghijkl'));
+    req.emit('end');
+    capture.materializeSlotBodies(slot);
+
+    expect(slot.requestBody).toBe('abcd');
+    expect(slot.requestPayloadRef).toMatchObject({
+      storage: 'preview',
+      reason: 'per_blob_cap',
+      size: 12
+    });
+    expect(spool.get(slot.requestPayloadRef!.blobId)).toBeNull();
   });
 
   it('skips inbound request capture for disallowed content types', () => {
@@ -551,6 +627,24 @@ describe('BodyCapture', () => {
     capture.materializeSlotBodies(slot);
 
     expect(slot.requestBody?.toString('utf8')).toBe('[MULTIPART BODY OMITTED]');
+  });
+
+  it('scrubs sensitive key-value assignments in text/plain bodies', () => {
+    const capture = createBodyCapture({ maxPayloadSize: 128 });
+    const slot = createSlot({
+      requestHeaders: { 'content-type': 'text/plain; charset=utf-8' }
+    });
+
+    const replacement = capture.captureClientRequestBody(
+      slot,
+      slot.seq,
+      'password=super-secret\nnote=keep-me',
+      () => undefined
+    );
+
+    expect(replacement).toBeUndefined();
+    capture.materializeSlotBodies(slot);
+    expect(slot.requestBody).toBe('password=[REDACTED]\nnote=keep-me');
   });
 
   it('can capture only request bodies without response bodies', () => {

@@ -81,6 +81,11 @@ export interface HealthSnapshot {
   // Current gauges.
   transportQueueDepth: number;
   deadLetterDepth: number;
+  deadLetter: {
+    enabled: boolean;
+    signed: boolean;
+    reason: 'configured' | 'not_configured' | 'unsigned';
+  };
   ioBufferDepth: number;
 
   // Rolling-window / last-value samples.

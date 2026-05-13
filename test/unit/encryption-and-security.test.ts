@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Encryption } from '../../src/security/encryption';
+import {
+  createEncryptionFromAssemblyConfig,
+  createPackageAssemblyEncryptionConfig
+} from '../../src/security/encryption-runtime';
 import { RateLimiter } from '../../src/security/rate-limiter';
 
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -171,6 +175,38 @@ describe('Encryption', () => {
 
     expect(() => encryption.decrypt({ ...env, v: 2 as 1 }))
       .toThrow(/EC_DECRYPT_UNKNOWN_VERSION/);
+  });
+});
+
+describe('Encryption runtime config', () => {
+  it('does not let ERRORCORE_DERIVED_KEY replace configured key material', () => {
+    const originalDerivedKey = process.env.ERRORCORE_DERIVED_KEY;
+
+    try {
+      process.env.ERRORCORE_DERIVED_KEY = '00'.repeat(32);
+
+      const assemblyConfig = createPackageAssemblyEncryptionConfig({
+        encryptionKey: 'configured-runtime-key',
+        macKey: undefined,
+        previousEncryptionKeys: []
+      });
+
+      expect(assemblyConfig).not.toHaveProperty('derivedKeyHex');
+
+      const runtimeEncryption = createEncryptionFromAssemblyConfig(assemblyConfig);
+      expect(runtimeEncryption).not.toBeNull();
+
+      const env = runtimeEncryption!.encryptToEnvelope(buf('configured only'), makeEnv('evt-runtime'));
+      const configuredEncryption = new Encryption('configured-runtime-key', { sdkVersion: env.sdk.version });
+
+      expect(configuredEncryption.decrypt(env)).toBe('configured only');
+    } finally {
+      if (originalDerivedKey === undefined) {
+        delete process.env.ERRORCORE_DERIVED_KEY;
+      } else {
+        process.env.ERRORCORE_DERIVED_KEY = originalDerivedKey;
+      }
+    }
   });
 });
 

@@ -1,7 +1,8 @@
 
-import { STANDARD_LIMITS, cloneAndLimit } from '../serialization/clone-and-limit';
+import { cloneAndLimit } from '../serialization/clone-and-limit';
 import { createDebug } from '../debug';
 import { safeConsole } from '../debug-log';
+import { Scrubber, scrubKeyValueAssignments } from '../pii/scrubber';
 import type { Encryption } from '../security/encryption';
 import type { RateLimiter } from '../security/rate-limiter';
 import type { ALSManager } from '../context/als-manager';
@@ -12,7 +13,10 @@ import { HTTP_TRANSPORT_TIMEOUT_MESSAGE } from '../transport/http-transport';
 const debug = createDebug('capturer');
 import type { RequestTracker } from '../context/request-tracker';
 import type { InspectorManager, LocalsWithDiagnostics } from './inspector-manager';
-import { finalizePackageAssemblyResult } from './package-builder';
+import {
+  finalizePackageAssemblyResult,
+  finalizePayloadBlobAssemblyResult
+} from './package-builder';
 import { computeFingerprint } from './fingerprint';
 import type { PackageBuilder } from './package-builder';
 import type { ProcessMetadata } from './process-metadata';
@@ -133,23 +137,65 @@ export function scrubInternalWarningValue(value: unknown, depth = 0): unknown {
   return value;
 }
 
+interface PayloadSpoolLike {
+  buildEnvelope(eventId: string, blobId: string): import('../types').PayloadBlobEnvelope | null;
+}
+
+function defaultScrubConfig(config: ResolvedConfig): ResolvedConfig {
+  if (config.piiScrubber === undefined) {
+    return config;
+  }
+
+  return {
+    ...config,
+    piiScrubber: undefined,
+    replaceDefaultScrubber: false
+  };
+}
+
+function sanitizeDiagnosticString(
+  config: ResolvedConfig,
+  value: unknown,
+  maxLength = 500
+): string {
+  let raw: string;
+  try {
+    raw = typeof value === 'string' ? value : String(value);
+  } catch {
+    raw = '[Unserializable diagnostic]';
+  }
+
+  const scrubber = new Scrubber(defaultScrubConfig(config));
+  const scrubbed = scrubber.scrubValue('', scrubKeyValueAssignments(raw));
+  const safe = typeof scrubbed === 'string' ? scrubbed : String(scrubbed);
+  return safe.length > maxLength
+    ? `${safe.slice(0, maxLength)}...[truncated, ${safe.length} chars]`
+    : safe;
+}
+
+function sanitizeDiagnosticValue(config: ResolvedConfig, value: unknown): unknown {
+  const scrubber = new Scrubber(defaultScrubConfig(config));
+  return scrubber.scrubValue('', scrubInternalWarningValue(value));
+}
+
 function emitSafeWarning(
   config: ResolvedConfig,
   warning: InternalWarning & { code: InternalWarningCode }
 ): void {
+  const message = sanitizeDiagnosticString(config, warning.message, 1000);
   // Preserve the human-readable console output but route through the
   // logLevel filter. The structured callback is the unfiltered channel.
-  safeConsole.warn(`[ErrorCore] ${warning.message}`);
+  safeConsole.warn(`[ErrorCore] ${message}`);
 
   if (config.onInternalWarning !== undefined) {
     const enriched: InternalWarning = {
       code: warning.code,
-      message: warning.message,
+      message,
       ...(warning.cause !== undefined
-        ? { cause: scrubInternalWarningValue(serializeCause(warning.cause)) }
+        ? { cause: sanitizeDiagnosticValue(config, serializeCause(warning.cause)) }
         : {}),
       ...(warning.context !== undefined
-        ? { context: scrubInternalWarningValue(warning.context) as Record<string, unknown> }
+        ? { context: sanitizeDiagnosticValue(config, warning.context) as Record<string, unknown> }
         : {}),
     };
     try {
@@ -240,6 +286,7 @@ export function extractCustomProperties(error: Error): Record<string, unknown> {
 function serializeError(
   error: Error,
   resolver: SourceMapResolver | null,
+  config: ResolvedConfig,
   depth = 0
 ): ErrorInfo {
   if (depth > 5) {
@@ -273,8 +320,8 @@ function serializeError(
     message: error.message || '',
     stack: resolvedStack,
     rawStack: rawStackField,
-    cause: cause instanceof Error ? serializeError(cause, resolver, depth + 1) : undefined,
-    properties: cloneAndLimit(extractCustomProperties(error), STANDARD_LIMITS) as Record<
+    cause: cause instanceof Error ? serializeError(cause, resolver, config, depth + 1) : undefined,
+    properties: cloneAndLimit(extractCustomProperties(error), config.serialization) as Record<
       string,
       unknown
     >
@@ -318,7 +365,9 @@ export class ErrorCapturer {
 
   private readonly eventClock: EventClock;
 
-  private readonly pendingTransportDispatches = new Set<Promise<void>>();
+  private readonly payloadSpool: PayloadSpoolLike | null;
+
+  private readonly pendingTransportDispatches = new Set<Promise<unknown>>();
 
   private readonly deliveryDiagnostics: CaptureDeliveryDiagnostics = {
     sent: 0,
@@ -354,6 +403,7 @@ export class ErrorCapturer {
     sourceMapResolver?: SourceMapResolver | null;
     watchdog?: { notifyErrorCaptured(error: Error): void } | null;
     healthMetrics?: HealthMetrics | null;
+    payloadSpool?: PayloadSpoolLike | null;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
@@ -375,6 +425,7 @@ export class ErrorCapturer {
     this.sourceMapResolver = deps.sourceMapResolver ?? null;
     this.watchdog = deps.watchdog ?? null;
     this.healthMetrics = deps.healthMetrics ?? null;
+    this.payloadSpool = deps.payloadSpool ?? null;
   }
 
   public capture(error: Error, _options?: { isUncaught?: boolean }): ErrorPackage | null {
@@ -386,7 +437,9 @@ export class ErrorCapturer {
     const errorEventHrtimeNs = process.hrtime.bigint();
 
     try {
-      debug(`capture() called for ${error.name}: ${error.message}`);
+      debug(
+        `capture() called for ${error.name}: ${sanitizeDiagnosticString(this.config, error.message)}`
+      );
       if (!this.rateLimiter.tryAcquire()) {
         debug('capture() rate-limited, dropping');
         this.healthMetrics?.recordDroppedRateLimited();
@@ -399,7 +452,7 @@ export class ErrorCapturer {
 
       const rateLimiterDrops = this.rateLimiter.getAndResetDropSummary() ?? undefined;
 
-      const serializedError = serializeError(error, this.sourceMapResolver);
+      const serializedError = serializeError(error, this.sourceMapResolver, this.config);
       const sourceMapTelemetry = this.sourceMapResolver?.consumeTelemetry();
       const localsResult = this.safeGetLocals(error, captureFailures);
       const context = this.safeGetContext(captureFailures);
@@ -529,7 +582,11 @@ export class ErrorCapturer {
       // a bad scrubber return type.
       const detail =
         captureError instanceof Error
-          ? `${captureError.name}: ${captureError.message.slice(0, 200)}`
+          ? sanitizeDiagnosticString(
+              this.config,
+              `${captureError.name}: ${captureError.message}`,
+              200
+            )
           : 'unknown';
       emitSafeWarning(this.config, {
         code: 'EC_CAPTURE_FAILED',
@@ -558,7 +615,9 @@ export class ErrorCapturer {
       const result = this.inspector.getLocalsWithDiagnostics(error);
 
       if (result.frames === null && result.missReason !== null) {
-        captureFailures.push(`locals: ${result.missReason}`);
+        captureFailures.push(
+          `locals: ${sanitizeDiagnosticString(this.config, result.missReason)}`
+        );
       }
 
       return {
@@ -570,7 +629,7 @@ export class ErrorCapturer {
       const message =
         inspectorError instanceof Error ? inspectorError.message : String(inspectorError);
 
-      captureFailures.push(`locals: ${message}`);
+      captureFailures.push(`locals: ${sanitizeDiagnosticString(this.config, message)}`);
       return { frames: null };
     }
   }
@@ -581,7 +640,7 @@ export class ErrorCapturer {
     } catch (alsError) {
       const message = alsError instanceof Error ? alsError.message : String(alsError);
 
-      captureFailures.push(`als: ${message}`);
+      captureFailures.push(`als: ${sanitizeDiagnosticString(this.config, message)}`);
       return undefined;
     }
   }
@@ -638,7 +697,11 @@ export class ErrorCapturer {
       config: this.config,
       encryption: this.encryption
     });
-    this.dispatchTransport({ serialized: payload, ...(envelope === undefined ? {} : { envelope }) });
+    const packageDispatch = this.dispatchTransport({
+      serialized: payload,
+      ...(envelope === undefined ? {} : { envelope })
+    });
+    this.dispatchPayloadBlobsAfter(packageDispatch, packageObject);
     return packageObject;
   }
 
@@ -650,13 +713,16 @@ export class ErrorCapturer {
         throw new Error('Package assembly worker returned no result');
       }
 
-      this.dispatchTransport({
+      const packageDispatch = this.dispatchTransport({
         serialized: result.payload,
         ...(result.envelope === undefined ? {} : { envelope: result.envelope })
       });
+      this.dispatchPayloadBlobsAfter(packageDispatch, result.packageObject);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      parts.captureFailures.push(`package-worker: ${message}`);
+      parts.captureFailures.push(
+        `package-worker: ${sanitizeDiagnosticString(this.config, message)}`
+      );
 
       try {
         this.captureInline(parts);
@@ -671,7 +737,7 @@ export class ErrorCapturer {
     }
   }
 
-  private dispatchTransport(payload: TransportPayload): void {
+  private dispatchTransport(payload: TransportPayload): Promise<boolean> {
     const serializedBytes = Buffer.isBuffer(payload.serialized)
       ? payload.serialized.length
       : Buffer.byteLength(payload.serialized, 'utf8');
@@ -687,17 +753,19 @@ export class ErrorCapturer {
       });
       this.deliveryDiagnostics.dropped += 1;
       this.healthMetrics?.recordDroppedCaptureFailed();
-      return;
+      return Promise.resolve(false);
     }
 
     this.healthMetrics?.recordCaptured();
     const start = Date.now();
 
-    let sendPromise = Promise.resolve()
+    let sendPromise: Promise<boolean>;
+    sendPromise = Promise.resolve()
       .then(() => this.transport.send(payload))
       .then(() => {
         this.deliveryDiagnostics.sent += 1;
         this.healthMetrics?.recordFlushLatency(Date.now() - start);
+        return true;
       })
       .catch((transportError) => {
         const reason =
@@ -767,11 +835,81 @@ export class ErrorCapturer {
           this.deliveryDiagnostics.dropped += 1;
           this.healthMetrics?.recordDroppedDlqWriteFailed();
         }
+        return true;
       })
       .finally(() => {
         this.pendingTransportDispatches.delete(sendPromise);
       });
 
     this.pendingTransportDispatches.add(sendPromise);
+    return sendPromise;
+  }
+
+  private dispatchPayloadBlobsAfter(
+    packageDispatch: Promise<boolean>,
+    pkg: ErrorPackage
+  ): void {
+    if (this.payloadSpool === null) {
+      return;
+    }
+
+    let blobDispatch: Promise<void>;
+    blobDispatch = packageDispatch.then(async (packageWasQueued) => {
+      if (!packageWasQueued) {
+        return;
+      }
+      await this.dispatchPayloadBlobs(pkg);
+    }).finally(() => {
+      this.pendingTransportDispatches.delete(blobDispatch);
+    });
+
+    this.pendingTransportDispatches.add(blobDispatch);
+  }
+
+  private async dispatchPayloadBlobs(pkg: ErrorPackage): Promise<void> {
+    if (this.payloadSpool === null) {
+      return;
+    }
+
+    const blobIds = new Set<string>();
+    for (const event of pkg.ioTimeline) {
+      if (event.requestPayloadRef?.storage === 'spool') {
+        blobIds.add(event.requestPayloadRef.blobId);
+      }
+      if (event.responsePayloadRef?.storage === 'spool') {
+        blobIds.add(event.responsePayloadRef.blobId);
+      }
+    }
+
+    const dispatches: Array<Promise<unknown>> = [];
+    for (const blobId of blobIds) {
+      const envelopeObject = this.payloadSpool.buildEnvelope(pkg.eventId, blobId);
+      if (envelopeObject === null) {
+        this.healthMetrics?.recordPayloadSpoolDrop();
+        emitSafeWarning(this.config, {
+          code: 'EC_PAYLOAD_SPOOL_DROPPED',
+          message: 'Payload blob reference could not be resolved during transport; blob dropped.',
+          context: {
+            eventId: pkg.eventId,
+            blobId
+          }
+        });
+        continue;
+      }
+      const result = finalizePayloadBlobAssemblyResult({
+        envelopeObject,
+        config: this.config,
+        encryption: this.encryption
+      });
+      dispatches.push(this.dispatchTransport({
+        kind: 'payload_blob',
+        serialized: result.payload,
+        ...(result.envelope === undefined ? {} : { envelope: result.envelope })
+      }));
+    }
+
+    if (dispatches.length > 0) {
+      await Promise.allSettled(dispatches);
+    }
   }
 }

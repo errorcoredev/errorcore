@@ -23,6 +23,7 @@ import {
 import { ProcessMetadata } from './capture/process-metadata';
 import { InspectorManager } from './capture/inspector-manager';
 import { BodyCapture } from './recording/body-capture';
+import { PayloadSpool } from './spool/payload-spool';
 import { StateTracker } from './state/state-tracker';
 import { HttpServerRecorder } from './recording/http-server';
 import { HttpClientRecorder } from './recording/http-client';
@@ -84,11 +85,15 @@ function deriveDeadLetterVerifier(
     };
   }
   // Fallback path: no encryption configured, but transport auth or
-  // string key may still be available. Single-key HMAC, no rotation
-  // chain (rotation only applies to encryptionKey).
+  // string key may still be available. Auth-only DLQ signatures use the
+  // current authorization first, followed by configured previous values
+  // so collector-token rotation does not strand recoverable records.
   const fallback = config.encryptionKey ?? transportAuthorization;
   if (fallback === undefined) return null;
-  return createHmacVerifier(fallback);
+  return createHmacVerifier([
+    fallback,
+    ...config.previousTransportAuthorizations
+  ]);
 }
 
 interface DeadLetterHealthState {
@@ -485,7 +490,8 @@ export class SDKInstance {
    * state. Safe to call from any SDK state, including before activate()
    * and after shutdown(). Never throws.
    *
-   * Counters (captured, dropped, droppedBreakdown.*, transportFailures)
+   * Counters (captured, dropped, droppedBreakdown.*, transportFailures,
+   * payloadSpool.*)
    * are monotonic since init(). Operators scrape this on an interval
    * and compute rates by differencing — matching the Prometheus counter
    * convention.
@@ -506,6 +512,7 @@ export class SDKInstance {
         breakdown.deadLetterWriteFailed,
       droppedBreakdown: breakdown,
       transportFailures: this.healthMetrics.getTransportFailures(),
+      payloadSpool: this.healthMetrics.getPayloadSpoolBreakdown(),
       transportQueueDepth: this.errorCapturer.getPendingTransportCount(),
       deadLetterDepth: this.deadLetterStore?.getPendingCount() ?? 0,
       deadLetter: this.deadLetterHealth,
@@ -735,13 +742,42 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     maxConcurrent: config.maxConcurrentRequests,
     ttlMs: 300000
   });
+  const healthMetrics = new HealthMetrics();
+  let errorCapturerForSpool: ErrorCapturer | null = null;
+  const payloadSpool = config.payloadSpool.enabled
+    ? new PayloadSpool({
+        globalMaxBytes: config.payloadSpool.globalMaxBytes,
+        perRequestMaxBytes: config.payloadSpool.perRequestMaxBytes,
+        perBlobMaxBytes: config.payloadSpool.perBlobMaxBytes,
+        previewBytes: config.payloadSpool.previewBytes,
+        completedTtlMs: config.payloadSpool.completedTtlMs,
+        getTransportQueueDepth: () =>
+          errorCapturerForSpool?.getPendingTransportCount() ?? 0,
+        onWarning: (warning) => {
+          if (warning.code === 'EC_PAYLOAD_SPOOL_PRESSURE') {
+            healthMetrics.recordPayloadSpoolPressure();
+          } else if (warning.code === 'EC_PAYLOAD_SPOOL_PREVIEW') {
+            healthMetrics.recordPayloadSpoolPreviewFallback();
+          } else if (warning.code === 'EC_PAYLOAD_SPOOL_DROPPED') {
+            healthMetrics.recordPayloadSpoolDrop();
+          }
+
+          try {
+            config.onInternalWarning?.(warning);
+          } catch {
+            // onInternalWarning must never crash the host.
+          }
+        }
+      })
+    : null;
   const bodyCapture = new BodyCapture({
     maxPayloadSize: config.maxPayloadSize,
     captureRequestBodies: config.captureRequestBodies,
     captureResponseBodies: config.captureResponseBodies,
     captureBodyDigest: config.captureBodyDigest,
     bodyCaptureContentTypes: config.bodyCaptureContentTypes,
-    scrubber
+    scrubber,
+    ...(payloadSpool === null ? {} : { payloadSpool })
   });
   const stateTracker = new StateTracker({ als, eventClock, config });
   const httpServerRecorder = new HttpServerRecorder({
@@ -751,7 +787,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     bodyCapture,
     headerFilter,
     scrubber,
-    config
+    config,
+    payloadSpool
   });
   const httpClientRecorder = new HttpClientRecorder({
     buffer,
@@ -793,6 +830,8 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
         ? null
         : new DeadLetterStore(config.deadLetterPath, {
             verifier: deadLetterVerifier,
+            maxSizeBytes: config.deadLetterMaxBytes,
+            maxBackups: config.deadLetterMaxBackups,
             maxPayloadBytes: config.serialization.maxTotalPackageSize + 16384,
             requireEncryptedPayload: config.encryptionKey !== undefined,
             onInternalWarning: config.onInternalWarning === undefined
@@ -848,8 +887,6 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     watchdog.start();
   }
 
-  const healthMetrics = new HealthMetrics();
-
   const errorCapturer = new ErrorCapturer({
     buffer,
     als,
@@ -868,8 +905,10 @@ export function createSDK(userConfig: Partial<SDKConfig> = {}): SDKInstance {
     deadLetterStore,
     sourceMapResolver,
     watchdog,
-    healthMetrics
+    healthMetrics,
+    payloadSpool
   });
+  errorCapturerForSpool = errorCapturer;
 
   return new SDKInstance({
     config,

@@ -478,6 +478,25 @@ describe('FileTransport', () => {
       const transport = new FileTransport({ path: '/tmp/test.log' });
       await expect(transport.flush()).resolves.toBeUndefined();
     });
+
+    it('opens an existing file read-write before fsyncing for Windows durability', async () => {
+      const transport = new FileTransport({ path: '/tmp/test.log' });
+
+      vi.spyOn(fs, 'open').mockImplementation((_path, _flags, callback) => {
+        (callback as Function)(null, 123);
+      });
+      const fsyncSpy = vi.spyOn(fs, 'fsync').mockImplementation((_fd, callback) => {
+        (callback as Function)();
+      });
+      vi.spyOn(fs, 'close').mockImplementation((_fd, callback) => {
+        (callback as Function)();
+      });
+
+      await transport.flush();
+
+      expect(fs.open).toHaveBeenCalledWith('/tmp/test.log', 'r+', expect.any(Function));
+      expect(fsyncSpy).toHaveBeenCalledWith(123, expect.any(Function));
+    });
   });
 
   describe('shutdown', () => {

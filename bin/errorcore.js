@@ -322,8 +322,8 @@ function cmdStatus(flags) {
     const { resolveConfig } = requireDist('config.js');
     const resolved = resolveConfig(userConfig);
     deadLetterPath = resolved.deadLetterPath;
-  } catch {
-    deadLetterPath = undefined;
+  } catch (err) {
+    die(err.message || String(err));
   }
 
   if (!deadLetterPath) {
@@ -425,10 +425,17 @@ async function cmdDrain(flags) {
       }
     };
   } else {
-    verifier = createHmacVerifier(integrityKey);
+    verifier = createHmacVerifier([
+      integrityKey,
+      ...(resolved.previousTransportAuthorizations || [])
+    ]);
   }
 
-  const store = new DeadLetterStore(deadLetterPath, { verifier });
+  const store = new DeadLetterStore(deadLetterPath, {
+    verifier,
+    maxSizeBytes: resolved.deadLetterMaxBytes,
+    maxBackups: resolved.deadLetterMaxBackups
+  });
 
   if (flags.rotate) {
     const result = store.reSignAll();
@@ -441,7 +448,9 @@ async function cmdDrain(flags) {
     return;
   }
 
-  const { entries, lineCount: snapshotLineCount } = store.drain();
+  const { entries, lineCount: snapshotLineCount } = store.drain({
+    allowLargeFile: true
+  });
 
   const payloads = entries.map((e) => e.payload);
   const payloadLineIndices = entries.map((e) => e.lineNumber - 1);

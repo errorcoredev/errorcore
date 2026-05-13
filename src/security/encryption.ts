@@ -13,7 +13,6 @@ import type { EncryptedEnvelope } from '../types';
 import { maybeCompress, maybeDecompress } from './compression';
 
 interface EncryptionOptions {
-  derivedKey?: Buffer;
   previousEncryptionKeys?: string[];
   /** Optional explicit MAC key (32+ bytes). When unset, derived from DEK. */
   macKey?: string | Buffer;
@@ -73,14 +72,9 @@ function computeKeyId(derivedKey: Buffer): string {
   return createHash('sha256').update(derivedKey).digest().slice(0, KEY_ID_PREFIX_BYTES).toString('hex');
 }
 
-function deriveKeys(encryptionKey: string | Buffer, options?: { macKey?: string | Buffer; derivedKey?: Buffer }): KeyMaterial {
+function deriveKeys(encryptionKey: string | Buffer, options?: { macKey?: string | Buffer }): KeyMaterial {
   const derivationSecret = readKeyMaterial(encryptionKey);
-  const derivedKey =
-    options?.derivedKey ??
-    pbkdf2Sync(derivationSecret, STATIC_KEY_SALT, 100000, 32, 'sha256');
-  if (derivedKey.length !== 32) {
-    throw new Error('Pre-derived key must be exactly 32 bytes');
-  }
+  const derivedKey = pbkdf2Sync(derivationSecret, STATIC_KEY_SALT, 100000, 32, 'sha256');
   const macKey = deriveMacKey(derivationSecret, options?.macKey);
   return {
     derivationSecret,
@@ -118,10 +112,11 @@ export class Encryption {
 
   public constructor(encryptionKey: string | Buffer, options?: EncryptionOptions) {
     const primary = deriveKeys(encryptionKey, {
-      macKey: options?.macKey,
-      derivedKey: options?.derivedKey
+      macKey: options?.macKey
     });
-    const previous = (options?.previousEncryptionKeys ?? []).map((k) => deriveKeys(k));
+    const previous = (options?.previousEncryptionKeys ?? []).map((k) => deriveKeys(k, {
+      macKey: options?.macKey
+    }));
     this.chain = [primary, ...previous];
     this.sdkVersion = options?.sdkVersion ?? 'unknown';
   }

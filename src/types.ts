@@ -38,6 +38,8 @@ export interface IOEventSlot {
   responseBody: Buffer | string | null;
   requestBodyDigest?: string | null;
   responseBodyDigest?: string | null;
+  requestPayloadRef?: PayloadBlobRef | null;
+  responsePayloadRef?: PayloadBlobRef | null;
   requestBodyTruncated: boolean;
   responseBodyTruncated: boolean;
   requestBodyOriginalSize: number | null;
@@ -51,6 +53,62 @@ export interface IOEventSlot {
     collection?: string;
   };
   estimatedBytes: number;
+}
+
+export type PayloadStorageMode = 'spool' | 'preview';
+
+export type PayloadPreviewReason =
+  | 'per_blob_cap'
+  | 'per_request_cap'
+  | 'global_cap'
+  | 'pressure'
+  | 'incomplete';
+
+export interface PayloadBlobRef {
+  blobId: string;
+  storage: PayloadStorageMode;
+  requestId: string | null;
+  lineageId: string | null;
+  mimeType: string | null;
+  size: number;
+  capturedSize: number;
+  sha256: string;
+  previewBytes: number;
+  previewTruncated: boolean;
+  reason?: PayloadPreviewReason;
+}
+
+export interface PayloadBlobEnvelope {
+  schemaVersion: '1.2.0';
+  kind: 'payload_blob';
+  eventId: string;
+  blobId: string;
+  requestId: string | null;
+  lineageId: string | null;
+  mimeType: string | null;
+  size: number;
+  capturedSize: number;
+  sha256: string;
+  bodyEncoding: 'base64';
+  body: string;
+  createdAt: string;
+}
+
+export interface StackBoundaryFrame {
+  functionName: string;
+  filePath: string;
+  lineNumber: number;
+  columnNumber: number;
+}
+
+export interface StackOwnershipMetadata {
+  origin: 'app' | 'external';
+  package?: string;
+  errorType: string;
+  appBoundaryFrame?: StackBoundaryFrame;
+  externalFramesCollapsed: boolean;
+  externalFrameCount: number;
+  appFrameCount: number;
 }
 
 export interface RequestContext {
@@ -236,6 +294,8 @@ export interface IOEventSerialized {
   responseBody: unknown | null;
   requestBodyDigest?: string | null;
   responseBodyDigest?: string | null;
+  requestPayloadRef?: PayloadBlobRef | null;
+  responsePayloadRef?: PayloadBlobRef | null;
   requestBodyTruncated: boolean;
   responseBodyTruncated: boolean;
   requestBodyOriginalSize: number | null;
@@ -304,7 +364,7 @@ export interface ProcessMetadata {
 }
 
 export interface ErrorPackage {
-  schemaVersion: '1.1.0';
+  schemaVersion: '1.1.0' | '1.2.0';
   /** Stable, per-event identifier minted at capture time (UUIDv4 today). */
   eventId: string;
   /**
@@ -319,6 +379,7 @@ export interface ErrorPackage {
   errorEventHrtimeNs: string;
   eventClockRange: { min: number; max: number };
   fingerprint?: string;
+  errorOrigin?: StackOwnershipMetadata;
   timeAnchor: TimeAnchor;
   error: {
     type: string;
@@ -484,6 +545,7 @@ export interface TransportPayload {
   serialized: string | Buffer;
   /** Parsed envelope metadata when the payload is an Errorcore envelope. */
   envelope?: Pick<EncryptedEnvelope, 'v' | 'eventId' | 'sdk' | 'keyId'>;
+  kind?: 'error' | 'payload_blob';
 }
 
 export interface SerializationLimits {
@@ -548,6 +610,9 @@ export type InternalWarningCode =
   | 'EC_SANITIZE_SKIP'
   | 'EC_PAYLOADS_DROPPED'
   | 'EC_PAYLOADS_DEAD_LETTERED'
+  | 'EC_PAYLOAD_SPOOL_PRESSURE'
+  | 'EC_PAYLOAD_SPOOL_PREVIEW'
+  | 'EC_PAYLOAD_SPOOL_DROPPED'
   // Deprecated snake_case literals retained for type-level back-compat.
   | 'rate_limited'
   | 'capture_failed'
@@ -601,7 +666,7 @@ export type EncryptionVerifyResult =
   | { ok: false };
 
 /**
- * Optional async callback for resolving the data-encryption key from a
+ * Optional synchronous callback for resolving the data-encryption key from a
  * KMS or other secret store. Called once at SDK init. Must return either
  * a 64-character hex string or a 32-byte Buffer.
  */
@@ -652,6 +717,14 @@ export interface SDKConfig {
   captureResponseBodies?: boolean;
   captureBody?: boolean;
   captureBodyDigest?: boolean;
+  payloadSpool?: {
+    enabled?: boolean;
+    globalMaxBytes?: number;
+    perRequestMaxBytes?: number;
+    perBlobMaxBytes?: number;
+    previewBytes?: number;
+    completedTtlMs?: number;
+  };
   bodyCaptureContentTypes?: string[];
   piiScrubber?: (key: string, value: unknown) => unknown;
   replaceDefaultScrubber?: boolean;
@@ -677,6 +750,20 @@ export interface SDKConfig {
   };
   silent?: boolean;
   logLevel?: LogLevel;
+  /**
+   * Previous HTTP Authorization values accepted when verifying auth-signed
+   * dead-letter records during transport auth rotation.
+   */
+  previousTransportAuthorizations?: string[];
+  /**
+   * Maximum dead-letter queue file size before writes rotate/drop according
+   * to transport policy. Defaults to 50 MB.
+   */
+  deadLetterMaxBytes?: number;
+  /**
+   * Number of rotated dead-letter queue backups to retain. Defaults to 5.
+   */
+  deadLetterMaxBackups?: number;
   sourceMapSyncThresholdBytes?: number;
   captureMiddlewareStatusCodes?: number[] | 'none' | 'all';
   traceContext?: {
@@ -727,6 +814,14 @@ export interface ResolvedConfig {
   captureResponseBodies: boolean;
   captureBody: boolean;
   captureBodyDigest: boolean;
+  payloadSpool: {
+    enabled: boolean;
+    globalMaxBytes: number;
+    perRequestMaxBytes: number;
+    perBlobMaxBytes: number;
+    previewBytes: number;
+    completedTtlMs: number;
+  };
   bodyCaptureContentTypes: string[];
   piiScrubber: ((key: string, value: unknown) => unknown) | undefined;
   replaceDefaultScrubber: boolean;
@@ -752,6 +847,9 @@ export interface ResolvedConfig {
   };
   silent: boolean;
   logLevel: LogLevel;
+  previousTransportAuthorizations: string[];
+  deadLetterMaxBytes: number;
+  deadLetterMaxBackups: number;
   sourceMapSyncThresholdBytes: number;
   captureMiddlewareStatusCodes: number[] | 'none' | 'all';
   traceContext: {
@@ -776,7 +874,6 @@ export interface PackageAssemblyEncryptionConfig {
   macKey?: string;
   previousEncryptionKeys: string[];
   sdkVersion: string;
-  derivedKeyHex?: string;
 }
 
 export interface PackageAssemblyWorkerData {

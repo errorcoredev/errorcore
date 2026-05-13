@@ -42,7 +42,8 @@ function createSdk(options?: { active?: boolean; throwOnCreate?: boolean }) {
         }),
         runWithContext: als.runWithContext.bind(als),
         getContext: als.getContext.bind(als),
-        getRequestId: als.getRequestId.bind(als)
+        getRequestId: als.getRequestId.bind(als),
+        getStore: als.getStore.bind(als)
       },
       requestTracker: {
         add: vi.fn((ctx: { requestId: string }) => {
@@ -55,6 +56,10 @@ function createSdk(options?: { active?: boolean; throwOnCreate?: boolean }) {
     als,
     getAddedContext: () => addedContext
   };
+}
+
+function createEmitter<T extends object>(fields: T): EventEmitter & T {
+  return Object.assign(new EventEmitter(), fields);
 }
 
 describe('middleware adapters', () => {
@@ -220,7 +225,7 @@ describe('middleware adapters', () => {
     expect(getAddedContext()?.headers).not.toHaveProperty('cookie');
   });
 
-  it('hapi plugin registers onRequest and enters ALS context', () => {
+  it('hapi plugin keeps ALS context active for the route lifecycle', () => {
     const { sdk, als, getAddedContext } = createSdk();
     let handler:
       | ((
@@ -233,6 +238,7 @@ describe('middleware adapters', () => {
           h: { continue: symbol }
         ) => symbol)
       | undefined;
+    const res = new EventEmitter() as EventEmitter & { finished?: boolean };
     const marker = Symbol('continue');
     const server = {
       ext: vi.fn((_name, extHandler) => {
@@ -252,22 +258,27 @@ describe('middleware adapters', () => {
           cookie: 'session=secret',
           'x-request-id': 'req-hapi'
         },
-        raw: { res: new EventEmitter() as EventEmitter & { finished?: boolean } }
+        raw: { res }
       },
       { continue: marker }
     );
+    const captured = getAddedContext();
+    const routeRequestId = als.getRequestId();
 
     expect(result).toBe(marker);
-    expect(als.getRequestId()).toBeUndefined();
+    expect(routeRequestId).toBe(captured?.requestId);
     expect(sdk.requestTracker.add).toHaveBeenCalledTimes(1);
-    expect(getAddedContext()).toMatchObject({
+    expect(captured).toMatchObject({
       headers: {
         host: 'service.local',
         'x-request-id': 'req-hapi'
       }
     });
-    expect(getAddedContext()?.headers).not.toHaveProperty('authorization');
-    expect(getAddedContext()?.headers).not.toHaveProperty('cookie');
+    expect(captured?.headers).not.toHaveProperty('authorization');
+    expect(captured?.headers).not.toHaveProperty('cookie');
+
+    res.emit('finish');
+    expect(als.getRequestId()).toBeUndefined();
   });
 
   it('raw handler wrapper exposes ALS context inside the handler', () => {
@@ -326,6 +337,283 @@ describe('middleware adapters', () => {
     );
 
     expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not re-enter user handlers when user code throws', async () => {
+    const expressSdk = createSdk().sdk;
+    const expressNext = vi.fn(() => {
+      throw new Error('express user boom');
+    });
+
+    expect(() =>
+      expressMiddleware(expressSdk)(
+        { method: 'GET', url: '/express-throw', headers: {} },
+        new EventEmitter() as never,
+        expressNext
+      )
+    ).toThrow('express user boom');
+    expect(expressNext).toHaveBeenCalledTimes(1);
+
+    const fastifySdk = createSdk().sdk;
+    let fastifyHook:
+      | ((request: { raw: { method: string; url: string; headers: Record<string, unknown> } }, reply: {
+          raw: EventEmitter & { finished?: boolean; on(event: 'finish', listener: () => void): void };
+        }, done: () => void) => void)
+      | undefined;
+    fastifyPlugin(fastifySdk)(
+      {
+        addHook: vi.fn((_name, handler) => {
+          fastifyHook = handler;
+        })
+      } as never,
+      {},
+      () => undefined
+    );
+    const fastifyNext = vi.fn(() => {
+      throw new Error('fastify user boom');
+    });
+
+    expect(() =>
+      fastifyHook?.(
+        { raw: { method: 'GET', url: '/fastify-throw', headers: {} } },
+        { raw: new EventEmitter() as EventEmitter & { finished?: boolean } },
+        fastifyNext
+      )
+    ).toThrow('fastify user boom');
+    expect(fastifyNext).toHaveBeenCalledTimes(1);
+
+    const koaSdk = createSdk().sdk;
+    const koaNext = vi.fn(async () => {
+      throw new Error('koa user boom');
+    });
+
+    await expect(
+      koaMiddleware(koaSdk)(
+        {
+          request: { method: 'GET', url: '/koa-throw', headers: {} },
+          res: new EventEmitter() as EventEmitter & { finished?: boolean }
+        } as never,
+        koaNext
+      )
+    ).rejects.toThrow('koa user boom');
+    expect(koaNext).toHaveBeenCalledTimes(1);
+
+    const rawSdk = createSdk().sdk;
+    const rawHandler = vi.fn(() => {
+      throw new Error('raw user boom');
+    });
+
+    expect(() =>
+      wrapHandler(rawHandler, rawSdk)(
+        { method: 'GET', url: '/raw-throw', headers: {} },
+        new EventEmitter() as never
+      )
+    ).toThrow('raw user boom');
+    expect(rawHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('cleans request tracking on close and only removes once', () => {
+    const express = createSdk();
+    const expressReq = createEmitter({ method: 'GET', url: '/express-close', headers: {} });
+    const expressRes = new EventEmitter() as EventEmitter & { finished?: boolean };
+
+    expressMiddleware(express.sdk)(expressReq as never, expressRes as never, () => undefined);
+    expressRes.emit('close');
+    expect(express.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+    expect(express.sdk.requestTracker.remove).toHaveBeenCalledWith(express.getAddedContext()?.requestId);
+    expressRes.emit('finish');
+    expect(express.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+
+    const fastify = createSdk();
+    let fastifyHook:
+      | ((request: { raw: EventEmitter & { method: string; url: string; headers: Record<string, unknown> } }, reply: {
+          raw: EventEmitter & { finished?: boolean; on(event: 'finish', listener: () => void): void };
+        }, done: () => void) => void)
+      | undefined;
+    fastifyPlugin(fastify.sdk)(
+      {
+        addHook: vi.fn((_name, handler) => {
+          fastifyHook = handler;
+        })
+      } as never,
+      {},
+      () => undefined
+    );
+    const fastifyReq = createEmitter({ method: 'GET', url: '/fastify-close', headers: {} });
+    const fastifyRes = new EventEmitter() as EventEmitter & { finished?: boolean };
+
+    fastifyHook?.({ raw: fastifyReq }, { raw: fastifyRes }, () => undefined);
+    fastifyRes.emit('close');
+    expect(fastify.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+    expect(fastify.sdk.requestTracker.remove).toHaveBeenCalledWith(fastify.getAddedContext()?.requestId);
+    fastifyRes.emit('finish');
+    expect(fastify.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+
+    const koa = createSdk();
+    const koaReq = createEmitter({ method: 'GET', url: '/koa-close', headers: {} });
+    const koaRes = new EventEmitter() as EventEmitter & { finished?: boolean };
+
+    void koaMiddleware(koa.sdk)(
+      {
+        request: { method: 'GET', url: '/koa-close', headers: {} },
+        req: koaReq,
+        res: koaRes
+      } as never,
+      async () => undefined
+    );
+    koaRes.emit('close');
+    expect(koa.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+    expect(koa.sdk.requestTracker.remove).toHaveBeenCalledWith(koa.getAddedContext()?.requestId);
+    koaRes.emit('finish');
+    expect(koa.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+
+    const hapi = createSdk();
+    let hapiHandler:
+      | ((request: {
+          method: string;
+          url: { pathname: string };
+          headers: Record<string, unknown>;
+          raw: {
+            req: EventEmitter & { method: string; url: string; headers: Record<string, unknown> };
+            res: EventEmitter & { finished?: boolean };
+          };
+        }, h: { continue: symbol }) => symbol)
+      | undefined;
+    hapiPlugin.register(
+      {
+        ext: vi.fn((_name, handler) => {
+          hapiHandler = handler;
+        })
+      } as never,
+      { sdk: hapi.sdk }
+    );
+    const hapiReq = createEmitter({ method: 'GET', url: '/hapi-close', headers: {} });
+    const hapiRes = new EventEmitter() as EventEmitter & { finished?: boolean };
+
+    hapiHandler?.(
+      {
+        method: 'get',
+        url: { pathname: '/hapi-close' },
+        headers: {},
+        raw: { req: hapiReq, res: hapiRes }
+      },
+      { continue: Symbol('continue') }
+    );
+    hapiRes.emit('close');
+    expect(hapi.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+    expect(hapi.sdk.requestTracker.remove).toHaveBeenCalledWith(hapi.getAddedContext()?.requestId);
+    hapiRes.emit('finish');
+    expect(hapi.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+
+    const raw = createSdk();
+    const rawReq = createEmitter({ method: 'GET', url: '/raw-close', headers: {} });
+    const rawRes = new EventEmitter() as EventEmitter & { finished?: boolean };
+
+    wrapHandler((_req, _res) => undefined, raw.sdk)(rawReq, rawRes);
+    rawRes.emit('close');
+    expect(raw.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+    expect(raw.sdk.requestTracker.remove).toHaveBeenCalledWith(raw.getAddedContext()?.requestId);
+    rawRes.emit('finish');
+    expect(raw.sdk.requestTracker.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it('cleans request tracking when the incoming request is aborted', () => {
+    const express = createSdk();
+    const expressReq = createEmitter({ method: 'GET', url: '/express-abort', headers: {} });
+
+    expressMiddleware(express.sdk)(
+      expressReq as never,
+      new EventEmitter() as EventEmitter & { finished?: boolean } as never,
+      () => undefined
+    );
+    expressReq.emit('aborted');
+    expect(express.sdk.requestTracker.remove).toHaveBeenCalledWith(express.getAddedContext()?.requestId);
+
+    const fastify = createSdk();
+    let fastifyHook:
+      | ((request: { raw: EventEmitter & { method: string; url: string; headers: Record<string, unknown> } }, reply: {
+          raw: EventEmitter & { finished?: boolean; on(event: 'finish', listener: () => void): void };
+        }, done: () => void) => void)
+      | undefined;
+    fastifyPlugin(fastify.sdk)(
+      {
+        addHook: vi.fn((_name, handler) => {
+          fastifyHook = handler;
+        })
+      } as never,
+      {},
+      () => undefined
+    );
+    const fastifyReq = createEmitter({ method: 'GET', url: '/fastify-abort', headers: {} });
+
+    fastifyHook?.(
+      { raw: fastifyReq },
+      { raw: new EventEmitter() as EventEmitter & { finished?: boolean } },
+      () => undefined
+    );
+    fastifyReq.emit('aborted');
+    expect(fastify.sdk.requestTracker.remove).toHaveBeenCalledWith(fastify.getAddedContext()?.requestId);
+
+    const koa = createSdk();
+    const koaReq = createEmitter({ method: 'GET', url: '/koa-abort', headers: {} });
+
+    void koaMiddleware(koa.sdk)(
+      {
+        request: { method: 'GET', url: '/koa-abort', headers: {} },
+        req: koaReq,
+        res: new EventEmitter() as EventEmitter & { finished?: boolean }
+      } as never,
+      async () => undefined
+    );
+    koaReq.emit('aborted');
+    expect(koa.sdk.requestTracker.remove).toHaveBeenCalledWith(koa.getAddedContext()?.requestId);
+
+    const hapi = createSdk();
+    let hapiHandler:
+      | ((request: {
+          method: string;
+          url: { pathname: string };
+          headers: Record<string, unknown>;
+          raw: {
+            req: EventEmitter & { method: string; url: string; headers: Record<string, unknown> };
+            res: EventEmitter & { finished?: boolean };
+          };
+        }, h: { continue: symbol }) => symbol)
+      | undefined;
+    hapiPlugin.register(
+      {
+        ext: vi.fn((_name, handler) => {
+          hapiHandler = handler;
+        })
+      } as never,
+      { sdk: hapi.sdk }
+    );
+    const hapiReq = createEmitter({ method: 'GET', url: '/hapi-abort', headers: {} });
+
+    hapiHandler?.(
+      {
+        method: 'get',
+        url: { pathname: '/hapi-abort' },
+        headers: {},
+        raw: {
+          req: hapiReq,
+          res: new EventEmitter() as EventEmitter & { finished?: boolean }
+        }
+      },
+      { continue: Symbol('continue') }
+    );
+    hapiReq.emit('aborted');
+    expect(hapi.sdk.requestTracker.remove).toHaveBeenCalledWith(hapi.getAddedContext()?.requestId);
+
+    const raw = createSdk();
+    const rawReq = createEmitter({ method: 'GET', url: '/raw-abort', headers: {} });
+
+    wrapHandler((_req, _res) => undefined, raw.sdk)(
+      rawReq,
+      new EventEmitter() as EventEmitter & { finished?: boolean }
+    );
+    rawReq.emit('aborted');
+    expect(raw.sdk.requestTracker.remove).toHaveBeenCalledWith(raw.getAddedContext()?.requestId);
   });
 
   it('skips duplicate context creation when a request context already exists', async () => {
