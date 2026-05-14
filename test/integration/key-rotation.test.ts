@@ -31,7 +31,7 @@ describe('dead-letter store key rotation', () => {
     expect(oldStore.getPendingCount()).toBe(1);
 
     // Rotation gotcha: handing PRIMARY+PREV to a fresh Encryption won't
-    // verify the old entry. Encryption derives HMAC keys via PBKDF2, but
+    // verify the old entry. Encryption derives HMAC keys via HKDF, but
     // the legacy store wrote a raw HMAC over PREV. We chain two raw-HMAC
     // verifiers to bridge that until reSignAll runs.
     const verifier = {

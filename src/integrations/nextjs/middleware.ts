@@ -12,6 +12,7 @@
 import {
   filterHeaders,
   getModuleInstance,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike,
 } from '../../middleware/common';
@@ -44,7 +45,7 @@ async function runMiddlewareWithCapture<TReq extends NextRequestLike, TResult>(
   try {
     result = await middleware(req);
   } catch (middlewareError) {
-    if (instance.captureError !== undefined && middlewareError instanceof Error) {
+    if (instance.captureError !== undefined) {
       try { instance.captureError(middlewareError); } catch {}
     }
     throw middlewareError;
@@ -74,7 +75,9 @@ export function withNextMiddleware<TReq extends NextRequestLike, TResult>(
   sdk?: MiddlewareSDKLike,
 ): (req: TReq) => Promise<TResult> {
   return async (req: TReq): Promise<TResult> => {
-    const instance = (sdk as MiddlewareSDKLike | null | undefined) ?? getModuleInstance() as MiddlewareSDKLike | null;
+    const instance = resolveLiveSDK(
+      (sdk as MiddlewareSDKLike | null | undefined) ?? getModuleInstance()
+    ) as MiddlewareSDKLike | null;
 
     if (instance === null || instance === undefined || !instance.isActive()) {
       warnIfUninitialized('withNextMiddleware()');

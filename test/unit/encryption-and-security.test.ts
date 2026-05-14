@@ -6,8 +6,11 @@ import {
   createPackageAssemblyEncryptionConfig
 } from '../../src/security/encryption-runtime';
 import { RateLimiter } from '../../src/security/rate-limiter';
+import type { EncryptedEnvelope } from '../../src/types';
 
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+const STATIC_KEY_SALT = Buffer.from('errorcore-v1-key-derivation', 'utf8');
+const MAC_DERIVATION_SALT = Buffer.from('errorcore-v1-mac-key', 'utf8');
 
 function makeEnv(eventId = 'evt-test'): { eventId: string } {
   return { eventId };
@@ -15,6 +18,56 @@ function makeEnv(eventId = 'evt-test'): { eventId: string } {
 
 function buf(s: string): Buffer {
   return Buffer.from(s, 'utf8');
+}
+
+function asBuffer(value: Buffer | ArrayBuffer): Buffer {
+  return Buffer.isBuffer(value) ? value : Buffer.from(value);
+}
+
+function buildLegacyPbkdf2Envelope(
+  encryptionKey: string,
+  plaintext: string,
+  opts: { eventId: string; sdkVersion: string }
+): EncryptedEnvelope {
+  const {
+    createCipheriv,
+    createHash,
+    createHmac,
+    pbkdf2Sync
+  } = require('node:crypto') as typeof import('node:crypto');
+
+  const secret = Buffer.from(encryptionKey, 'utf8');
+  const derivedKey = pbkdf2Sync(secret, STATIC_KEY_SALT, 100000, 32, 'sha256');
+  const macKey = pbkdf2Sync(secret, MAC_DERIVATION_SALT, 100000, 32, 'sha256');
+  const keyId = createHash('sha256').update(derivedKey).digest().slice(0, 8).toString('hex');
+  const aad = Buffer.from(`1|${keyId}|${opts.sdkVersion}|${opts.eventId}`, 'utf8');
+  const iv = Buffer.from('00112233445566778899aabb', 'hex');
+  const cipher = createCipheriv('aes-256-gcm', derivedKey, iv);
+  cipher.setAAD(aad);
+  const ciphertext = Buffer.concat([
+    cipher.update(Buffer.from(plaintext, 'utf8')),
+    cipher.final()
+  ]);
+  const authTag = cipher.getAuthTag();
+  const hmac = createHmac('sha256', macKey)
+    .update(iv)
+    .update(ciphertext)
+    .update(authTag)
+    .update(aad)
+    .digest('base64');
+
+  return {
+    v: 1,
+    eventId: opts.eventId,
+    sdk: { name: 'errorcore', version: opts.sdkVersion },
+    keyId,
+    iv: iv.toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+    authTag: authTag.toString('base64'),
+    hmac,
+    compressed: false,
+    producedAt: 1
+  };
 }
 
 describe('Encryption', () => {
@@ -146,22 +199,72 @@ describe('Encryption', () => {
       .toBeUndefined();
   });
 
-  it('verifies sign against Node createHmac using the v1 mac salt', async () => {
-    const { createHmac, pbkdf2Sync } = await import('node:crypto');
+  it('verifies sign against Node createHmac using HKDF and the v1 mac salt', async () => {
+    const { createHmac, hkdfSync } = await import('node:crypto');
 
     const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
-    const expectedKey = pbkdf2Sync(
+    const expectedKey = asBuffer(hkdfSync(
+      'sha256',
       Buffer.from('top-secret-key', 'utf8'),
       Buffer.from('errorcore-v1-mac-key', 'utf8'),
-      100000,
-      32,
-      'sha256'
-    );
+      Buffer.alloc(0),
+      32
+    ));
     const expectedSig = createHmac('sha256', expectedKey)
       .update('payload')
       .digest('base64');
 
     expect(encryption.sign('payload')).toBe(expectedSig);
+  });
+
+  it('treats 64-character hex encryption keys as 32 random bytes for HKDF', async () => {
+    const { createHash, hkdfSync } = await import('node:crypto');
+    const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const expectedDerivedKey = asBuffer(hkdfSync(
+      'sha256',
+      Buffer.from(hexKey, 'hex'),
+      Buffer.from('errorcore-v1-key-derivation', 'utf8'),
+      Buffer.alloc(0),
+      32
+    ));
+    const expectedKeyId = createHash('sha256')
+      .update(expectedDerivedKey)
+      .digest()
+      .slice(0, 8)
+      .toString('hex');
+
+    const encryption = new Encryption(hexKey, { sdkVersion: '0.3.0' });
+
+    expect(encryption.primaryKeyId).toBe(expectedKeyId);
+  });
+
+  it('decrypts envelopes produced by the legacy PBKDF2 key derivation', () => {
+    const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const envelope = buildLegacyPbkdf2Envelope(hexKey, 'legacy secret', {
+      eventId: 'evt-legacy',
+      sdkVersion: '0.2.0'
+    });
+    const encryption = new Encryption(hexKey, { sdkVersion: '0.2.0' });
+
+    expect(encryption.decrypt(envelope)).toBe('legacy secret');
+  });
+
+  it('verifies payload MACs produced by the legacy PBKDF2 derivation', () => {
+    const { createHmac, pbkdf2Sync } = require('node:crypto') as typeof import('node:crypto');
+    const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const legacyMacKey = pbkdf2Sync(
+      Buffer.from(hexKey, 'utf8'),
+      Buffer.from('errorcore-v1-mac-key', 'utf8'),
+      100000,
+      32,
+      'sha256'
+    );
+    const legacyMac = createHmac('sha256', legacyMacKey)
+      .update('payload')
+      .digest('base64');
+    const encryption = new Encryption(hexKey, { sdkVersion: '0.3.0' });
+
+    expect(encryption.verify('payload', legacyMac)).toEqual({ ok: true, keyIndex: 0 });
   });
 
   it('rejects an explicit MAC key shorter than 32 bytes', () => {

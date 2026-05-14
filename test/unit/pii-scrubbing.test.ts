@@ -301,7 +301,45 @@ describe('Scrubber', () => {
       scrubber.scrubBodyBuffer(Buffer.from('raw multipart secret'), {
         'content-type': 'multipart/form-data; boundary=abc123'
       }).toString('utf8')
-    ).toBe('[MULTIPART BODY OMITTED]');
+    ).toBe('MULTIPART_REDACTED');
+  });
+
+  it('only bypasses value-pattern scrubbing for SDK-owned infrastructure paths', () => {
+    const scrubber = new Scrubber(resolveConfig({}));
+    const luhnLikeHrtime = '4111111111111111';
+
+    const scrubbed = scrubber.scrubObject({
+      errorEventHrtimeNs: luhnLikeHrtime,
+      ioTimeline: [
+        {
+          seq: 1,
+          hrtimeNs: luhnLikeHrtime,
+          startTime: luhnLikeHrtime,
+          requestBody: {
+            hrtimeNs: luhnLikeHrtime
+          }
+        }
+      ],
+      error: {
+        properties: {
+          hrtimeNs: luhnLikeHrtime
+        }
+      }
+    }) as {
+      errorEventHrtimeNs: string;
+      ioTimeline: Array<{
+        hrtimeNs: string;
+        startTime: string;
+        requestBody: { hrtimeNs: string };
+      }>;
+      error: { properties: { hrtimeNs: string } };
+    };
+
+    expect(scrubbed.errorEventHrtimeNs).toBe(luhnLikeHrtime);
+    expect(scrubbed.ioTimeline[0].hrtimeNs).toBe(luhnLikeHrtime);
+    expect(scrubbed.ioTimeline[0].startTime).toBe(luhnLikeHrtime);
+    expect(scrubbed.ioTimeline[0].requestBody.hrtimeNs).toBe('[REDACTED]');
+    expect(scrubbed.error.properties.hrtimeNs).toBe('[REDACTED]');
   });
 
   describe('scrubBodyBuffer — structural JSON walk', () => {

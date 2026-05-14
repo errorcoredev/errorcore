@@ -76,7 +76,7 @@ describe('SDK composition', () => {
     }
   });
 
-  it('does not call process.exit when the host has its own uncaughtException handler', () => {
+  it('does not call process.exit when the host has its own uncaughtException handler', async () => {
     // Regression: the previous behavior was that the SDK always forced
     // process.exit(1) after capturing an uncaught exception, even when
     // the host application had installed its own handler that expected
@@ -115,8 +115,7 @@ describe('SDK composition', () => {
     } finally {
       process.off('uncaughtException', existingHostHandler);
       if (sdk !== undefined) {
-        // Avoid shutdown side effects that would call exit in production.
-        void sdk.shutdown().catch(() => undefined);
+        await sdk.shutdown();
       }
       exitSpy.mockRestore();
     }
@@ -200,7 +199,7 @@ describe('SDK composition', () => {
     });
     const payload = JSON.stringify(envelope);
     // The SDK reads the dead-letter file with an Encryption-derived HMAC
-    // (PBKDF2 of encryptionKey under the hmac-key salt). Sign the fixture
+    // (HKDF of encryptionKey under the hmac-key salt). Sign the fixture
     // through the same Encryption instance so verification succeeds when
     // the SDK replays it.
     const store = new DeadLetterStore(deadLetterPath, {
@@ -448,6 +447,81 @@ describe('SDK composition', () => {
       expect(captureSpy).toHaveBeenCalledTimes(1);
     } finally {
       await sdk.shutdown();
+    }
+  });
+
+  it('normalizes primitive thrown values before direct capture', async () => {
+    const sdk = createTestSDK();
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture').mockReturnValue(null);
+
+    try {
+      sdk.activate();
+      sdk.captureError('secret=super-secret' as unknown);
+
+      const normalized = captureSpy.mock.calls[0]?.[0] as Error & {
+        thrownType?: string;
+        thrownValue?: unknown;
+      };
+      expect(normalized).toBeInstanceOf(Error);
+      expect(normalized.name).toBe('NonErrorThrown');
+      expect(normalized.message).toBe('Non-Error thrown (string)');
+      expect(normalized.thrownType).toBe('string');
+      expect(normalized.thrownValue).toBe('secret=[REDACTED]');
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('normalizes unhandledRejection reasons before capture', async () => {
+    const sdk = createTestSDK();
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture').mockReturnValue(null);
+    const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => true);
+
+    try {
+      sdk.activate();
+      const listeners = process.listeners('unhandledRejection');
+      const sdkHandler = listeners[listeners.length - 1] as (reason: unknown) => void;
+
+      sdkHandler({ card: '4111111111111111' });
+
+      const normalized = captureSpy.mock.calls[0]?.[0] as Error & {
+        thrownType?: string;
+        thrownValue?: unknown;
+      };
+      expect(normalized.name).toBe('NonErrorThrown');
+      expect(normalized.thrownType).toBe('object');
+      expect(normalized.thrownValue).toEqual({ card: '[REDACTED]' });
+    } finally {
+      warnSpy.mockRestore();
+      await sdk.shutdown();
+    }
+  });
+
+  it('does not let SDK uncaughtException capture failures escape when the host has a handler', async () => {
+    const existingHostHandler = vi.fn();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined as never) as typeof process.exit);
+    process.on('uncaughtException', existingHostHandler);
+
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      useWorkerAssembly: false
+    });
+    vi.spyOn(sdk.errorCapturer, 'capture').mockImplementation(() => {
+      throw new Error('capture pipeline failed');
+    });
+
+    try {
+      sdk.activate();
+      const listeners = process.listeners('uncaughtException');
+      const sdkHandler = listeners[listeners.length - 1] as (err: unknown) => void;
+
+      expect(() => sdkHandler('primitive-crash')).not.toThrow();
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.off('uncaughtException', existingHostHandler);
+      await sdk.shutdown();
+      exitSpy.mockRestore();
     }
   });
 

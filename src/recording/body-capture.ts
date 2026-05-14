@@ -5,6 +5,7 @@ import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http';
 import {
   getBodyEncoding,
   isTextualContentType,
+  MULTIPART_REDACTED,
   scrubKeyValueAssignments
 } from '../pii/scrubber';
 import type { IOEventSlot, PayloadBlobRef, RequestContext } from '../types';
@@ -125,6 +126,14 @@ function isPlainTextContentType(contentType: string | undefined): boolean {
   }
 
   return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'text/plain';
+}
+
+function isMultipartContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) {
+    return false;
+  }
+
+  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'multipart/form-data';
 }
 
 function scrubPlainTextKeyValues(buffer: Buffer, contentType: string | undefined): Buffer {
@@ -485,7 +494,22 @@ export class BodyCapture {
     seq: number,
     onBytesChanged: (oldBytes: number, newBytes: number) => void
   ): void {
-    if (!this.isRequestCaptureEnabled() || !this.shouldCaptureHeaders(slot.requestHeaders)) {
+    if (!this.isRequestCaptureEnabled()) {
+      return;
+    }
+
+    if (this.shouldRecordMultipartMarker(slot.requestHeaders)) {
+      this.recordMultipartMarker(
+        slot,
+        'requestBody',
+        'requestBodyDigest',
+        'requestBodyOriginalSize',
+        onBytesChanged
+      );
+      return;
+    }
+
+    if (!this.shouldCaptureHeaders(slot.requestHeaders)) {
       return;
     }
 
@@ -563,7 +587,22 @@ export class BodyCapture {
     seq: number,
     onBytesChanged: (oldBytes: number, newBytes: number) => void
   ): void {
-    if (!this.isRequestCaptureEnabled() || !this.shouldCaptureHeaders(slot.requestHeaders)) {
+    if (!this.isRequestCaptureEnabled()) {
+      return;
+    }
+
+    if (this.shouldRecordMultipartMarker(slot.requestHeaders)) {
+      this.recordMultipartMarker(
+        slot,
+        'requestBody',
+        'requestBodyDigest',
+        'requestBodyOriginalSize',
+        onBytesChanged
+      );
+      return;
+    }
+
+    if (!this.shouldCaptureHeaders(slot.requestHeaders)) {
       return;
     }
 
@@ -603,7 +642,20 @@ export class BodyCapture {
     body: unknown,
     onBytesChanged: (oldBytes: number, newBytes: number) => void
   ): AsyncGenerator<unknown> | undefined {
-    if (!this.isRequestCaptureEnabled() || !this.shouldCaptureHeaders(slot.requestHeaders)) {
+    if (!this.isRequestCaptureEnabled()) {
+      return undefined;
+    }
+    if (this.shouldRecordMultipartMarker(slot.requestHeaders)) {
+      this.recordMultipartMarker(
+        slot,
+        'requestBody',
+        'requestBodyDigest',
+        'requestBodyOriginalSize',
+        onBytesChanged
+      );
+      return undefined;
+    }
+    if (!this.shouldCaptureHeaders(slot.requestHeaders)) {
       return undefined;
     }
     if (body === null || body === undefined) {
@@ -964,6 +1016,27 @@ export class BodyCapture {
 
   private shouldCaptureHeaders(headers: Record<string, string> | null | undefined): boolean {
     return this.shouldCaptureContentTypeHeader(headers?.['content-type']);
+  }
+
+  private shouldRecordMultipartMarker(
+    headers: Record<string, string> | null | undefined
+  ): boolean {
+    return isMultipartContentType(headers?.['content-type']);
+  }
+
+  private recordMultipartMarker(
+    slot: IOEventSlot,
+    bodyKey: 'requestBody' | 'responseBody',
+    digestKey: 'requestBodyDigest' | 'responseBodyDigest',
+    originalSizeKey: 'requestBodyOriginalSize' | 'responseBodyOriginalSize',
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void {
+    const oldBytes = slot.estimatedBytes;
+    slot[bodyKey] = MULTIPART_REDACTED;
+    slot[digestKey] = null;
+    slot[originalSizeKey] = null;
+    slot.estimatedBytes = estimateBytes(slot);
+    onBytesChanged(oldBytes, slot.estimatedBytes);
   }
 
   private shouldCaptureContentTypeHeader(contentType: unknown): boolean {

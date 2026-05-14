@@ -25,7 +25,7 @@ export function init(_config?: Partial<SDKConfig>): void {
   // no-op under Edge runtime
 }
 
-export function captureError(_error: Error): void {
+export function captureError(_error: unknown): void {
   // no-op
 }
 

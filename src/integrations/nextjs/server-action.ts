@@ -12,6 +12,7 @@
 
 import {
   getModuleInstance,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike,
 } from '../../middleware/common';
@@ -27,7 +28,7 @@ async function runActionWithCapture<TArgs extends unknown[], TResult>(
   try {
     return await action(...args);
   } catch (error) {
-    if (instance.captureError !== undefined && error instanceof Error) {
+    if (instance.captureError !== undefined) {
       try { instance.captureError(error); } catch {}
     }
     throw error;
@@ -40,7 +41,7 @@ export function withServerAction<TArgs extends unknown[], TResult>(
   sdk?: SDKInstanceLike,
 ): (...args: TArgs) => Promise<TResult> {
   return async (...args: TArgs): Promise<TResult> => {
-    const instance = sdk ?? getModuleInstance();
+    const instance = resolveLiveSDK(sdk ?? getModuleInstance());
 
     if (instance === null || !instance.isActive()) {
       warnIfUninitialized('withServerAction()');

@@ -672,6 +672,9 @@ export type EncryptionVerifyResult =
  */
 export type EncryptionKeyCallback = () => string | Buffer;
 
+export type DriverResolver = () => unknown;
+export type DriverSpecifier = object | Function | string | DriverResolver;
+
 export interface SDKConfig {
   bufferSize?: number;
   bufferMaxBytes?: number;
@@ -686,8 +689,7 @@ export interface SDKConfig {
   encryptionKey?: string;
   /**
    * Optional separate MAC key (64-char hex). When unset, the SDK derives
-   * a MAC sub-key from the DEK via PBKDF2 with a distinct salt — back-
-   * compatible with the single-secret config. Setting both lets operators
+   * a MAC sub-key from the DEK via HKDF with a distinct salt. Setting both lets operators
    * rotate the encryption and authentication keys independently.
    */
   macKey?: string;
@@ -743,10 +745,10 @@ export interface SDKConfig {
   serverless?: boolean | 'auto';
   onInternalWarning?: (warning: InternalWarning) => void;
   drivers?: {
-    pg?: unknown;
-    mongodb?: unknown;
-    mysql2?: unknown;
-    ioredis?: unknown;
+    pg?: DriverSpecifier;
+    mongodb?: DriverSpecifier;
+    mysql2?: DriverSpecifier;
+    ioredis?: DriverSpecifier;
   };
   silent?: boolean;
   logLevel?: LogLevel;
@@ -840,10 +842,10 @@ export interface ResolvedConfig {
   serverless: boolean;
   onInternalWarning: ((warning: InternalWarning) => void) | undefined;
   drivers: {
-    pg?: unknown;
-    mongodb?: unknown;
-    mysql2?: unknown;
-    ioredis?: unknown;
+    pg?: DriverSpecifier;
+    mongodb?: DriverSpecifier;
+    mysql2?: DriverSpecifier;
+    ioredis?: DriverSpecifier;
   };
   silent: boolean;
   logLevel: LogLevel;

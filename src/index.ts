@@ -102,7 +102,7 @@ export function init(config?: Partial<SDKConfig>): SDKInstance {
   }
 }
 
-export function captureError(error: Error): void {
+export function captureError(error: unknown): void {
   const instance = getGlobalInstance();
 
   if (instance === null) {

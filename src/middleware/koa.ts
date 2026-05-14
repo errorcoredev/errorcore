@@ -2,6 +2,8 @@
 import {
   filterHeaders,
   getModuleInstance,
+  prepareForRequestStart,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
@@ -16,12 +18,14 @@ export function koaMiddleware(sdk?: SDKInstanceLike) {
     },
     next: () => Promise<unknown>
   ): Promise<unknown> => {
-    const instance = sdk ?? getModuleInstance();
+    const instance = resolveLiveSDK(sdk ?? getModuleInstance());
 
     if (instance === null || !instance.isActive()) {
       warnIfUninitialized('koaMiddleware()');
       return next();
     }
+
+    prepareForRequestStart(instance);
 
     if (ctx.res.finished === true || instance.als.getContext?.() !== undefined) {
       return next();

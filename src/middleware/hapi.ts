@@ -2,6 +2,8 @@
 import {
   filterHeaders,
   getModuleInstance,
+  prepareForRequestStart,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
@@ -56,12 +58,14 @@ export const hapiPlugin = {
     options: { sdk?: SDKInstanceLike }
   ): void {
     server.ext('onRequest', (request, h) => {
-      const instance = options.sdk ?? getModuleInstance();
+      const instance = resolveLiveSDK(options.sdk ?? getModuleInstance());
 
       if (instance === null || !instance.isActive()) {
         warnIfUninitialized('hapiPlugin');
         return h.continue;
       }
+
+      prepareForRequestStart(instance);
 
       if (request.raw.res.finished === true || instance.als.getContext?.() !== undefined) {
         return h.continue;

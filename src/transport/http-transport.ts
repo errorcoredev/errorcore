@@ -43,6 +43,14 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+function applyRetryJitter(ms: number): number {
+  return Math.round(ms * (0.8 + Math.random() * 0.4));
+}
+
+function createTimeoutError(): Error {
+  return new Error(HTTP_TRANSPORT_TIMEOUT_MESSAGE);
+}
+
 function parseRetryAfter(value: string | string[] | undefined): number | undefined {
   const raw = Array.isArray(value) ? value[0] : value;
   if (raw === undefined) return undefined;
@@ -244,7 +252,7 @@ export class HttpTransport {
               response.on('data', () => undefined);
               response.on('end', () => {
                 if (statusCode >= 200 && statusCode < 300) {
-                  resolve();
+                  settle(resolve);
                   return;
                 }
 
@@ -254,19 +262,42 @@ export class HttpTransport {
                 };
                 statusError.statusCode = statusCode;
                 statusError.retryAfterMs = parseRetryAfter(response.headers?.['retry-after']);
-                reject(statusError);
+                settle(() => reject(statusError));
               });
             }
           )
         );
+        let settled = false;
+        let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const settle = (fn: () => void): void => {
+          if (settled) return;
+          settled = true;
+          if (deadlineTimer !== null) {
+            clearTimeout(deadlineTimer);
+            deadlineTimer = null;
+          }
+          fn();
+        };
+
+        const failWithTimeout = (): void => {
+          const timeoutError = createTimeoutError();
+          request.destroy(timeoutError);
+          settle(() => reject(timeoutError));
+        };
 
         request.on('error', (error) => {
-          reject(error);
+          settle(() => reject(error));
         });
 
         request.setTimeout(this.timeoutMs, () => {
-          request.destroy(new Error(HTTP_TRANSPORT_TIMEOUT_MESSAGE));
+          failWithTimeout();
         });
+
+        deadlineTimer = setTimeout(() => {
+          failWithTimeout();
+        }, this.timeoutMs);
+        deadlineTimer.unref();
 
         request.write(body);
         request.end();
@@ -313,17 +344,31 @@ export class HttpTransport {
             let settled = false;
             let statusCode = 500;
             let retryAfterMs: number | undefined;
+            let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
 
             const settle = (fn: () => void): void => {
               if (settled) return;
               settled = true;
+              if (deadlineTimer !== null) {
+                clearTimeout(deadlineTimer);
+                deadlineTimer = null;
+              }
               fn();
             };
 
-            stream.setTimeout(this.timeoutMs, () => {
+            const failWithTimeout = (): void => {
               stream.close();
-              settle(() => reject(new Error(HTTP_TRANSPORT_TIMEOUT_MESSAGE)));
+              settle(() => reject(createTimeoutError()));
+            };
+
+            stream.setTimeout(this.timeoutMs, () => {
+              failWithTimeout();
             });
+
+            deadlineTimer = setTimeout(() => {
+              failWithTimeout();
+            }, this.timeoutMs);
+            deadlineTimer.unref();
 
             stream.on('response', (headers) => {
               const rawStatus = headers[http2.constants.HTTP2_HEADER_STATUS];
@@ -494,7 +539,9 @@ export class HttpTransport {
       return null;
     }
 
-    const configuredDelay = error.retryAfterMs ?? RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]!;
+    const configuredDelay = error.retryAfterMs ?? applyRetryJitter(
+      RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]!
+    );
     return Math.min(configuredDelay, remainingBudget);
   }
 }

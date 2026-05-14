@@ -41,10 +41,12 @@ function createSdk(options?: { active?: boolean; throwOnCreate?: boolean }) {
           return als.createRequestContext(input);
         }),
         runWithContext: als.runWithContext.bind(als),
+        enterWithContext: vi.fn(als.enterWithContext.bind(als)),
         getContext: als.getContext.bind(als),
         getRequestId: als.getRequestId.bind(als),
         getStore: als.getStore.bind(als)
       },
+      prepareForRequestStart: vi.fn(),
       requestTracker: {
         add: vi.fn((ctx: { requestId: string }) => {
           addedContext = ctx;
@@ -126,6 +128,142 @@ describe('middleware adapters', () => {
     expect(sdk.requestTracker.add).not.toHaveBeenCalled();
   });
 
+  it('falls back to the active module SDK when a bound middleware SDK was shut down', () => {
+    const stale = createSdk({ active: false });
+    const active = createSdk();
+    const globalKey = Symbol.for('errorcore.sdk.instance');
+    const previous = (globalThis as Record<symbol, unknown>)[globalKey];
+    (globalThis as Record<symbol, unknown>)[globalKey] = active.sdk;
+
+    try {
+      const next = vi.fn();
+      expressMiddleware(stale.sdk)(
+        { method: 'GET', url: '/live', headers: {} },
+        new EventEmitter() as never,
+        next
+      );
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(stale.sdk.requestTracker.add).not.toHaveBeenCalled();
+      expect(active.sdk.requestTracker.add).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previous === undefined) {
+        delete (globalThis as Record<symbol, unknown>)[globalKey];
+      } else {
+        (globalThis as Record<symbol, unknown>)[globalKey] = previous;
+      }
+    }
+  });
+
+  it('re-arms local capture before active framework handlers run', async () => {
+    const express = createSdk();
+    expressMiddleware(express.sdk)(
+      { method: 'GET', url: '/express', headers: {} },
+      new EventEmitter() as never,
+      () => {
+        expect(express.sdk.prepareForRequestStart).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    const fastify = createSdk();
+    let fastifyHook:
+      | ((request: { raw: { method: string; url: string; headers: Record<string, unknown> } }, reply: {
+          raw: EventEmitter & { finished?: boolean; on(event: 'finish', listener: () => void): void };
+        }, done: () => void) => void)
+      | undefined;
+    fastifyPlugin(fastify.sdk)(
+      {
+        addHook: vi.fn((_name, handler) => {
+          fastifyHook = handler;
+        })
+      } as never,
+      {},
+      () => undefined
+    );
+    fastifyHook?.(
+      { raw: { method: 'GET', url: '/fastify', headers: {} } },
+      { raw: new EventEmitter() as EventEmitter & { finished?: boolean } },
+      () => {
+        expect(fastify.sdk.prepareForRequestStart).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    const koa = createSdk();
+    await koaMiddleware(koa.sdk)(
+      {
+        request: { method: 'GET', url: '/koa', headers: {} },
+        res: new EventEmitter() as EventEmitter & { finished?: boolean }
+      } as never,
+      async () => {
+        expect(koa.sdk.prepareForRequestStart).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    const hapi = createSdk();
+    let hapiHandler:
+      | ((request: {
+          method: string;
+          url: { pathname: string };
+          headers: Record<string, unknown>;
+          raw: { res: EventEmitter & { finished?: boolean } };
+        }, h: { continue: symbol }) => symbol)
+      | undefined;
+    hapiPlugin.register(
+      {
+        ext: vi.fn((_name, handler) => {
+          hapiHandler = handler;
+        })
+      } as never,
+      { sdk: hapi.sdk }
+    );
+    hapiHandler?.(
+      {
+        method: 'get',
+        url: { pathname: '/hapi' },
+        headers: {},
+        raw: { res: new EventEmitter() as EventEmitter & { finished?: boolean } }
+      },
+      { continue: Symbol('continue') }
+    );
+    expect(hapi.sdk.prepareForRequestStart).toHaveBeenCalledTimes(1);
+
+    const raw = createSdk();
+    wrapHandler((_req, _res) => {
+      expect(raw.sdk.prepareForRequestStart).toHaveBeenCalledTimes(1);
+    }, raw.sdk)(
+      { method: 'GET', url: '/raw', headers: {} },
+      new EventEmitter() as never
+    );
+
+    const next = createSdk();
+    await withErrorcore(async () => {
+      expect(next.sdk.prepareForRequestStart).toHaveBeenCalledTimes(1);
+      return { status: 200 };
+    }, next.sdk)(createNextRequest());
+  });
+
+  it('does not re-arm local capture when SDK is inactive', async () => {
+    const express = createSdk({ active: false });
+    expressMiddleware(express.sdk)(
+      { method: 'GET', url: '/express', headers: {} },
+      new EventEmitter() as never,
+      () => undefined
+    );
+
+    const raw = createSdk({ active: false });
+    wrapHandler((_req, _res) => undefined, raw.sdk)(
+      { method: 'GET', url: '/raw', headers: {} },
+      new EventEmitter() as never
+    );
+
+    const next = createSdk({ active: false });
+    await withErrorcore(async () => ({ status: 200 }), next.sdk)(createNextRequest());
+
+    expect(express.sdk.prepareForRequestStart).not.toHaveBeenCalled();
+    expect(raw.sdk.prepareForRequestStart).not.toHaveBeenCalled();
+    expect(next.sdk.prepareForRequestStart).not.toHaveBeenCalled();
+  });
+
   it('fastify hook sets up ALS context', () => {
     const { sdk, als, getAddedContext } = createSdk();
     let hook:
@@ -186,6 +324,52 @@ describe('middleware adapters', () => {
     });
     expect(getAddedContext()?.headers).not.toHaveProperty('authorization');
     expect(getAddedContext()?.headers).not.toHaveProperty('cookie');
+  });
+
+  it('fastify enters context for the lifecycle after the onRequest hook returns', () => {
+    const { sdk, als } = createSdk();
+    let hook:
+      | ((
+          request: {
+            raw: {
+              method: string;
+              url: string;
+              headers: Record<string, unknown>;
+            };
+          },
+          reply: {
+            raw: { finished?: boolean; on(event: 'finish', listener: () => void): void };
+          },
+          done: () => void
+        ) => void)
+      | undefined;
+    const fastify = {
+      addHook: vi.fn((_name, handler) => {
+        hook = handler;
+      })
+    };
+
+    fastifyPlugin(sdk)(fastify as never, {}, () => undefined);
+
+    hook?.(
+      {
+        raw: {
+          method: 'GET',
+          url: '/fastify-enter',
+          headers: {}
+        }
+      },
+      {
+        raw: new EventEmitter() as EventEmitter & {
+          finished?: boolean;
+          on(event: 'finish', listener: () => void): void;
+        }
+      },
+      () => undefined
+    );
+
+    expect(sdk.als.enterWithContext).toHaveBeenCalledTimes(1);
+    expect(als.getRequestId()).toBeDefined();
   });
 
   it('koa propagates context through the async middleware chain', async () => {

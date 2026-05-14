@@ -2,6 +2,8 @@
 import {
   filterHeaders,
   getModuleInstance,
+  prepareForRequestStart,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
@@ -134,12 +136,14 @@ export function wrapLambda<TEvent = unknown, TResult = unknown>(
   sdk?: SDKInstanceLike
 ): (event: TEvent, context: LambdaContext) => Promise<TResult> {
   return async (event: TEvent, lambdaContext: LambdaContext): Promise<TResult> => {
-    const instance = sdk ?? getModuleInstance();
+    const instance = resolveLiveSDK(sdk ?? getModuleInstance());
 
     if (instance === null || !instance.isActive()) {
       warnIfUninitialized('wrapLambda()');
       return handler(event, lambdaContext);
     }
+
+    prepareForRequestStart(instance);
 
     const extracted = extractRequestContext(event, lambdaContext);
     let context: import('../types').RequestContext;
@@ -219,7 +223,7 @@ export function wrapLambda<TEvent = unknown, TResult = unknown>(
 
       return result;
     } catch (error) {
-      if (instance.captureError && error instanceof Error) {
+      if (instance.captureError) {
         try { instance.captureError(error); } catch {}
       }
       throw error;
@@ -250,6 +254,8 @@ export function wrapServerless<TArgs extends unknown[], TResult>(
       warnIfUninitialized('wrapServerless()');
       return handler(...args);
     }
+
+    prepareForRequestStart(instance);
 
     const extracted = options?.extractContext?.(...args) ?? {
       method: 'INVOKE',
@@ -295,7 +301,7 @@ export function wrapServerless<TArgs extends unknown[], TResult>(
         handler(...args)
       );
     } catch (error) {
-      if (instance.captureError && error instanceof Error) {
+      if (instance.captureError) {
         try { instance.captureError(error); } catch {}
       }
       throw error;

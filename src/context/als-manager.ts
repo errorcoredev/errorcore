@@ -178,6 +178,10 @@ export class ALSManager {
     return this.store.run(ctx, fn);
   }
 
+  public enterWithContext(ctx: RequestContext): void {
+    this.store.enterWith(ctx);
+  }
+
   public getContext(): RequestContext | undefined {
     return this.store.getStore();
   }

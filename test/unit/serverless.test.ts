@@ -374,10 +374,12 @@ describe('Phase 6: Distributed Trace Propagation', () => {
 describe('Phase 3: Lambda Handler Wrapper', () => {
   // Use dynamic import to avoid module-level side effects
   let wrapLambda: typeof import('../../src/middleware/lambda').wrapLambda;
+  let wrapServerless: typeof import('../../src/middleware/lambda').wrapServerless;
 
   beforeEach(async () => {
     const mod = await import('../../src/middleware/lambda');
     wrapLambda = mod.wrapLambda;
+    wrapServerless = mod.wrapServerless;
   });
 
   it('passes through to bare handler when SDK is not initialized', async () => {
@@ -542,6 +544,41 @@ describe('Phase 3: Lambda Handler Wrapper', () => {
       message: 'HTTP 503'
     }));
   });
+
+  it('re-arms local capture before Lambda and generic serverless handlers run', async () => {
+    const lambdaSdk = makeActiveSdk();
+    const lambdaPrepare = lambdaSdk.prepareForRequestStart;
+    const lambdaWrapped = wrapLambda(async () => {
+      expect(lambdaPrepare).toHaveBeenCalledTimes(1);
+      return { statusCode: 200 };
+    }, lambdaSdk);
+
+    await lambdaWrapped(
+      { httpMethod: 'GET', path: '/lambda', headers: {} },
+      makeLambdaContext()
+    );
+
+    const moduleRef = await import('../../src/index');
+    await moduleRef.shutdown();
+    const serverlessSdk = moduleRef.init({
+      allowUnencrypted: true,
+      captureLocalVariables: false,
+      silent: true,
+      transport: { type: 'stdout' }
+    });
+    const serverlessPrepare = vi.spyOn(serverlessSdk, 'prepareForRequestStart');
+
+    const serverlessWrapped = wrapServerless(async () => {
+      expect(serverlessPrepare).toHaveBeenCalledTimes(1);
+      return 'ok';
+    });
+
+    try {
+      await expect(serverlessWrapped()).resolves.toBe('ok');
+    } finally {
+      await moduleRef.shutdown();
+    }
+  });
 });
 
 function makeLambdaContext(): import('../../src/middleware/lambda').LambdaContext {
@@ -578,7 +615,7 @@ function makeRequestContext(input?: Partial<RequestContext>): RequestContext {
   };
 }
 
-function makeActiveSdk(): SDKInstanceLike {
+function makeActiveSdk(): SDKInstanceLike & { prepareForRequestStart: ReturnType<typeof vi.fn> } {
   let currentContext: RequestContext | undefined;
   const watchdog = {
     notifyInvokeStart: vi.fn(),
@@ -588,6 +625,7 @@ function makeActiveSdk(): SDKInstanceLike {
   const sdk: SDKInstanceLike = {
     isActive: vi.fn(() => true),
     captureError: vi.fn(),
+    prepareForRequestStart: vi.fn(),
     flush: vi.fn().mockResolvedValue(undefined),
     als: {
       createRequestContext: vi.fn((input) => makeRequestContext({

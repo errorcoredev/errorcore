@@ -286,7 +286,7 @@ npx errorcore drain --force          # Skip confirmation prompt
 npx errorcore status                 # Show dead-letter store size and payload count
 ```
 
-Successfully sent payloads are removed from the store. Failed payloads are retained.
+Successfully sent payloads are removed from the store. Failed payloads are retained. `drain --dry-run` is read-only and does not take the DLQ writer lock.
 
 ## Encryption
 
@@ -309,6 +309,8 @@ When `encryptionKey` is set, error packages are encrypted with AES-256-GCM befor
 `drain --rotate` is also useful as a recovery operation if the on-disk DLQ has accumulated entries under several legacy keys; declare every key the entries might have been written with under `previousEncryptionKeys` and run the command in one shot.
 
 If `drain --rotate` reports `dropped > 0`, those entries do not verify under any key in the chain — likely the originating key is not declared. Either add it to `previousEncryptionKeys` and re-run, or accept the loss (the entries cannot be trusted anyway).
+
+If another process owns the DLQ lock, `drain --rotate` fails with `EC_DLQ_LOCKED` and leaves the file untouched.
 
 ## Dashboard (UI)
 

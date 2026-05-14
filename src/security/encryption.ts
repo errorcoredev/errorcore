@@ -4,6 +4,7 @@ import {
   createDecipheriv,
   createHash,
   createHmac,
+  hkdfSync,
   pbkdf2Sync,
   randomBytes,
   timingSafeEqual
@@ -21,7 +22,15 @@ interface EncryptionOptions {
 }
 
 interface KeyMaterial {
-  derivationSecret: Buffer;
+  legacyDerivationSecret: Buffer;
+  derivedKey: Buffer;
+  macKey: Buffer;
+  keyId: string;
+  explicitMacKey?: string | Buffer;
+  legacy?: RuntimeKeyMaterial;
+}
+
+interface RuntimeKeyMaterial {
   derivedKey: Buffer;
   macKey: Buffer;
   keyId: string;
@@ -41,12 +50,34 @@ function readKeyMaterial(input: string | Buffer): Buffer {
   if (input.length === 0) {
     throw new Error('encryptionKey must not be empty');
   }
+  if (/^[0-9a-f]{64}$/i.test(input)) {
+    return Buffer.from(input, 'hex');
+  }
   return Buffer.from(input, 'utf8');
+}
+
+function readLegacyKeyMaterial(input: string | Buffer): Buffer {
+  if (Buffer.isBuffer(input)) {
+    return input;
+  }
+  if (input.length === 0) {
+    throw new Error('encryptionKey must not be empty');
+  }
+  return Buffer.from(input, 'utf8');
+}
+
+function hkdfSha256(secret: Buffer, salt: Buffer): Buffer {
+  return Buffer.from(hkdfSync('sha256', secret, salt, Buffer.alloc(0), 32));
+}
+
+function legacyPbkdf2Sha256(secret: Buffer, salt: Buffer): Buffer {
+  return pbkdf2Sync(secret, salt, 100000, 32, 'sha256');
 }
 
 function deriveMacKey(
   dekSecret: Buffer,
-  explicit?: string | Buffer
+  explicit?: string | Buffer,
+  mode: 'hkdf' | 'legacy-pbkdf2' = 'hkdf'
 ): Buffer {
   if (explicit !== undefined) {
     const candidate = typeof explicit === 'string'
@@ -59,7 +90,9 @@ function deriveMacKey(
     }
     return candidate;
   }
-  return pbkdf2Sync(dekSecret, MAC_DERIVATION_SALT, 100000, 32, 'sha256');
+  return mode === 'hkdf'
+    ? hkdfSha256(dekSecret, MAC_DERIVATION_SALT)
+    : legacyPbkdf2Sha256(dekSecret, MAC_DERIVATION_SALT);
 }
 
 /**
@@ -74,18 +107,77 @@ function computeKeyId(derivedKey: Buffer): string {
 
 function deriveKeys(encryptionKey: string | Buffer, options?: { macKey?: string | Buffer }): KeyMaterial {
   const derivationSecret = readKeyMaterial(encryptionKey);
-  const derivedKey = pbkdf2Sync(derivationSecret, STATIC_KEY_SALT, 100000, 32, 'sha256');
+  const legacyDerivationSecret = readLegacyKeyMaterial(encryptionKey);
+  const derivedKey = hkdfSha256(derivationSecret, STATIC_KEY_SALT);
   const macKey = deriveMacKey(derivationSecret, options?.macKey);
   return {
-    derivationSecret,
+    legacyDerivationSecret,
+    derivedKey,
+    macKey,
+    keyId: computeKeyId(derivedKey),
+    explicitMacKey: options?.macKey
+  };
+}
+
+function getLegacyKeyMaterial(km: KeyMaterial): RuntimeKeyMaterial {
+  if (km.legacy !== undefined) {
+    return km.legacy;
+  }
+
+  const derivedKey = legacyPbkdf2Sha256(km.legacyDerivationSecret, STATIC_KEY_SALT);
+  const macKey = deriveMacKey(km.legacyDerivationSecret, km.explicitMacKey, 'legacy-pbkdf2');
+  km.legacy = {
     derivedKey,
     macKey,
     keyId: computeKeyId(derivedKey)
   };
+  return km.legacy;
 }
 
 function buildAad(eventId: string, sdkVersion: string, keyId: string): Buffer {
   return Buffer.from(`${AAD_VERSION}|${keyId}|${sdkVersion}|${eventId}`, 'utf8');
+}
+
+function tryDecryptWithMaterial(
+  material: RuntimeKeyMaterial,
+  envelope: EncryptedEnvelope,
+  sdkVersion: string,
+  iv: Buffer,
+  ciphertext: Buffer,
+  authTag: Buffer,
+  expectedHmac: Buffer
+): { ok: true; plaintext: string } | { ok: false; failure: 'hmac' | 'authTag' } {
+  const aad = buildAad(
+    envelope.eventId,
+    envelope.sdk?.version ?? sdkVersion,
+    material.keyId
+  );
+  const computedHmac = createHmac('sha256', material.macKey)
+    .update(iv)
+    .update(ciphertext)
+    .update(authTag)
+    .update(aad)
+    .digest();
+
+  if (
+    computedHmac.length !== expectedHmac.length ||
+    !timingSafeEqual(computedHmac, expectedHmac)
+  ) {
+    return { ok: false, failure: 'hmac' };
+  }
+
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', material.derivedKey, iv);
+    decipher.setAAD(aad);
+    decipher.setAuthTag(authTag);
+    const plaintextBuf = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return {
+      ok: true,
+      plaintext: maybeDecompress(plaintextBuf, envelope.compressed).toString('utf8')
+    };
+  } catch {
+    return { ok: false, failure: 'authTag' };
+  }
 }
 
 export interface EnvelopeEncryptOptions {
@@ -203,38 +295,43 @@ export class Encryption {
     let firstFailure: 'hmac' | 'authTag' | null = null;
 
     for (const km of keyOrder) {
-      const aad = buildAad(
-        envelope.eventId,
-        envelope.sdk?.version ?? this.sdkVersion,
-        km.keyId
+      const attempt = tryDecryptWithMaterial(
+        km,
+        envelope,
+        this.sdkVersion,
+        iv,
+        ciphertext,
+        authTag,
+        expectedHmac
       );
-      const computedHmac = createHmac('sha256', km.macKey)
-        .update(iv)
-        .update(ciphertext)
-        .update(authTag)
-        .update(aad)
-        .digest();
-
-      if (
-        computedHmac.length !== expectedHmac.length ||
-        !timingSafeEqual(computedHmac, expectedHmac)
-      ) {
-        if (firstFailure === null) firstFailure = 'hmac';
-        continue;
-      }
-
-      try {
-        const decipher = createDecipheriv('aes-256-gcm', km.derivedKey, iv);
-        decipher.setAAD(aad);
-        decipher.setAuthTag(authTag);
-        const plaintextBuf = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-        const plaintext = maybeDecompress(plaintextBuf, envelope.compressed).toString('utf8');
+      if (attempt.ok) {
         const keyIndex = this.chain.indexOf(km);
-        return { ok: true, plaintext, keyIndex };
-      } catch {
-        if (firstFailure === null) firstFailure = 'authTag';
-        continue;
+        return { ok: true, plaintext: attempt.plaintext, keyIndex };
       }
+      if (firstFailure === null) firstFailure = attempt.failure;
+    }
+
+    const legacyKeyOrder = this.chain.slice().sort((a, b) => {
+      if (getLegacyKeyMaterial(a).keyId === envelope.keyId) return -1;
+      if (getLegacyKeyMaterial(b).keyId === envelope.keyId) return 1;
+      return 0;
+    });
+
+    for (const km of legacyKeyOrder) {
+      const attempt = tryDecryptWithMaterial(
+        getLegacyKeyMaterial(km),
+        envelope,
+        this.sdkVersion,
+        iv,
+        ciphertext,
+        authTag,
+        expectedHmac
+      );
+      if (attempt.ok) {
+        const keyIndex = this.chain.indexOf(km);
+        return { ok: true, plaintext: attempt.plaintext, keyIndex };
+      }
+      if (firstFailure === null) firstFailure = attempt.failure;
     }
 
     if (firstFailure === 'hmac') {
@@ -280,6 +377,15 @@ export class Encryption {
     }
     for (let i = 0; i < this.chain.length; i++) {
       const expected = createHmac('sha256', this.chain[i]!.macKey)
+        .update(serialized)
+        .digest();
+      if (expected.length === actual.length && timingSafeEqual(expected, actual)) {
+        return { ok: true, keyIndex: i };
+      }
+    }
+    for (let i = 0; i < this.chain.length; i++) {
+      const legacy = getLegacyKeyMaterial(this.chain[i]!);
+      const expected = createHmac('sha256', legacy.macKey)
         .update(serialized)
         .digest();
       if (expected.length === actual.length && timingSafeEqual(expected, actual)) {

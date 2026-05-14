@@ -26,6 +26,11 @@ function die(message) {
   process.exit(1);
 }
 
+function isDeadLetterLockError(error) {
+  const message = error && error.message ? String(error.message) : String(error);
+  return message.includes('Failed to acquire lock') && message.includes('.lock');
+}
+
 function requireDist(modulePath) {
   const full = path.join(distDir, modulePath);
   try {
@@ -438,7 +443,15 @@ async function cmdDrain(flags) {
   });
 
   if (flags.rotate) {
-    const result = store.reSignAll();
+    let result;
+    try {
+      result = store.reSignAll();
+    } catch (err) {
+      if (isDeadLetterLockError(err)) {
+        die(`EC_DLQ_LOCKED: ${(err && err.message) || String(err)}`);
+      }
+      throw err;
+    }
     process.stdout.write(
       green('Rotated dead-letter signatures: ') +
       `${result.resigned} payload(s) re-signed, ` +

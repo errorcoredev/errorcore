@@ -5,7 +5,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ERRORCORE_INTERNAL, SDK_INTERNAL_REQUESTS } from '../../src/recording/http-client';
 import { isInternalCallActive } from '../../src/recording/internal';
-import { HttpTransport } from '../../src/transport/http-transport';
+import {
+  HTTP_TRANSPORT_TIMEOUT_MESSAGE,
+  HttpTransport
+} from '../../src/transport/http-transport';
 import { FileTransport } from '../../src/transport/file-transport';
 import { StdoutTransport } from '../../src/transport/stdout-transport';
 import { TransportDispatcher } from '../../src/transport/transport';
@@ -169,6 +172,16 @@ function createHttp1Transport(
   return new HttpTransport({ ...config, protocol: 'http1' });
 }
 
+type PrivateHttpTransport = HttpTransport & {
+  sendHttp1Once(payload: { serialized: string | Buffer }): Promise<void>;
+  sendHttp2Once(payload: { serialized: string | Buffer }): Promise<void>;
+  getRetryDelay(
+    error: Error & { statusCode?: number; code?: string; retryAfterMs?: number },
+    attempt: number,
+    startedAt: number
+  ): number | null;
+};
+
 describe('HttpTransport', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -278,15 +291,18 @@ describe('HttpTransport', () => {
 
   it('retries on failure and succeeds on a later attempt', async () => {
     const requestSpy = createMockRequest({ statuses: [500, 500, 200] });
-    const delaySpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler) => {
-      fn();
+    const delaySpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler, ms?: number) => {
+      if (ms !== 60000) {
+        fn();
+      }
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
     const transport = createHttp1Transport({
-      url: 'https://example.com/collect'
+      url: 'https://example.com/collect',
+      timeoutMs: 60000
     });
 
     await transport.send('payload');
@@ -324,18 +340,18 @@ describe('HttpTransport', () => {
 
     const capturedDelays: number[] = [];
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler, ms?: number) => {
-      if (typeof ms === 'number' && ms > 0) {
+      if (typeof ms === 'number' && ms > 0 && ms !== 60000) {
         capturedDelays.push(ms);
       }
-      if (typeof fn === 'function') fn();
+      if (typeof fn === 'function' && ms !== 60000) fn();
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
-    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({ url: 'https://example.com/collect', timeoutMs: 60000 });
     await transport.send('payload');
 
     expect(requestSpy).toHaveBeenCalledTimes(2);
-    expect(capturedDelays).toContain(2000);
+    expect(capturedDelays).toEqual([2000]);
   });
 
   it('handles request timeouts', async () => {
@@ -355,6 +371,65 @@ describe('HttpTransport', () => {
 
     const request = requestSpy.mock.results[0]?.value as { destroy: ReturnType<typeof vi.fn> };
     expect(request.destroy).toHaveBeenCalled();
+  });
+
+  it('enforces a total HTTP/1 attempt deadline even when the response never ends', async () => {
+    vi.useFakeTimers();
+    try {
+      let request: (EventEmitter & {
+        write: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        setTimeout: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      }) | undefined;
+      const requestSpy = vi.fn((_opts: unknown, callback: (res: EventEmitter & { statusCode?: number }) => void) => {
+        const response = new EventEmitter() as EventEmitter & { statusCode?: number };
+        response.statusCode = 200;
+        request = new EventEmitter() as typeof request;
+        request!.write = vi.fn();
+        request!.setTimeout = vi.fn(() => request!);
+        request!.destroy = vi.fn((error?: Error) => {
+          if (error !== undefined) request!.emit('error', error);
+        });
+        request!.end = vi.fn(() => {
+          callback(response);
+          response.emit('data', Buffer.from('x'));
+        });
+        return request!;
+      });
+      httpsModule.request = requestSpy as typeof httpsModule.request;
+      const transport = createHttp1Transport({
+        url: 'https://example.com/collect',
+        timeoutMs: 100
+      }) as PrivateHttpTransport;
+
+      let observed = 'pending';
+      const send = transport.sendHttp1Once({ serialized: 'payload' })
+        .then(() => { observed = 'resolved'; }, (error: Error) => { observed = error.message; });
+      await vi.advanceTimersByTimeAsync(100);
+      await send;
+
+      expect(observed).toBe(HTTP_TRANSPORT_TIMEOUT_MESSAGE);
+      expect(request?.destroy).toHaveBeenCalledWith(expect.objectContaining({
+        message: HTTP_TRANSPORT_TIMEOUT_MESSAGE
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the total HTTP/1 deadline after a successful attempt', async () => {
+    const requestSpy = createMockRequest({ statuses: [200] });
+    httpsModule.request = requestSpy as typeof httpsModule.request;
+    const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+    const transport = createHttp1Transport({
+      url: 'https://example.com/collect',
+      timeoutMs: 1000
+    }) as PrivateHttpTransport;
+
+    await transport.sendHttp1Once({ serialized: 'payload' });
+
+    expect(clearSpy).toHaveBeenCalled();
   });
 
   it('rejects insecure HTTP URLs by default', () => {
@@ -402,39 +477,55 @@ describe('HttpTransport', () => {
     ).not.toThrow();
   });
 
-  it('(d) retries exactly 5 times with bounded backoff before throwing', async () => {
+  it('(d) retries exactly 5 times with bounded jittered backoff before throwing', async () => {
     const requestSpy = createMockRequest({ statuses: [500, 500, 500, 500, 500] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
 
     const capturedDelays: number[] = [];
     const originalSetTimeout = globalThis.setTimeout;
+    vi.spyOn(Math, 'random').mockReturnValue(0.75);
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler, ms?: number) => {
-      if (typeof ms === 'number' && ms > 0) {
+      if (typeof ms === 'number' && ms > 0 && ms !== 60000) {
         capturedDelays.push(ms);
       }
-      if (typeof fn === 'function') fn();
+      if (typeof fn === 'function' && ms !== 60000) fn();
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
-    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({
+      url: 'https://example.com/collect',
+      timeoutMs: 60000
+    });
 
     await expect(transport.send('payload')).rejects.toThrow('HTTP 500');
 
     expect(requestSpy).toHaveBeenCalledTimes(5);
-    expect(capturedDelays).toEqual([200, 600, 1800, 5400]);
+    expect(capturedDelays).toEqual([220, 660, 1980, 5940]);
 
     globalThis.setTimeout = originalSetTimeout;
+  });
+
+  it('caps jittered retry delays to the remaining retry budget', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+    vi.spyOn(Date, 'now').mockReturnValue(29_790);
+    const transport = createHttp1Transport({ url: 'https://example.com/collect' }) as PrivateHttpTransport;
+    const retryable = Object.assign(new Error('HTTP 500'), { statusCode: 500 });
+
+    expect(transport.getRetryDelay(retryable, 0, 0)).toBe(210);
   });
 
   it('(e) throws after max retries so the caller can fall through to dead-letter', async () => {
     const requestSpy = createMockRequest({ statuses: [502, 502, 502, 502, 502] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
-    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler) => {
-      if (typeof fn === 'function') fn();
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler, ms?: number) => {
+      if (typeof fn === 'function' && ms !== 60000) fn();
       return { unref: vi.fn() } as unknown as NodeJS.Timeout;
     }) as typeof setTimeout);
 
-    const transport = createHttp1Transport({ url: 'https://example.com/collect' });
+    const transport = createHttp1Transport({
+      url: 'https://example.com/collect',
+      timeoutMs: 60000
+    });
 
     await expect(transport.send('payload')).rejects.toThrow();
     expect(requestSpy).toHaveBeenCalledTimes(5);
@@ -688,6 +779,113 @@ describe('HttpTransport', () => {
     expect(session.destroy).toHaveBeenCalled();
   });
 
+  it('clears the total HTTP/2 deadline after a successful attempt', async () => {
+    const session = new EventEmitter() as EventEmitter & {
+      destroyed: boolean;
+      closed: boolean;
+      request: ReturnType<typeof vi.fn>;
+      destroy: ReturnType<typeof vi.fn>;
+    };
+    session.destroyed = false;
+    session.closed = false;
+    session.destroy = vi.fn(() => {
+      session.destroyed = true;
+      session.closed = true;
+      session.emit('close');
+    });
+
+    const stream = new EventEmitter() as EventEmitter & {
+      setTimeout: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      end: ReturnType<typeof vi.fn>;
+    };
+    stream.setTimeout = vi.fn(() => stream);
+    stream.close = vi.fn();
+    stream.end = vi.fn(() => {
+      process.nextTick(() => {
+        stream.emit('response', {
+          [http2Module.constants.HTTP2_HEADER_STATUS]: 200
+        });
+        stream.emit('end');
+      });
+      return stream;
+    });
+    session.request = vi.fn(() => stream);
+    vi.spyOn(http2Module, 'connect').mockImplementation((() => {
+      process.nextTick(() => session.emit('connect'));
+      return session;
+    }) as typeof http2Module.connect);
+    const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+    const transport = new HttpTransport({
+      url: 'https://example.com/collect',
+      protocol: 'http2',
+      timeoutMs: 1000
+    }) as PrivateHttpTransport;
+
+    await transport.sendHttp2Once({ serialized: 'payload' });
+    await transport.shutdown();
+
+    expect(clearSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('enforces a total HTTP/2 attempt deadline even when the response never ends', async () => {
+    vi.useFakeTimers();
+    try {
+      const session = new EventEmitter() as EventEmitter & {
+        destroyed: boolean;
+        closed: boolean;
+        request: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      session.destroyed = false;
+      session.closed = false;
+      session.destroy = vi.fn(() => {
+        session.destroyed = true;
+        session.closed = true;
+        session.emit('close');
+      });
+
+      const stream = new EventEmitter() as EventEmitter & {
+        setTimeout: ReturnType<typeof vi.fn>;
+        close: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+      };
+      stream.setTimeout = vi.fn(() => stream);
+      stream.close = vi.fn();
+      stream.end = vi.fn(() => {
+        process.nextTick(() => {
+          stream.emit('response', {
+            [http2Module.constants.HTTP2_HEADER_STATUS]: 200
+          });
+          stream.emit('data', Buffer.from('x'));
+        });
+        return stream;
+      });
+      session.request = vi.fn(() => stream);
+      vi.spyOn(http2Module, 'connect').mockImplementation((() => {
+        process.nextTick(() => session.emit('connect'));
+        return session;
+      }) as typeof http2Module.connect);
+      const transport = new HttpTransport({
+        url: 'https://example.com/collect',
+        protocol: 'http2',
+        timeoutMs: 100
+      }) as PrivateHttpTransport;
+
+      let observed = 'pending';
+      const send = transport.sendHttp2Once({ serialized: 'payload' })
+        .then(() => { observed = 'resolved'; }, (error: Error) => { observed = error.message; });
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(100);
+      await send;
+
+      expect(observed).toBe(HTTP_TRANSPORT_TIMEOUT_MESSAGE);
+      expect(stream.close).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('falls back from auto HTTP/2 to HTTP/1.1 when HTTP/2 negotiation fails', async () => {
     const session = new EventEmitter() as EventEmitter & {
       destroyed: boolean;
@@ -808,16 +1006,11 @@ describe('HttpTransport', () => {
   it('does not retry permanent HTTP failures', async () => {
     const requestSpy = createMockRequest({ statuses: [401, 401, 401] });
     httpsModule.request = requestSpy as typeof httpsModule.request;
-    const delaySpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: TimerHandler) => {
-      fn();
-      return { unref: vi.fn() } as unknown as NodeJS.Timeout;
-    }) as typeof setTimeout);
 
     const transport = createHttp1Transport({ url: 'https://example.com/collect' });
 
     await expect(transport.send('payload')).rejects.toThrow('HTTP 401');
     expect(requestSpy).toHaveBeenCalledTimes(1);
-    expect(delaySpy).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -831,15 +1024,6 @@ describe('HttpTransport', () => {
         Object.assign(new Error(message), { code })
       ]);
       httpsModule.request = requestSpy as typeof httpsModule.request;
-      const delaySpy = vi
-        .spyOn(globalThis, 'setTimeout')
-        .mockImplementation(((fn: TimerHandler) => {
-          if (typeof fn === 'function') {
-            fn();
-          }
-
-          return { unref: vi.fn() } as unknown as NodeJS.Timeout;
-        }) as typeof setTimeout);
 
       const transport = createHttp1Transport({ url: 'https://example.com/collect' });
 
@@ -854,7 +1038,6 @@ describe('HttpTransport', () => {
       expect(thrown?.message).toBe(message);
       expect(thrown?.code).toBe(code);
       expect(requestSpy).toHaveBeenCalledTimes(1);
-      expect(delaySpy).not.toHaveBeenCalled();
     }
   );
 });

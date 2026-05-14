@@ -607,18 +607,20 @@ describe('BodyCapture', () => {
   it('materializes multipart bodies as a safe placeholder instead of raw bytes', () => {
     const capture = createBodyCapture({
       maxPayloadSize: 64,
+      captureBodyDigest: true,
       scrubber: new Scrubber(resolveTestConfig())
     });
     const req = new MockIncomingMessage();
     const slot = createSlot({
       requestHeaders: { 'content-type': 'multipart/form-data; boundary=test' }
     });
+    const onBytesChanged = vi.fn();
 
     capture.captureInboundRequest(
       req as IncomingMessage,
       slot,
       slot.seq,
-      () => undefined
+      onBytesChanged
     );
 
     req.on('data', () => undefined);
@@ -626,7 +628,10 @@ describe('BodyCapture', () => {
     req.emit('end');
     capture.materializeSlotBodies(slot);
 
-    expect(slot.requestBody?.toString('utf8')).toBe('[MULTIPART BODY OMITTED]');
+    expect(slot.requestBody?.toString('utf8')).toBe('MULTIPART_REDACTED');
+    expect(slot.requestBodyOriginalSize).toBeNull();
+    expect(slot.requestBodyDigest).toBeNull();
+    expect(onBytesChanged).toHaveBeenCalledTimes(1);
   });
 
   it('scrubs sensitive key-value assignments in text/plain bodies', () => {

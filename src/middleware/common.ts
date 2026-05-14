@@ -4,8 +4,9 @@ import { safeConsole } from '../debug-log';
 
 export interface SDKInstanceLike {
   isActive(): boolean;
-  captureError?(error: Error): void;
+  captureError?(error: unknown): void;
   flush?(): Promise<void>;
+  prepareForRequestStart?(): void;
   als: {
     createRequestContext(input: {
       method: string;
@@ -16,6 +17,7 @@ export interface SDKInstanceLike {
     }): RequestContext;
     getContext?(): RequestContext | undefined;
     runWithContext<T>(ctx: RequestContext, fn: () => T): T;
+    enterWithContext?(ctx: RequestContext): void;
     formatTraceparent?(): string | null;
   };
   requestTracker: {
@@ -51,10 +53,33 @@ export function getModuleInstance(): SDKInstanceLike | null {
       getModuleInstance?: () => SDKInstanceLike | null;
     };
 
-    return moduleRef.getModuleInstance?.() ?? null;
+    const moduleInstance = moduleRef.getModuleInstance?.() ?? null;
+    if (moduleInstance !== null) {
+      return moduleInstance;
+    }
   } catch {
-    return null;
   }
+
+  return (
+    (globalThis as Record<symbol, SDKInstanceLike | null | undefined>)[
+      Symbol.for('errorcore.sdk.instance')
+    ] ?? null
+  );
+}
+
+export function resolveLiveSDK(
+  sdk: SDKInstanceLike | null | undefined
+): SDKInstanceLike | null {
+  if (sdk !== null && sdk !== undefined && sdk.isActive()) {
+    return sdk;
+  }
+
+  const moduleInstance = getModuleInstance();
+  if (moduleInstance !== null && moduleInstance.isActive()) {
+    return moduleInstance;
+  }
+
+  return sdk ?? moduleInstance;
 }
 
 let middlewareWarningEmitted = false;
@@ -78,4 +103,12 @@ export function filterHeaders(
   headers: Record<string, unknown>
 ): Record<string, string> {
   return sdk.headerFilter.filterAndNormalizeHeaders(headers);
+}
+
+export function prepareForRequestStart(sdk: SDKInstanceLike): void {
+  try {
+    sdk.prepareForRequestStart?.();
+  } catch {
+    // Request middleware must never fail because inspector re-arming failed.
+  }
 }

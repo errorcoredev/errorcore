@@ -24,7 +24,7 @@ import {
 
 const REDACTED = '[REDACTED]';
 const DEPTH_LIMIT = '[DEPTH_LIMIT]';
-const MULTIPART_REDACTED = '[MULTIPART BODY OMITTED]';
+export const MULTIPART_REDACTED = 'MULTIPART_REDACTED';
 
 function isPrivateOrInfrastructureIp(ip: string): boolean {
   const parts = ip.split('.').map((p) => Number.parseInt(p, 10));
@@ -95,21 +95,96 @@ function matchesSensitiveKey(key: string): boolean {
  * leaf strings under request.body, so an inner `hrtimeNs` key inside
  * a user's JSON body never reaches this layer.
  */
-const INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
-  'hrtimeNs', 'startTime', 'endTime', 'evictedAt', 'timestamp',
+const ROOT_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
   'errorEventHrtimeNs', 'wallClockMs', 'durationMs', 'eventLoopLagMs',
-  'seq', 'errorEventSeq', 'capturedAt', 'producedAt', 'receivedAt',
+  'errorEventSeq', 'capturedAt', 'producedAt', 'receivedAt',
+  'fingerprint', 'eventId'
+]);
+
+const IO_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'hrtimeNs', 'startTime', 'endTime', 'seq', 'durationMs', 'statusCode',
+  'fd', 'requestBodyOriginalSize', 'responseBodyOriginalSize'
+]);
+
+const EVICTION_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'seq', 'startTime', 'evictedAt'
+]);
+
+const STATE_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'seq', 'hrtimeNs', 'timestamp'
+]);
+
+const PROCESS_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
   'pid', 'ppid', 'uptime',
   'rss', 'heapTotal', 'heapUsed', 'external', 'arrayBuffers',
   'activeHandles', 'activeRequests',
-  'min', 'max',
-  'rowCount', 'statusCode',
-  'phase', 'direction', 'type',
-  'fingerprint',
-  'keyId', 'eventId',
-  '_overflow', '_type', 'className',
-  'lineNumber', 'columnNumber'
+  'eventLoopLagMs', 'wallClockMs', 'hrtimeNs'
 ]);
+
+const LOCAL_FRAME_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'lineNumber', 'columnNumber', '_overflow', '_type', 'className'
+]);
+
+function isArrayIndexPathSegment(value: string | undefined): boolean {
+  return typeof value === 'string' && /^\d+$/.test(value);
+}
+
+function isSdkInfrastructurePath(path: string[]): boolean {
+  const key = path[path.length - 1];
+  if (key === undefined) {
+    return false;
+  }
+
+  if (path.length === 1) {
+    return ROOT_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'eventClockRange' && path.length === 2) {
+    return key === 'min' || key === 'max';
+  }
+
+  if (path[0] === 'timeAnchor' && path.length === 2) {
+    return key === 'wallClockMs' || key === 'hrtimeNs';
+  }
+
+  if (path[0] === 'ioTimeline' && path.length === 3 && isArrayIndexPathSegment(path[1])) {
+    return IO_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'evictionLog' && path.length === 3 && isArrayIndexPathSegment(path[1])) {
+    return EVICTION_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (
+    (path[0] === 'stateReads' || path[0] === 'stateWrites') &&
+    path.length === 3 &&
+    isArrayIndexPathSegment(path[1])
+  ) {
+    return STATE_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'processMetadata') {
+    return PROCESS_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'ambientContext') {
+    return key === 'totalBufferEventsAtCapture' ||
+      key === 'seqGaps' ||
+      key === 'retrievedCount' ||
+      key === 'min' ||
+      key === 'max';
+  }
+
+  if (path[0] === 'localVariables' && isArrayIndexPathSegment(path[1])) {
+    return path.length === 3 && LOCAL_FRAME_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'ioTimeline' && path[2] === 'dbMeta' && key === 'rowCount') {
+    return true;
+  }
+
+  return false;
+}
 
 /**
  * Header / value keys whose VALUE is operational metadata, not a
@@ -561,6 +636,7 @@ export class Scrubber {
       return this.cloneAndScrub(
         key,
         value,
+        key === '' ? [] : [key],
         0,
         new WeakSet<object>(),
         this.config.serialization
@@ -573,6 +649,7 @@ export class Scrubber {
   private cloneAndScrub(
     key: string,
     value: unknown,
+    path: string[],
     depth: number,
     visited: WeakSet<object>,
     limits: SerializationLimits
@@ -581,9 +658,11 @@ export class Scrubber {
       return DEPTH_LIMIT;
     }
 
-    // SDK-internal infrastructure keys: pass values through without any
-    // pattern matching. Resolves §B1 (hrtime strings being Luhn-redacted).
-    if (INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key)) {
+    // SDK-internal infrastructure fields: pass values through without
+    // pattern matching only at known ErrorPackage paths. User-controlled
+    // objects can still contain keys like `hrtimeNs`, so key-only bypasses
+    // would create false negatives in request bodies and thrown objects.
+    if (isSdkInfrastructurePath(path)) {
       return value;
     }
 
@@ -700,6 +779,7 @@ export class Scrubber {
           items[index] = this.cloneAndScrub(
             String(index),
             value[index],
+            [...path, String(index)],
             depth + 1,
             visited,
             limits
@@ -736,8 +816,22 @@ export class Scrubber {
           }
 
           entries.push([
-            this.cloneAndScrub(String(index), entryKey, depth + 1, visited, limits),
-            this.cloneAndScrub(String(index), entryValue, depth + 1, visited, limits)
+            this.cloneAndScrub(
+              String(index),
+              entryKey,
+              [...path, String(index), 'key'],
+              depth + 1,
+              visited,
+              limits
+            ),
+            this.cloneAndScrub(
+              String(index),
+              entryValue,
+              [...path, String(index), 'value'],
+              depth + 1,
+              visited,
+              limits
+            )
           ]);
           index += 1;
         }
@@ -768,7 +862,14 @@ export class Scrubber {
           }
 
           values.push(
-            this.cloneAndScrub(String(index), entryValue, depth + 1, visited, limits)
+            this.cloneAndScrub(
+              String(index),
+              entryValue,
+              [...path, String(index)],
+              depth + 1,
+              visited,
+              limits
+            )
           );
           index += 1;
         }
@@ -799,6 +900,7 @@ export class Scrubber {
           scrubbed[objectKey] = this.cloneAndScrub(
             objectKey,
             (value as Record<string, unknown>)[objectKey],
+            [...path, objectKey],
             depth + 1,
             visited,
             limits

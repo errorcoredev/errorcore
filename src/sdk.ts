@@ -41,6 +41,7 @@ import {
   type IntegrityVerifier
 } from './transport/dead-letter-store';
 import { ErrorCapturer } from './capture/error-capturer';
+import { normalizeThrown } from './capture/normalize-thrown';
 import { PackageAssemblyDispatcher } from './capture/package-assembly-dispatcher';
 import { SourceMapResolver } from './capture/source-map-resolver';
 import { WatchdogManager } from './middleware/watchdog';
@@ -408,7 +409,7 @@ export class SDKInstance {
     });
   }
 
-  public captureError(error: Error): void {
+  public captureError(error: unknown): void {
     // Allow capture during the active phase and during the shutting-down
     // phase. During shutdown the transport is still up and the capturer
     // can still enqueue; this prevents a silent drop of the final error
@@ -417,7 +418,7 @@ export class SDKInstance {
       return;
     }
 
-    this.errorCapturer.capture(error);
+    this.errorCapturer.capture(normalizeThrown(error, this.config));
   }
 
   public trackState<T extends Map<unknown, unknown> | Record<string, unknown>>(
@@ -483,6 +484,18 @@ export class SDKInstance {
 
   public getWatchdog(): WatchdogManager | null {
     return this.watchdog;
+  }
+
+  public prepareForRequestStart(): void {
+    if (!this.config.captureLocalVariables) {
+      return;
+    }
+
+    try {
+      this.inspector.ensureDebuggerActive();
+    } catch {
+      // Local-variable capture is best-effort and must not affect request handling.
+    }
   }
 
   /**
@@ -637,9 +650,13 @@ export class SDKInstance {
     const preExistingRejectionListenerCount = process.listenerCount('unhandledRejection');
 
     const unhandledRejectionHandler = (reason: unknown) => {
-      const error = reason instanceof Error ? reason : new Error(String(reason));
+      const error = normalizeThrown(reason, this.config);
 
-      this.errorCapturer.capture(error);
+      try {
+        this.errorCapturer.capture(error);
+      } catch {
+        // SDK capture failures must never change host rejection behavior.
+      }
 
       // If the SDK is the only unhandledRejection listener, emit a warning
       // so Node's default behavior (log + future termination) is preserved.
@@ -664,20 +681,29 @@ export class SDKInstance {
       // intentionally keep the process alive.
       const preExistingUncaughtListenerCount = process.listenerCount('uncaughtException');
 
-      const uncaughtExceptionHandler = (error: Error) => {
+      const uncaughtExceptionHandler = (thrown: unknown) => {
         if (this.fatalExitInProgress) {
           return;
         }
 
         this.fatalExitInProgress = true;
-        this.errorCapturer.capture(error, { isUncaught: true });
+        const error = normalizeThrown(thrown, this.config);
+        try {
+          this.errorCapturer.capture(error, { isUncaught: true });
+        } catch {
+          // Preserve host uncaughtException behavior even if ErrorCore fails.
+        }
 
-        const currentCount = process.listenerCount('uncaughtException');
-        const sdkIsOnlyListener = currentCount === preExistingUncaughtListenerCount + 1;
+        const currentOtherListenerCount = process
+          .listeners('uncaughtException')
+          .filter((listener) => listener !== uncaughtExceptionHandler).length;
+        const hasHostUncaughtListener =
+          preExistingUncaughtListenerCount > 0 || currentOtherListenerCount > 0;
 
-        if (!sdkIsOnlyListener) {
+        if (hasHostUncaughtListener) {
           // Host has its own handler. Let it decide. We have already
           // captured the error above.
+          this.fatalExitInProgress = false;
           return;
         }
 

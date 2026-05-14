@@ -2,6 +2,8 @@
 import {
   filterHeaders,
   getModuleInstance,
+  prepareForRequestStart,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
@@ -25,12 +27,14 @@ export function withErrorcore<
   sdk?: SDKInstanceLike
 ): (req: TReq, ctx: TCtx) => Promise<TResult> {
   return async (req, routeContext) => {
-    const instance = sdk ?? getModuleInstance();
+    const instance = resolveLiveSDK(sdk ?? getModuleInstance());
 
     if (instance === null || !instance.isActive()) {
       warnIfUninitialized('withErrorcore()');
       return handler(req, routeContext);
     }
+
+    prepareForRequestStart(instance);
 
     if (instance.als.getContext?.() !== undefined) {
       // Nested context (e.g., HttpServerRecorder's emit-patch already set
@@ -55,7 +59,7 @@ export function withErrorcore<
         }
         return result;
       } catch (handlerError) {
-        if (instance.captureError !== undefined && handlerError instanceof Error) {
+        if (instance.captureError !== undefined) {
           try { instance.captureError(handlerError); } catch {}
         }
         throw handlerError;
@@ -120,7 +124,7 @@ export function withErrorcore<
           // outside runWithContext, which meant captured thrown errors
           // fell through to the ambient-events path — no ioTimeline filter
           // by requestId, no trace context, no state reads. [G2]
-          if (instance.captureError !== undefined && handlerError instanceof Error) {
+          if (instance.captureError !== undefined) {
             try { instance.captureError(handlerError); } catch {}
           }
           throw handlerError;

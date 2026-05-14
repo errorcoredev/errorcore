@@ -8,7 +8,7 @@ The SDK captures errors in Node.js applications, packages scrubbed context, opti
 
 Included in this SDK contract:
 
-- Error capture through explicit `captureError`, process-level handlers, and supported middleware.
+- Error capture through explicit `captureError(unknown)`, process-level handlers, and supported middleware.
 - Async request context through AsyncLocalStorage.
 - Outbound IO recording for existing HTTP/HTTPS, undici/fetch, DNS, TCP, and supported database driver hooks.
 - Opt-in local-variable capture through V8 Inspector.
@@ -30,6 +30,7 @@ Excluded from this SDK contract:
 
 ```text
 application error
+  -> thrown-value normalization
   -> ErrorCapturer
   -> PackageBuilder
   -> scrubber and size limits
@@ -41,6 +42,8 @@ application error
 ```
 
 Worker assembly and inline assembly share the same encryption options: primary DEK, previous DEKs, MAC key, derived key, and SDK version. Decryption uses the envelope SDK version for AAD so CLI/UI/DLQ paths can read envelopes produced by runtime workers.
+
+`Error` instances are captured unchanged. Non-Error thrown values are normalized to `NonErrorThrown`; the package records `thrownType` and a scrubbed, truncated `thrownValue`.
 
 ## Transport Contract
 
@@ -147,5 +150,7 @@ Completeness is recomputed after destructive trims. If the final serialized enve
 Runtime warning callbacks use `EC_*` codes. Warning context and cause are scrubbed before `onInternalWarning` is invoked.
 
 DLQ entries store the serialized envelope exactly once, with line-level signing when a stable secret exists. Replay/drain parses envelope metadata and sends typed transport payloads so HTTP replay retains key/event headers. `errorcore replay` is an alias for `errorcore drain`.
+
+CLI dry-run drains are read-only. `errorcore drain --rotate` re-signs entries under the active key and reports `EC_DLQ_LOCKED` if another process owns the DLQ lock.
 
 Health snapshots expose DLQ enabled/signed state, depth, and drop counters so operators can detect disabled or unsigned durability paths before transport failures occur.

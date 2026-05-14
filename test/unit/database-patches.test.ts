@@ -676,6 +676,72 @@ describe('G2 — PatchManager threads drivers config into installers', () => {
     expect(() => pm.installAll()).not.toThrow();
     expect(() => pm.unwrapAll()).not.toThrow();
   });
+
+  it('resolves string driver specifiers from the application root at install time', async () => {
+    const originalQuery = function originalQuery() { return 'pg-string'; };
+    const fakePg = {
+      Client: { prototype: { query: originalQuery } },
+      Pool: { prototype: {} }
+    };
+
+    await withDriverMocks({ pg: fakePg }, () => {
+      const pm = new PatchManager({
+        buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+        als: new ALSManager(),
+        config: resolveTestConfig({
+          drivers: { pg: 'pg' }
+        })
+      });
+
+      pm.installAll();
+
+      expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
+      expect(pm.getRecorderStates().pg).toEqual({ state: 'ok' });
+
+      pm.unwrapAll();
+      expect(fakePg.Client.prototype.query).toBe(originalQuery);
+    });
+  });
+
+  it('resolves lazy driver specifiers without calling constructor-style driver exports', () => {
+    const originalQuery = function originalQuery() { return 'pg-lazy'; };
+    const fakePg = {
+      Client: { prototype: { query: originalQuery } },
+      Pool: { prototype: {} }
+    };
+    const resolver = vi.fn(() => fakePg);
+    const pm = new PatchManager({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config: resolveTestConfig({
+        drivers: { pg: resolver }
+      })
+    });
+
+    pm.installAll();
+
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
+
+    pm.unwrapAll();
+    expect(fakePg.Client.prototype.query).toBe(originalQuery);
+  });
+
+  it('reports a missing explicit string driver without falling back to SDK dependencies', () => {
+    const pm = new PatchManager({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config: resolveTestConfig({
+        drivers: { pg: '@errorcore/missing-pg-driver' }
+      })
+    });
+
+    expect(() => pm.installAll()).not.toThrow();
+    expect(pm.getRecorderStates().pg).toEqual({
+      state: 'skip',
+      reason: 'not-installed'
+    });
+  });
 });
 
 describe('G2 — pg installer with explicit driver', () => {

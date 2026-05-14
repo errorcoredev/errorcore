@@ -2,6 +2,8 @@
 import {
   filterHeaders,
   getModuleInstance,
+  prepareForRequestStart,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
@@ -23,13 +25,15 @@ export function fastifyPlugin(sdk?: SDKInstanceLike) {
     done: () => void
   ): void => {
     fastify.addHook('onRequest', (request, reply, next) => {
-      const instance = sdk ?? getModuleInstance();
+      const instance = resolveLiveSDK(sdk ?? getModuleInstance());
 
       if (instance === null || !instance.isActive()) {
         warnIfUninitialized('fastifyPlugin()');
         next();
         return;
       }
+
+      prepareForRequestStart(instance);
 
       if (reply.raw.finished === true || instance.als.getContext?.() !== undefined) {
         next();
@@ -64,6 +68,12 @@ export function fastifyPlugin(sdk?: SDKInstanceLike) {
           response: reply.raw
         });
       } catch {
+        next();
+        return;
+      }
+
+      if (typeof instance.als.enterWithContext === 'function') {
+        instance.als.enterWithContext(ctx);
         next();
         return;
       }

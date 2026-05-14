@@ -2,6 +2,8 @@
 import {
   filterHeaders,
   getModuleInstance,
+  prepareForRequestStart,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
@@ -14,13 +16,15 @@ export function wrapHandler<
   ) => void
 >(handler: T, sdk?: SDKInstanceLike): T {
   return ((req, res) => {
-    const instance = sdk ?? getModuleInstance();
+    const instance = resolveLiveSDK(sdk ?? getModuleInstance());
 
     if (instance === null || !instance.isActive()) {
       warnIfUninitialized('wrapHandler()');
       handler(req, res);
       return;
     }
+
+    prepareForRequestStart(instance);
 
     if (res.finished === true || instance.als.getContext?.() !== undefined) {
       handler(req, res);

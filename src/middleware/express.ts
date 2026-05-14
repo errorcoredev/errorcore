@@ -2,6 +2,8 @@
 import {
   filterHeaders,
   getModuleInstance,
+  prepareForRequestStart,
+  resolveLiveSDK,
   warnIfUninitialized,
   type SDKInstanceLike
 } from './common';
@@ -11,15 +13,17 @@ export function expressMiddleware(sdk?: SDKInstanceLike) {
   return (
     req: { method: string; url: string; headers: Record<string, unknown> },
     res: { finished?: boolean; on(event: 'finish', listener: () => void): void },
-    next: () => void
+  next: () => void
   ): void => {
-    const instance = sdk ?? getModuleInstance();
+    const instance = resolveLiveSDK(sdk ?? getModuleInstance());
 
     if (instance === null || !instance.isActive()) {
       warnIfUninitialized('expressMiddleware()');
       next();
       return;
     }
+
+    prepareForRequestStart(instance);
 
     if (res.finished === true) {
       next();

@@ -31,6 +31,18 @@ errorcore.init();
 
 That's it. In development (`NODE_ENV !== 'production'`), errorcore defaults to stdout transport and unencrypted payloads. Throw an error and the captured payload prints to your terminal.
 
+### Manual capture
+
+```js
+try {
+  await job();
+} catch (err) {
+  errorcore.captureError(err);
+}
+```
+
+`captureError` accepts `unknown`, not just `Error`. Primitive throws and plain-object throws are normalized to `NonErrorThrown` with a safe `thrownType` and scrubbed `thrownValue` before packaging.
+
 ### Quick start (fastest path)
 
 ```bash
@@ -104,7 +116,19 @@ errorcore.init({
 });
 ```
 
-**Tier 3: Next.js App Router**: externalize drivers from the webpack bundle:
+Entries may also be package names or lazy resolvers:
+
+```ts
+errorcore.init({
+  drivers: {
+    pg: 'pg',
+    mysql2: () => require('mysql2'),
+    mongodb: require('mongodb'),
+  },
+});
+```
+
+**Tier 3: Next.js App Router**: pass package-name drivers and externalize them from the webpack bundle:
 
 ```js
 // next.config.js
@@ -113,7 +137,7 @@ module.exports = {
 };
 ```
 
-Without this, the DB timeline will not populate. The startup diagnostic will report `warn(bundled-unpatched)`. HTTP inbound, HTTP outbound, and `fetch` (undici) recording work in all three tiers.
+Without this, the DB timeline will not populate. The startup diagnostic will report `warn(bundled-unpatched)` when explicit drivers are missing. HTTP inbound, HTTP outbound, and `fetch` (undici) recording work in all three tiers.
 
 ## Startup diagnostic
 
@@ -145,6 +169,8 @@ errorcore.init({
 ```
 
 `undefined` returns (pass-through middleware) are never captured regardless of this setting. `withNextMiddleware` captures middleware execution; wrap route handlers separately when route-handler ALS context is required.
+
+`errorcore/nextjs/edge` remains import-safe in Edge runtime, but it is a no-op compatibility stub in this release. Use Node runtime middleware and route/server-action wrappers for functional capture.
 
 ## Documentation
 

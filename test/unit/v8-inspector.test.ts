@@ -258,6 +258,32 @@ describe('InspectorManager', () => {
     });
   });
 
+  it('re-enables pause-on-exceptions when ensureDebuggerActive is called after idle deactivation', () => {
+    createTimerStubs();
+    const timeoutTimers = createTimeoutStubs();
+    const inspector = createInspectorMock();
+
+    withInspectorMock(inspector.inspectorModule, () => {
+      const manager = new InspectorManager(createInspectorConfig(), {
+        getRequestId: () => 'req-1'
+      });
+
+      manager.ensureDebuggerActive();
+      timeoutTimers.timers[0]?.fn();
+      manager.ensureDebuggerActive();
+
+      const pauseCalls = inspector.session.post.mock.calls.filter(
+        (call) => call[0] === 'Debugger.setPauseOnExceptions'
+      );
+      expect(pauseCalls.map((call) => call[1])).toEqual([
+        { state: 'all' },
+        { state: 'none' },
+        { state: 'all' }
+      ]);
+      manager.shutdown();
+    });
+  });
+
   it('resumes immediately for non-exception pauses', () => {
     createTimerStubs();
     createTimeoutStubs();

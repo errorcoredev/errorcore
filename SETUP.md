@@ -176,18 +176,18 @@ captureMiddlewareStatusCodes: 'none',
 
 ### Database driver references
 
-In bundled environments (Next.js, Vite SSR, esbuild), `require()` may not reach the same module instance the application uses, so the SDK's monkey-patches silently miss queries. Pass the driver references explicitly to install patches against the application's actual module graph:
+In bundled environments, `require()` may not reach the same module instance the application uses, so the SDK's monkey-patches silently miss queries. Pass driver references explicitly as module objects, package-name strings, or lazy resolvers:
 
 ```js
 drivers: {
-  pg: require('pg'),
-  mongodb: require('mongodb'),
-  mysql2: require('mysql2'),
+  pg: 'pg',
+  mongodb: 'mongodb',
+  mysql2: () => require('mysql2'),
   ioredis: require('ioredis'),
 }
 ```
 
-Only include the drivers your application uses; each entry is optional. For Next.js App Router specifically, prefer the `serverExternalPackages` approach documented in the README -- it externalizes drivers from the webpack bundle and makes the explicit reference unnecessary. The startup diagnostic line reports `warn(bundled-unpatched)` for any driver that was found but could not be patched.
+String entries are resolved at SDK runtime from the application root, which avoids forcing Next.js production builds to import optional database packages at the top level. Only include the drivers your application uses; each entry is optional. For Next.js App Router, pair package-name entries with `serverExternalPackages` in `next.config.js`. The startup diagnostic line reports `warn(bundled-unpatched)` when a driver was found but could not be patched.
 
 ### Body capture content types
 
@@ -201,6 +201,8 @@ bodyCaptureContentTypes: [
   'application/xml',
 ]
 ```
+
+Multipart form-data is never buffered for body capture. It records the literal marker `MULTIPART_REDACTED` instead.
 
 ### PII filtering
 
@@ -393,6 +395,8 @@ The dashboard requires `hono` and `@hono/node-server` at runtime; both are liste
 By default, all CLI subcommands (`validate`, `status`, `drain`, `ui`) refuse to load a `--config <path>` that resolves outside the current working directory. This blocks accidental or hostile invocations from running arbitrary JavaScript whose path is controlled only by the process cwd at startup.
 
 Pass `--allow-external-config` to load a config from an absolute path or a path with `..` segments. Use this when the config lives in a shared mount point (`/etc/errorcore.config.js`) or in a directory above the CLI's cwd in a monorepo. Do not pass it in CI without auditing the path.
+
+The flag is order-independent, so both `errorcore --allow-external-config drain --config ../errorcore.config.js` and `errorcore drain --config ../errorcore.config.js --allow-external-config` are accepted.
 
 ## Verification
 
