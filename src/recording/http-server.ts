@@ -7,14 +7,26 @@ import type { Socket } from 'node:net';
 
 import type { IOEventSlot, RequestContext, ResolvedConfig } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
-import { extractFd, toDurationMs } from './utils';
+import { extractFd, pushIOEvent, toDurationMs } from './utils';
+import type { RecorderState } from '../sdk-diagnostics';
+import { safeConsole } from '../debug-log';
+import { registerRequestCleanup } from '../context/request-tracker';
+import { RequestContextCarrier } from '../context/request-context-carrier';
 
 interface IOEventBufferLike {
-  push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
+  push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
     slot: IOEventSlot;
     seq: number;
   };
-  updatePayloadBytes(oldBytes: number, newBytes: number): void;
+  updatePayloadBytes(oldBytes: number, newBytes: number, slot?: IOEventSlot): void;
+  compactCompletedRequest?(
+    requestId: string,
+    compactSlot?: (slot: IOEventSlot) => void
+  ): number;
+  releaseCompletedRequest?(
+    requestId: string,
+    compactSlot?: (slot: IOEventSlot) => void
+  ): number;
 }
 
 interface ALSManagerLike {
@@ -22,6 +34,8 @@ interface ALSManagerLike {
     method: string;
     url: string;
     headers: Record<string, string>;
+    traceparent?: string;
+    tracestate?: string;
   }): RequestContext;
   runWithContext<T>(ctx: RequestContext, fn: () => T): T;
   getContext(): RequestContext | undefined;
@@ -42,6 +56,7 @@ interface BodyCaptureLike {
     onBytesChanged: (oldBytes: number, newBytes: number) => void
   ): void;
   releaseInboundRequest(req: IncomingMessage): void;
+  releaseSlotBodies(slot: IOEventSlot): void;
   captureOutboundResponse(
     res: ServerResponse,
     slot: IOEventSlot,
@@ -50,6 +65,11 @@ interface BodyCaptureLike {
   ): void;
   materializeContextBody(context: RequestContext): void;
   materializeSlotBodies(slot: IOEventSlot): void;
+}
+
+interface PayloadSpoolLike {
+  markRequestComplete(requestId: string): void;
+  sweep(): void;
 }
 
 interface HeaderFilterLike {
@@ -61,6 +81,14 @@ interface ScrubberLike {
   scrubUrl(rawUrl: string): string;
 }
 
+interface RequestContextCarrierLike {
+  get(request: unknown): RequestContext | undefined;
+  set(request: unknown, context: RequestContext): void;
+  getOrCreate(request: unknown, create: () => RequestContext): RequestContext;
+  claimCleanupRegistration(request: unknown): boolean;
+  delete(request: unknown): void;
+}
+
 interface BindStoreChannel {
   bindStore?: (
     store: AsyncLocalStorage<RequestContext>,
@@ -69,6 +97,8 @@ interface BindStoreChannel {
 }
 
 const RESPONSE_FINALIZER = Symbol('errorcore.responseFinalizer');
+
+const FINALIZED_REQUESTS = new WeakSet<IncomingMessage>();
 
 type ResponseWithFinalizer = ServerResponse & {
   [RESPONSE_FINALIZER]?: RequestFinalizer;
@@ -94,19 +124,21 @@ class RequestFinalizer {
 
   public bodyCapture!: BodyCaptureLike;
 
-  public requestContexts!: WeakMap<object, RequestContext>;
+  public requestContextCarrier!: RequestContextCarrierLike;
+
+  public payloadSpool!: PayloadSpoolLike | null;
 
   public pool!: RequestFinalizer[];
 
   public finalized = false;
 
   public readonly updateInboundPayloadBytes = (oldBytes: number, newBytes: number): void => {
-    this.buffer.updatePayloadBytes(oldBytes, newBytes);
+    this.buffer.updatePayloadBytes(oldBytes, newBytes, this.slot);
     this.context.bodyTruncated = this.slot.requestBodyTruncated;
   };
 
   public readonly updateOutboundPayloadBytes = (oldBytes: number, newBytes: number): void => {
-    this.buffer.updatePayloadBytes(oldBytes, newBytes);
+    this.buffer.updatePayloadBytes(oldBytes, newBytes, this.slot);
   };
 
   public initialize(input: {
@@ -119,7 +151,8 @@ class RequestFinalizer {
     als: ALSManagerLike;
     headerFilter: HeaderFilterLike;
     bodyCapture: BodyCaptureLike;
-    requestContexts: WeakMap<object, RequestContext>;
+    requestContextCarrier: RequestContextCarrierLike;
+    payloadSpool: PayloadSpoolLike | null;
     pool: RequestFinalizer[];
   }): this {
     this.buffer = input.buffer;
@@ -131,7 +164,8 @@ class RequestFinalizer {
     this.als = input.als;
     this.headerFilter = input.headerFilter;
     this.bodyCapture = input.bodyCapture;
-    this.requestContexts = input.requestContexts;
+    this.requestContextCarrier = input.requestContextCarrier;
+    this.payloadSpool = input.payloadSpool;
     this.pool = input.pool;
     this.finalized = false;
     return this;
@@ -152,8 +186,19 @@ class RequestFinalizer {
     this.context.body = this.slot.requestBody;
     this.context.bodyTruncated = this.slot.requestBodyTruncated;
     this.bodyCapture.releaseInboundRequest(this.request);
+    const responseCompleted =
+      (this.response as ResponseWithFinalizer).writableFinished === true ||
+      (this.response as ResponseWithFinalizer).writableEnded === true;
+    if ((this.slot.statusCode ?? 0) < 500 && (!aborted || responseCompleted)) {
+      this.buffer.releaseCompletedRequest?.(
+        this.context.requestId,
+        (slot) => this.bodyCapture.releaseSlotBodies(slot)
+      );
+    }
     this.requestTracker.remove(this.context.requestId);
-    this.requestContexts.delete(this.request);
+    this.payloadSpool?.markRequestComplete(this.context.requestId);
+    this.payloadSpool?.sweep();
+    this.requestContextCarrier.delete(this.request);
     this.als.releaseRequestContext?.(this.context);
     this.response.removeListener('close', handleResponseClose);
     delete (this.response as ResponseWithFinalizer)[RESPONSE_FINALIZER];
@@ -173,7 +218,8 @@ class RequestFinalizer {
     this.als = undefined as never;
     this.headerFilter = undefined as never;
     this.bodyCapture = undefined as never;
-    this.requestContexts = undefined as never;
+    this.requestContextCarrier = undefined as never;
+    this.payloadSpool = null;
     this.pool = undefined as never;
   }
 }
@@ -181,10 +227,12 @@ class RequestFinalizer {
 function handleResponseClose(this: ServerResponse): void {
   const response = this as ResponseWithFinalizer;
   const finalizer = response[RESPONSE_FINALIZER];
-
   if (finalizer === undefined) {
     return;
   }
+  const request = finalizer.request;
+  if (FINALIZED_REQUESTS.has(request)) return;
+  FINALIZED_REQUESTS.add(request);
 
   finalizer.finalize(
     !((response.writableFinished ?? false) || response.writableEnded)
@@ -206,11 +254,13 @@ export class HttpServerRecorder {
 
   private readonly config: ResolvedConfig;
 
-  private readonly requestContexts = new WeakMap<object, RequestContext>();
+  private readonly requestContextCarrier: RequestContextCarrierLike;
+
+  private readonly payloadSpool: PayloadSpoolLike | null;
 
   private readonly finalizerPool: RequestFinalizer[] = [];
 
-  private readonly pushEventScratch = {} as Omit<IOEventSlot, 'seq' | 'estimatedBytes'>;
+  private readonly pushEventScratch = {} as Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>;
 
   private bindStoreSucceeded = false;
 
@@ -224,6 +274,8 @@ export class HttpServerRecorder {
     headerFilter: HeaderFilterLike;
     scrubber: ScrubberLike;
     config: ResolvedConfig;
+    payloadSpool?: PayloadSpoolLike | null;
+    requestContextCarrier?: RequestContextCarrierLike;
   }) {
     this.buffer = deps.buffer;
     this.als = deps.als;
@@ -232,26 +284,36 @@ export class HttpServerRecorder {
     this.headerFilter = deps.headerFilter;
     this.scrubber = deps.scrubber;
     this.config = deps.config;
+    this.payloadSpool = deps.payloadSpool ?? null;
+    this.requestContextCarrier = deps.requestContextCarrier ?? new RequestContextCarrier();
   }
 
   public install(): void {
     this.tryBindStore();
-    if (!this.bindStoreSucceeded) {
-      this.installEmitPatch();
-    }
+    // Always install the emit-patch. bindStore wraps channel subscribers
+    // with store.run() during channel.publish(), but it does NOT set the
+    // ALS for the downstream server.emit('request', req, res) call. As a
+    // result, request handlers registered via server.on('request', ...)
+    // (Next.js, Fastify, any framework that uses the event) run outside
+    // our ALS scope when only bindStore is active. The emit-patch wraps
+    // Server.prototype.emit('request') in als.runWithContext(), which is
+    // the mechanism that makes the context available to those handlers.
+    // bindStore and emit-patch use the same WeakMap<IncomingMessage,
+    // RequestContext> backing store, so they return the same context for
+    // the same request - no double-registration.
+    this.installEmitPatch();
   }
 
   public handleRequestStart(message: {
     request: IncomingMessage;
     response: ServerResponse;
-    socket: Socket;
+    socket?: Socket;
     server: Server;
   }): void {
     try {
       if (
         message.request === undefined ||
-        message.response === undefined ||
-        message.socket === undefined
+        message.response === undefined
       ) {
         return;
       }
@@ -276,7 +338,7 @@ export class HttpServerRecorder {
       event.method = context.method;
       event.url = context.url;
       event.statusCode = null;
-      event.fd = extractFd(socket);
+      event.fd = socket === undefined ? null : extractFd(socket);
       event.requestHeaders = context.headers;
       event.responseHeaders = null;
       event.requestBody = null;
@@ -293,7 +355,7 @@ export class HttpServerRecorder {
 
       const { slot, seq } = this.buffer.push(event);
 
-      context.ioEvents.push(slot);
+      pushIOEvent(context, slot, this.config.bufferSize);
 
       const finalizer = (this.finalizerPool.pop() ?? new RequestFinalizer()).initialize({
         buffer: this.buffer,
@@ -305,7 +367,8 @@ export class HttpServerRecorder {
         als: this.als,
         headerFilter: this.headerFilter,
         bodyCapture: this.bodyCapture,
-        requestContexts: this.requestContexts,
+        requestContextCarrier: this.requestContextCarrier,
+        payloadSpool: this.payloadSpool,
         pool: this.finalizerPool
       });
 
@@ -317,17 +380,56 @@ export class HttpServerRecorder {
         finalizer.updateOutboundPayloadBytes
       );
 
+      if (this.requestContextCarrier.claimCleanupRegistration(request)) {
+        registerRequestCleanup({
+          requestTracker: this.requestTracker,
+          requestId: context.requestId,
+          request,
+          response,
+          onResponseComplete: () => {
+            if ((response.statusCode ?? 0) < 500) {
+              this.buffer.releaseCompletedRequest?.(
+                context.requestId,
+                (entry) => this.bodyCapture.releaseSlotBodies(entry)
+              );
+            }
+          }
+        });
+      }
+
       (response as ResponseWithFinalizer)[RESPONSE_FINALIZER] = finalizer;
       response.on('close', handleResponseClose);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record inbound HTTP request: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record inbound HTTP request: ${messageText}`);
+    }
+  }
+
+  public handleResponseFinish(message: unknown): void {
+    try {
+      const request = (message as { request?: IncomingMessage }).request;
+      const response = (message as { response?: ServerResponse }).response;
+      if (request === undefined || response === undefined) return;
+      if (FINALIZED_REQUESTS.has(request)) return;
+
+      const finalizer = (response as ResponseWithFinalizer)[RESPONSE_FINALIZER];
+      if (finalizer === undefined) return;
+      FINALIZED_REQUESTS.add(request);
+      // Channel-driven finalization is never "aborted" - response.finish fires on clean lifecycle.
+      finalizer.finalize(false);
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      safeConsole.warn(`[ErrorCore] Failed to finalize response via channel: ${messageText}`);
     }
   }
 
   public shutdown(): void {
     this.emitPatchRestore?.();
     this.emitPatchRestore = null;
+  }
+
+  public getState(): RecorderState {
+    return { state: 'ok' };
   }
 
   public getBindStorePath(): 'bindStore' | 'emit-patch' {
@@ -363,7 +465,7 @@ export class HttpServerRecorder {
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] bindStore unavailable, using emit patch (reason: ${reason})`);
+      safeConsole.warn(`[ErrorCore] bindStore unavailable, using emit patch (reason: ${reason})`);
       process.emit('errorcore:init' as never, { path: 'emit-patch', reason } as never);
     }
   }
@@ -396,21 +498,31 @@ export class HttpServerRecorder {
   }
 
   private getOrCreateContext(request: IncomingMessage): RequestContext {
-    const existing = this.requestContexts.get(request);
-
-    if (existing !== undefined) {
-      return existing;
-    }
-
-    const headers = this.getFilteredRequestHeaders(request.headers as Record<string, unknown>);
-    const context = this.als.createRequestContext({
-      method: request.method ?? 'UNKNOWN',
-      url: request.url ?? '',
-      headers
+    return this.requestContextCarrier.getOrCreate(request, () => {
+      const rawHeaders = request.headers as Record<string, unknown>;
+      const headers = this.getFilteredRequestHeaders(rawHeaders);
+      return this.als.createRequestContext({
+        method: request.method ?? 'UNKNOWN',
+        url: this.scrubUrl(request.url ?? ''),
+        headers,
+        // W3C trace context (modules 06, 21): pull these BEFORE filtering so
+        // the headerAllowlist doesn't strip them. ALSManager parses both.
+        traceparent: typeof rawHeaders['traceparent'] === 'string'
+          ? (rawHeaders['traceparent'] as string)
+          : undefined,
+        tracestate: typeof rawHeaders['tracestate'] === 'string'
+          ? (rawHeaders['tracestate'] as string)
+          : undefined
+      });
     });
+  }
 
-    this.requestContexts.set(request, context);
-    return context;
+  private scrubUrl(rawUrl: string): string {
+    try {
+      return this.scrubber.scrubUrl(rawUrl);
+    } catch {
+      return '';
+    }
   }
 
   private getFilteredRequestHeaders(

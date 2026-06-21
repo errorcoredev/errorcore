@@ -6,10 +6,12 @@ import type { Socket } from 'node:net';
 import type { IOEventSlot, RequestContext } from '../types';
 import { installOwnedWrapper } from './patches/patch-manager';
 import { isInternalCallActive, runAsInternal } from './internal';
-import { extractFd, toDurationMs } from './utils';
+import { extractFd, pushIOEvent, toDurationMs } from './utils';
+import type { RecorderState } from '../sdk-diagnostics';
+import { safeConsole } from '../debug-log';
 
 interface IOEventBufferLike {
-  push(event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>): {
+  push(event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>): {
     slot: IOEventSlot;
     seq: number;
   };
@@ -116,10 +118,10 @@ export class NetDnsRecorder {
         aborted: false
       });
 
-      context?.ioEvents.push(slot);
+      pushIOEvent(context, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record TCP connect: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record TCP connect: ${messageText}`);
     }
   }
 
@@ -164,10 +166,10 @@ export class NetDnsRecorder {
         aborted: false
       });
 
-      context?.ioEvents.push(slot);
+      pushIOEvent(context, slot);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Failed to record DNS lookup: ${messageText}`);
+      safeConsole.warn(`[ErrorCore] Failed to record DNS lookup: ${messageText}`);
     }
   }
 
@@ -175,6 +177,10 @@ export class NetDnsRecorder {
     while (this.restores.length > 0) {
       this.restores.pop()?.();
     }
+  }
+
+  public getState(): RecorderState {
+    return { state: 'ok' };
   }
 
   private patchNet(): void {

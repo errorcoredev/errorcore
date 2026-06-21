@@ -1,0 +1,8 @@
+{
+  "id": "hapi",
+  "framework": "hapi",
+  "repo": "agendor/sample-hapi-rest-api",
+  "pin": "4706ead645949fb4e32c62f2582bfd4c1c7659a1",
+  "sourceDir": "source",
+  "overlay": "../benchmark-app"
+}

@@ -3,6 +3,7 @@ import Module = require('node:module');
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ChannelSubscriber } from '../../src/recording/channel-subscriber';
+import { setLogLevel, __resetLogLevel } from '../../src/debug-log';
 
 const originalRequire = Module.prototype.require;
 
@@ -29,7 +30,8 @@ function withDiagnosticsChannelMock<T>(
 function createSubscriber() {
   return new ChannelSubscriber({
     httpServer: {
-      handleRequestStart: vi.fn()
+      handleRequestStart: vi.fn(),
+      handleResponseFinish: vi.fn()
     },
     httpClient: {
       handleRequestStart: vi.fn()
@@ -66,6 +68,7 @@ describe('ChannelSubscriber', () => {
 
     expect(diagnosticsChannel.subscribe.mock.calls.map((call) => call[0])).toEqual([
       'http.server.request.start',
+      'http.server.response.finish',
       'http.client.request.start',
       'undici:request:create',
       'undici:request:headers',
@@ -88,9 +91,10 @@ describe('ChannelSubscriber', () => {
       subscriber.unsubscribeAll();
     });
 
-    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(7);
+    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(8);
     expect(diagnosticsChannel.unsubscribe.mock.calls.map((call) => call[0])).toEqual([
       'http.server.request.start',
+      'http.server.response.finish',
       'http.client.request.start',
       'undici:request:create',
       'undici:request:headers',
@@ -110,7 +114,8 @@ describe('ChannelSubscriber', () => {
       httpServer: {
         handleRequestStart: vi.fn(() => {
           throw new Error('boom');
-        })
+        }),
+        handleResponseFinish: vi.fn()
       },
       httpClient: {
         handleRequestStart: vi.fn()
@@ -139,26 +144,31 @@ describe('ChannelSubscriber', () => {
   });
 
   it('skips missing channels without throwing', () => {
+    setLogLevel('debug');
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
-    const diagnosticsChannel = {
-      subscribe: vi.fn((channelName: string) => {
-        if (channelName === 'net.client.socket') {
-          throw new Error('missing channel');
-        }
-      }),
-      unsubscribe: vi.fn()
-    };
+    try {
+      const diagnosticsChannel = {
+        subscribe: vi.fn((channelName: string) => {
+          if (channelName === 'net.client.socket') {
+            throw new Error('missing channel');
+          }
+        }),
+        unsubscribe: vi.fn()
+      };
 
-    expect(() =>
-      withDiagnosticsChannelMock(diagnosticsChannel, () => {
-        const subscriber = createSubscriber();
+      expect(() =>
+        withDiagnosticsChannelMock(diagnosticsChannel, () => {
+          const subscriber = createSubscriber();
 
-        subscriber.subscribeAll();
-      })
-    ).not.toThrow();
+          subscriber.subscribeAll();
+        })
+      ).not.toThrow();
 
-    expect(debug).toHaveBeenCalledTimes(1);
-    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(7);
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(8);
+    } finally {
+      __resetLogLevel();
+    }
   });
 
   it('is idempotent when subscribeAll is called twice', () => {
@@ -174,7 +184,42 @@ describe('ChannelSubscriber', () => {
       subscriber.subscribeAll();
     });
 
-    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(14);
-    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(7);
+    expect(diagnosticsChannel.subscribe).toHaveBeenCalledTimes(16);
+    expect(diagnosticsChannel.unsubscribe).toHaveBeenCalledTimes(8);
+  });
+});
+
+describe('G2 - response finish subscription', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('subscribes to response finish without treating response creation as completion', () => {
+    const subscribed: string[] = [];
+    const diagnosticsChannel = {
+      subscribe: vi.fn((name: string) => { subscribed.push(name); }),
+      unsubscribe: vi.fn()
+    };
+    withDiagnosticsChannelMock(diagnosticsChannel, () => {
+      const sub = new ChannelSubscriber({
+        httpServer: {
+          handleRequestStart: vi.fn(),
+          handleResponseFinish: vi.fn()
+        },
+        httpClient: { handleRequestStart: vi.fn() },
+        undiciRecorder: {
+          handleRequestCreate: vi.fn(),
+          handleRequestHeaders: vi.fn(),
+          handleRequestTrailers: vi.fn(),
+          handleRequestError: vi.fn()
+        },
+        netDns: { handleNetConnect: vi.fn() }
+      });
+      sub.subscribeAll();
+    });
+
+    expect(subscribed).toContain('http.server.response.finish');
+    expect(subscribed).not.toContain('http.server.response.created');
   });
 });

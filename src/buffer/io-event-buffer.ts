@@ -1,16 +1,19 @@
 
+import type { EventClock } from '../context/event-clock';
 import type { AmbientEventContext, EvictionRecord, IOEventSlot } from '../types';
 
 // Accounts for serialized JSON field names and structure, not the in-memory null slot size.
 const METADATA_OVERHEAD = 256;
 
-type PushableIOEvent = Omit<IOEventSlot, 'seq' | 'estimatedBytes'>;
+type PushableIOEvent = Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>;
 
 const EMPTY_REQUEST_SLOTS: IOEventSlot[] = [];
 
 interface IOEventBufferOptions {
   capacity: number;
   maxBytes: number;
+  eventClock: EventClock;
+  storeContextEvents?: boolean;
 }
 
 interface IOEventBufferStats {
@@ -21,9 +24,11 @@ interface IOEventBufferStats {
   maxBytes: number;
 }
 
+type SlotCompactor = (slot: IOEventSlot) => void;
+
 function estimateBytes(event: {
-  requestBody: Buffer | null;
-  responseBody: Buffer | null;
+  requestBody: string | Buffer | null;
+  responseBody: string | Buffer | null;
 }): number {
   return (
     METADATA_OVERHEAD +
@@ -49,7 +54,11 @@ export class IOEventBuffer {
 
   private overflowCount = 0;
 
-  private nextSeq = 1;
+  private readonly eventClock: EventClock;
+
+  private readonly storeContextEvents: boolean;
+
+  private readonly storedSlots = new WeakSet<IOEventSlot>();
 
   private requestIdIndex: Map<string, IOEventSlot[]> | null = null;
 
@@ -64,6 +73,8 @@ export class IOEventBuffer {
   public constructor(options: IOEventBufferOptions) {
     this.capacity = options.capacity;
     this.maxBytes = options.maxBytes;
+    this.eventClock = options.eventClock;
+    this.storeContextEvents = options.storeContextEvents ?? true;
     this.slots = new Array<IOEventSlot | null>(this.capacity).fill(null);
     this.evictionSlots = new Array<EvictionRecord | null>(
       IOEventBuffer.EVICTION_LOG_CAPACITY
@@ -72,8 +83,19 @@ export class IOEventBuffer {
 
   public push(event: PushableIOEvent): { slot: IOEventSlot; seq: number } {
     this.requestIdIndex = null;
-    const seq = this.nextSeq;
+    const seq = this.eventClock.tick();
     const estimatedBytes = estimateBytes(event);
+    const slot = {} as IOEventSlot;
+    this.assignSlot(slot, event, seq, estimatedBytes);
+
+    if (
+      !this.storeContextEvents &&
+      event.requestId !== null &&
+      event.contextLost === false
+    ) {
+      return { slot, seq };
+    }
+
     const index = this.writeHead % this.capacity;
     const overwrittenSlot = this.slots[index];
 
@@ -81,24 +103,28 @@ export class IOEventBuffer {
       this.evictIndex(index);
     }
 
-    while (this.payloadBytes + estimatedBytes > this.maxBytes && this.slotCount > 0) {
-      this.evictOldest();
-    }
-
-    const slot = {} as IOEventSlot;
-    this.assignSlot(slot, event, seq, estimatedBytes);
+    this.enforceByteBudget(estimatedBytes);
 
     this.slots[index] = slot;
+    this.storedSlots.add(slot);
     this.payloadBytes += estimatedBytes;
     this.slotCount += 1;
     this.writeHead += 1;
-    this.nextSeq += 1;
 
     return { slot, seq };
   }
 
-  public updatePayloadBytes(oldBytes: number, newBytes: number): void {
+  public updatePayloadBytes(
+    oldBytes: number,
+    newBytes: number,
+    slot?: IOEventSlot
+  ): void {
+    if (slot !== undefined && !this.storedSlots.has(slot)) {
+      return;
+    }
+    this.requestIdIndex = null;
     this.payloadBytes += newBytes - oldBytes;
+    this.enforceByteBudget();
   }
 
   public filterByRequestId(requestId: string): IOEventSlot[] {
@@ -254,6 +280,78 @@ export class IOEventBuffer {
     };
   }
 
+  public compactCompletedRequest(
+    requestId: string,
+    compactSlot?: SlotCompactor
+  ): number {
+    let compacted = 0;
+
+    for (let cursor = this.readHead; cursor < this.writeHead; cursor += 1) {
+      const slot = this.slots[cursor % this.capacity];
+      if (
+        slot === null ||
+        slot.requestId !== requestId ||
+        slot.phase !== 'done' ||
+        slot.error !== null ||
+        slot.aborted
+      ) {
+        continue;
+      }
+
+      const oldBytes = slot.estimatedBytes;
+      compactSlot?.(slot);
+      this.compactSuccessfulSlot(slot);
+      this.payloadBytes += slot.estimatedBytes - oldBytes;
+      compacted += 1;
+    }
+
+    return compacted;
+  }
+
+  public releaseCompletedRequest(
+    requestId: string,
+    compactSlot?: SlotCompactor
+  ): number {
+    let released = 0;
+    this.requestIdIndex = null;
+
+    for (let cursor = this.readHead; cursor < this.writeHead; cursor += 1) {
+      const index = cursor % this.capacity;
+      const slot = this.slots[index];
+      if (
+        slot === null ||
+        slot.requestId !== requestId ||
+        slot.phase !== 'done' ||
+        slot.error !== null ||
+        slot.aborted
+      ) {
+        continue;
+      }
+
+      const oldBytes = slot.estimatedBytes;
+      compactSlot?.(slot);
+      this.compactSuccessfulSlot(slot);
+      this.payloadBytes += slot.estimatedBytes - oldBytes;
+      this.evictIndex(index, false);
+      released += 1;
+    }
+
+    return released;
+  }
+
+  public compactDetachedSlot(
+    slot: IOEventSlot,
+    compactSlot?: SlotCompactor
+  ): boolean {
+    if (slot.phase !== 'done' || slot.error !== null || slot.aborted) {
+      return false;
+    }
+
+    compactSlot?.(slot);
+    this.compactSuccessfulSlot(slot);
+    return true;
+  }
+
   private collectChronological(): IOEventSlot[] {
     const liveSlots: IOEventSlot[] = [];
 
@@ -279,30 +377,41 @@ export class IOEventBuffer {
     }
   }
 
-  private evictIndex(index: number): void {
+  private enforceByteBudget(incomingBytes = 0): void {
+    while (this.payloadBytes + incomingBytes > this.maxBytes && this.slotCount > 0) {
+      this.evictOldest();
+    }
+  }
+
+  private evictIndex(index: number, countOverflow = true): void {
     const slot = this.slots[index];
     if (slot === null) {
       return;
     }
 
-    const cap = IOEventBuffer.EVICTION_LOG_CAPACITY;
-    const logIndex = this.evictionWriteHead % cap;
-    this.evictionSlots[logIndex] = {
-      seq: slot.seq,
-      type: slot.type,
-      direction: slot.direction,
-      target: slot.target,
-      requestId: slot.requestId,
-      startTime: slot.startTime,
-      evictedAt: process.hrtime.bigint()
-    };
-    this.evictionWriteHead += 1;
-    this.evictionCount += 1;
+    if (countOverflow) {
+      const cap = IOEventBuffer.EVICTION_LOG_CAPACITY;
+      const logIndex = this.evictionWriteHead % cap;
+      this.evictionSlots[logIndex] = {
+        seq: slot.seq,
+        type: slot.type,
+        direction: slot.direction,
+        target: slot.target,
+        requestId: slot.requestId,
+        startTime: slot.startTime,
+        evictedAt: process.hrtime.bigint()
+      };
+      this.evictionWriteHead += 1;
+      this.evictionCount += 1;
+    }
 
     this.slots[index] = null;
+    this.storedSlots.delete(slot);
     this.payloadBytes -= slot.estimatedBytes;
     this.slotCount -= 1;
-    this.overflowCount += 1;
+    if (countOverflow) {
+      this.overflowCount += 1;
+    }
 
     if (this.slotCount === 0) {
       this.readHead = this.writeHead;
@@ -321,6 +430,7 @@ export class IOEventBuffer {
     estimatedBytes: number
   ): void {
     slot.seq = seq;
+    slot.hrtimeNs = process.hrtime.bigint();
     slot.phase = event.phase;
     slot.startTime = event.startTime;
     slot.endTime = event.endTime;
@@ -340,6 +450,8 @@ export class IOEventBuffer {
     slot.responseBody = event.responseBody;
     slot.requestBodyDigest = event.requestBodyDigest ?? null;
     slot.responseBodyDigest = event.responseBodyDigest ?? null;
+    slot.requestPayloadRef = event.requestPayloadRef ?? null;
+    slot.responsePayloadRef = event.responsePayloadRef ?? null;
     slot.requestBodyTruncated = event.requestBodyTruncated;
     slot.responseBodyTruncated = event.responseBodyTruncated;
     slot.requestBodyOriginalSize = event.requestBodyOriginalSize;
@@ -348,5 +460,34 @@ export class IOEventBuffer {
     slot.aborted = event.aborted;
     slot.dbMeta = event.dbMeta;
     slot.estimatedBytes = estimatedBytes;
+  }
+
+  private compactSuccessfulSlot(slot: IOEventSlot): void {
+    slot.requestHeaders = null;
+    slot.responseHeaders = null;
+    slot.requestBody = null;
+    slot.responseBody = null;
+    slot.requestBodyDigest = null;
+    slot.responseBodyDigest = null;
+    slot.requestPayloadRef = null;
+    slot.responsePayloadRef = null;
+    slot.requestBodyTruncated = false;
+    slot.responseBodyTruncated = false;
+    slot.requestBodyOriginalSize = null;
+    slot.responseBodyOriginalSize = null;
+
+    if (slot.dbMeta !== undefined) {
+      const compactedDbMeta: IOEventSlot['dbMeta'] = {};
+      if (slot.dbMeta.rowCount !== undefined) {
+        compactedDbMeta.rowCount = slot.dbMeta.rowCount;
+      }
+      if (slot.dbMeta.collection !== undefined) {
+        compactedDbMeta.collection = slot.dbMeta.collection;
+      }
+      slot.dbMeta =
+        Object.keys(compactedDbMeta).length === 0 ? undefined : compactedDbMeta;
+    }
+
+    slot.estimatedBytes = estimateBytes(slot);
   }
 }

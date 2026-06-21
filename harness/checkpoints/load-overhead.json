@@ -1,0 +1,28 @@
+{
+    "phase":  "load-overhead",
+    "timestamp":  "2026-06-01T23:11:18.2231440+05:30",
+    "commands":  [
+                     {
+                         "label":  "load-enabled-compose-up-direct",
+                         "exitCode":  0
+                     },
+                     {
+                         "label":  "load-enabled-autocannon-direct",
+                         "exitCode":  0
+                     },
+                     {
+                         "label":  "load-baseline-compose-up-direct",
+                         "exitCode":  0
+                     },
+                     {
+                         "label":  "load-baseline-autocannon-direct",
+                         "exitCode":  0
+                     },
+                     {
+                         "label":  "load-restore-enabled-compose-up-direct",
+                         "exitCode":  0
+                     }
+                 ],
+    "enabled":  "harness/captures/load/errorcore-enabled.json",
+    "disabled":  "harness/captures/load/errorcore-disabled.json"
+}

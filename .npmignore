@@ -1,0 +1,66 @@
+# Source and build config (package.json files list controls publish contents)
+src/
+tsconfig.json
+vitest.config.ts
+
+# Documentation and planning notes
+*.md
+docs/
+!README.md
+!LICENSE.md
+
+# Tests, specs, and fixtures
+test/
+spec/
+tmp-nextjs-smoke/
+lean-launch-test/
+
+# Benchmarks and performance harnesses
+bench/
+perf/
+benchmark-harness/
+benchmark-results/
+
+# Validation / integration harnesses (not public-facing)
+harness/
+
+# Build, release, and CI tooling
+scripts/
+.github/
+
+# Banner image (README-only)
+banner.png
+
+# Environment and secrets
+*.env
+.env*
+
+# Logs
+*.log
+
+# Pack artifacts
+*.tgz
+
+# Runtime source maps
+*.js.map
+*.mjs.map
+dist/**/*.js.map
+dist/**/*.mjs.map
+
+# Coverage
+coverage/
+
+# Config files
+errorcore.config.js
+errorcore.config.mjs
+
+# Dead-letter store
+.errorcore-dead-letters.ndjson
+
+# Temp directories
+tmp-review-*/
+tmp-pre-ship-*/
+tmp-errorcore-cli-*/
+
+# Node
+node_modules/

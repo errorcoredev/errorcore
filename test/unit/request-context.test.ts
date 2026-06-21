@@ -3,8 +3,9 @@ import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ALSManager } from '../../src/context/als-manager';
-import { RequestTracker } from '../../src/context/request-tracker';
+import { RequestTracker, registerRequestCleanup } from '../../src/context/request-tracker';
 import type { RequestContext } from '../../src/types';
+import { setLogLevel, __resetLogLevel } from '../../src/debug-log';
 
 function createContext(
   requestId: string,
@@ -225,15 +226,20 @@ describe('RequestTracker', () => {
 
   it('enforces the maxConcurrent cap and logs a debug warning', () => {
     stubTrackerTimer();
+    setLogLevel('debug');
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
-    const tracker = new RequestTracker({ maxConcurrent: 1, ttlMs: 1000 });
+    try {
+      const tracker = new RequestTracker({ maxConcurrent: 1, ttlMs: 1000 });
 
-    tracker.add(createContext('req-1'));
-    tracker.add(createContext('req-2'));
+      tracker.add(createContext('req-1'));
+      tracker.add(createContext('req-2'));
 
-    expect(tracker.getCount()).toBe(1);
-    expect(tracker.getAll()[0]?.requestId).toBe('req-1');
-    expect(debug).toHaveBeenCalledTimes(1);
+      expect(tracker.getCount()).toBe(1);
+      expect(tracker.getAll()[0]?.requestId).toBe('req-1');
+      expect(debug).toHaveBeenCalledTimes(1);
+    } finally {
+      __resetLogLevel();
+    }
   });
 
   it('sweeps stale entries and unreferences the interval timer', () => {
@@ -253,13 +259,41 @@ describe('RequestTracker', () => {
 
   it('supports idempotent removal', () => {
     stubTrackerTimer();
-    const tracker = new RequestTracker({ maxConcurrent: 2, ttlMs: 1000 });
+    const onRemove = vi.fn();
+    const tracker = new RequestTracker({ maxConcurrent: 2, ttlMs: 1000, onRemove });
+    const context = createContext('req-1');
 
-    tracker.add(createContext('req-1'));
+    tracker.add(context);
     tracker.remove('req-1');
     tracker.remove('req-1');
 
     expect(tracker.getCount()).toBe(0);
+    expect(onRemove).toHaveBeenCalledTimes(1);
+    expect(onRemove).toHaveBeenCalledWith(context);
+  });
+
+  it('runs response completion cleanup after an earlier request close cleanup', () => {
+    const request = new EventEmitter();
+    const response = new EventEmitter();
+    const remove = vi.fn();
+    const onCleanup = vi.fn();
+    const onResponseComplete = vi.fn();
+
+    registerRequestCleanup({
+      requestTracker: { remove },
+      requestId: 'req-1',
+      request,
+      response,
+      onCleanup,
+      onResponseComplete
+    });
+
+    request.emit('close');
+    response.emit('finish');
+
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(onCleanup).toHaveBeenCalledTimes(1);
+    expect(onResponseComplete).toHaveBeenCalledTimes(1);
   });
 
   it('shutdown clears the map and stops the timer', () => {

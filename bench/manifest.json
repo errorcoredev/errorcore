@@ -1,0 +1,205 @@
+{
+  "nodeImage": "node:22.14.0-bookworm-slim",
+  "nodeImageDigest": "sha256:745403dc46b5ab4c998502b07a12cbf020cf2c30645427a68ec0718f02d647de",
+  "sentry": {
+    "node": "10.56.0",
+    "nextjs": "10.56.0",
+    "npmIntegrity": "sha512-qvgtXHkcR4CH3fh0VEVyw4Ysc6MMiAnm727NdTTm0yU5e53erCeo2521+yfJkqmRTGiOSgwA7B5Bs+ot9j0vFQ=="
+  },
+  "bugsnag": {
+    "js": "8.9.0",
+    "npmIntegrity": "sha512-ChjKFVBF2CgepDXfMBkbEdcFUniJNN8py5V+tinaB8+vpJbr/fD1+VLFhkruSEn3jOafXrc1XJe9WHtsu9ht0g=="
+  },
+  "errorcore": {
+    "version": "0.2.0"
+  },
+  "targets": [
+    {
+      "id": "express",
+      "framework": "express",
+      "repo": "gothinkster/node-express-realworld-example-app",
+      "pin": "30b68e1e881462b2f4164ea09ab4c4f5699c7b0b"
+    },
+    {
+      "id": "fastify",
+      "framework": "fastify",
+      "repo": "fastify/demo",
+      "pin": "5fa922df34d0ace9f8a63279bfd72ea06cf358da"
+    },
+    {
+      "id": "koa",
+      "framework": "koa",
+      "repo": "eflem00/koa-boilerplate",
+      "pin": "98265346877a30f3595baf6f574726078b2b6c54"
+    },
+    {
+      "id": "hapi",
+      "framework": "hapi",
+      "repo": "agendor/sample-hapi-rest-api",
+      "pin": "4706ead645949fb4e32c62f2582bfd4c1c7659a1"
+    },
+    {
+      "id": "hono",
+      "framework": "hono",
+      "repo": "honojs/examples",
+      "pin": "3b0b62875a0e1265763fea1c6388866d5697ef81"
+    },
+    {
+      "id": "nextjs",
+      "framework": "nextjs",
+      "repo": "vercel/next.js",
+      "tag": "v15.3.4",
+      "pin": "fb5a153bf0389719139d9e820afd170191b026ae"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "S1",
+      "target": "express",
+      "frozen": true,
+      "description": "Deep app validation path with nested parsed input, DB lookup, and schema/type mismatch in application logic",
+      "expected": {
+        "expectedErrorType": "TypeError",
+        "expectedMessage": "limitCents.toFixed is not a function",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "applyPolicyLimit",
+        "expectedPayloadCount": 1,
+        "applicableDimensions": ["D1", "D2", "D3", "D4", "D5", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S2",
+      "target": "fastify",
+      "frozen": true,
+      "description": "Error after await from failed upstream HTTP dependency",
+      "expected": {
+        "expectedErrorType": "Error",
+        "expectedMessage": "upstream dependency returned HTTP 503",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "requireUpstreamOk",
+        "expectedPayloadCount": 1,
+        "applicableDimensions": ["D1", "D2", "D3", "D4", "D6", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S3",
+      "target": "hono",
+      "frozen": true,
+      "description": "ESM worker/background job unhandled rejection from a failed async dependency",
+      "expected": {
+        "expectedErrorType": "Error",
+        "expectedMessage": "redis key bench:missing-worker-input was required but missing",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "redisGetRequired",
+        "expectedPayloadCount": 1,
+        "asyncContext": "esmBackgroundWorkerDependency",
+        "applicableDimensions": ["D1", "D2", "D3", "D6", "D7", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S4",
+      "target": "koa",
+      "frozen": true,
+      "description": "Multiple DB queries plus outbound HTTP, then dependency failure",
+      "expected": {
+        "expectedErrorType": "Error",
+        "expectedMessage": "upstream dependency returned HTTP 502",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "requireUpstreamOk",
+        "expectedPayloadCount": 1,
+        "applicableDimensions": ["D1", "D2", "D3", "D4", "D5", "D6", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S5",
+      "target": "hapi",
+      "frozen": true,
+      "description": "Service A calls service B, B fails, verify W3C trace context across both payloads",
+      "expected": {
+        "expectedErrorType": "Error",
+        "expectedMessage": "service-b failed with HTTP 500",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "runScenario",
+        "expectedPayloadCount": 2,
+        "expectedPayloads": [
+          {
+            "serviceRole": "B",
+            "expectedErrorType": "Error",
+            "expectedMessage": "service-b inventory reservation failed",
+            "expectedOriginatingFrame": "runScenario"
+          },
+          {
+            "serviceRole": "A",
+            "expectedErrorType": "Error",
+            "expectedMessage": "service-b failed with HTTP 500",
+            "expectedOriginatingFrame": "runScenario"
+          }
+        ],
+        "requiresTraceCorrelation": true,
+        "applicableDimensions": ["D1", "D2", "D3", "D4", "D5", "D6", "D8", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S6",
+      "target": "fastify",
+      "frozen": true,
+      "description": "Delayed upstream failure after request has returned",
+      "expected": {
+        "expectedErrorType": "Error",
+        "expectedMessage": "delayed upstream failed after response: upstream dependency returned HTTP 504",
+        "messageWrapped": true,
+        "expectedOriginatingFrame": "delayedUpstreamFailureAfterResponse",
+        "expectedPayloadCount": 1,
+        "applicableDimensions": ["D1", "D2", "D3", "D6", "D7", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S7",
+      "target": "hono",
+      "frozen": true,
+      "description": "Non-HTTP queue or worker consumer fails on malformed job/dependency outage",
+      "expected": {
+        "expectedErrorType": "TypeError",
+        "expectedMessage": "job.payload.price.cents must be an integer",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "queueConsumer",
+        "expectedPayloadCount": 1,
+        "applicableDimensions": ["D1", "D2", "D3", "D7", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S8",
+      "target": "koa",
+      "frozen": true,
+      "description": "Error under framework/library noise from parser/ORM stack-heavy failure",
+      "expected": {
+        "expectedErrorType": "Error",
+        "expectedMessage": "ORM hydration failed: inventory.sku missing after parser plugin",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "inventoryPluginLayer",
+        "expectedPayloadCount": 1,
+        "applicableDimensions": ["D1", "D2", "D3", "D9", "D10", "D11", "D12"]
+      }
+    },
+    {
+      "id": "S9",
+      "target": "express",
+      "frozen": true,
+      "description": "Sink unreachable during capture, then restored, measuring retry/dead-letter/loss",
+      "expected": {
+        "expectedErrorType": "Error",
+        "expectedMessage": "checkout failed while capture sink is unreachable",
+        "messageWrapped": false,
+        "expectedOriginatingFrame": "runScenario",
+        "expectedPayloadCount": 1,
+        "expectedDelivery": {
+          "delivered": 1,
+          "deadLettered": 0,
+          "lost": 0
+        },
+        "applicableDimensions": ["D1", "D2", "D3", "D5", "D9", "D10", "D11", "D12"]
+      }
+    }
+  ],
+  "rubric": ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12"]
+}

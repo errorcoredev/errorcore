@@ -21,22 +21,27 @@
 
 ## Purpose
 
-Wrap user-registered in-memory state containers (Maps, objects, caches) in Proxies that record READS per-request via ALS context. Only reads are recorded, not writes.
+Wrap user-registered in-memory state containers (Maps, objects, caches) in Proxies that record READS per-request via ALS context.
+
+> **Sibling spec — module 22:** Writes (`set`, `delete`) on the same containers are captured as a separate stream. The Proxy traps for writes are added by module 22 to the same `StateTracker` class; this module continues to govern the read path.
 
 ---
 
 ## Scope
 
 - `StateTracker` class with `track(name, container)` method
-- Proxy handler for `Map` containers
-- Proxy handler for plain objects
+- Proxy handler for `Map` containers (read methods: `get`, `has`, `entries`, `values`, `forEach`)
+- Proxy handler for plain objects (`get` trap)
 - Eager serialization of read values using `cloneAndLimit` with tight limits
+- Per-context cap on recorded reads (default 50)
+
+Writes (`set`, `delete`) and the new constructor deps (`eventClock`, `config`) are governed by module 22.
 
 ---
 
 ## Non-Goals
 
-- Does not track writes/mutations.
+- Does not track writes/mutations directly. Module 22 adds those.
 - Does not manage the containers themselves (user owns them).
 - Does not perform PII scrubbing (scrubbing happens at capture time).
 
@@ -73,6 +78,7 @@ class StateTracker {
 
 ```typescript
 interface StateRead {
+  seq: number;       // EventClock.tick() at record time (module 20)
   container: string;
   operation: string;
   key: unknown;
@@ -140,7 +146,7 @@ If we stored a reference to the original value, the state read array would keep 
 
 ## Testing Requirements
 
-- Map.get: read recorded with correct container name, operation, key, serialized value
+- Map.get: read recorded with correct container name, operation, key, serialized value, and `seq`
 - Map.has: read recorded with boolean result
 - Plain object property access: read recorded
 - Symbol access: NOT recorded
@@ -150,6 +156,7 @@ If we stored a reference to the original value, the state read array would keep 
 - Large value: tight limits applied (depth 4, etc.)
 - Proxy does not alter application-visible behavior (same return values)
 - Multiple tracked containers with different names
+- Existing read tests continue to pass after module 22's write-capture additions land
 
 ---
 

@@ -1,0 +1,8 @@
+{
+  "id": "fastify",
+  "framework": "fastify",
+  "repo": "fastify/demo",
+  "pin": "5fa922df34d0ace9f8a63279bfd72ea06cf358da",
+  "sourceDir": "source",
+  "overlay": "../benchmark-app"
+}

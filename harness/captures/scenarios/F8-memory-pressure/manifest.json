@@ -1,0 +1,27 @@
+{
+    "scenario":  "F8-memory-pressure",
+    "label":  "Large valid JSON payload pressure on body parsing and allocation",
+    "fault":  "Concurrent oversized-but-valid JSON user payloads through existing API",
+    "endpoint":  "POST /api/users",
+    "requestsIssued":  12,
+    "timestamp":  "2026-06-02T01:36:11.1348698+05:30",
+    "beforeLineCounts":  {
+                             "enrich-svc":  2,
+                             "conduit-api":  7
+                         },
+    "afterLineCounts":  {
+                            "enrich-svc":  2,
+                            "conduit-api":  7
+                        },
+    "newCaptures":  {
+                        "conduitApi":  0,
+                        "enrichSvc":  0
+                    },
+    "commands":  [
+                     {
+                         "label":  "F8-large-json-users",
+                         "exitCode":  1,
+                         "output":  "The remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error."
+                     }
+                 ]
+}

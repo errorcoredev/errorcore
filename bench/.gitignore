@@ -1,0 +1,4 @@
+results/*
+!results/.gitkeep
+apps/*/source/
+apps/benchmark-app/node_modules/

@@ -1,0 +1,32 @@
+{
+    "scenario":  "F6-cross-service-timeout",
+    "label":  "A to B hop timeout through enrich-proxy",
+    "fault":  "toxiproxy timeout toxic on enrich-proxy",
+    "endpoint":  "GET /api/tags",
+    "requestsIssued":  1,
+    "timestamp":  "2026-06-02T01:35:10.6197573+05:30",
+    "beforeLineCounts":  {
+                             "enrich-svc":  1,
+                             "conduit-api":  5
+                         },
+    "afterLineCounts":  {
+                            "enrich-svc":  1,
+                            "conduit-api":  6
+                        },
+    "newCaptures":  {
+                        "conduitApi":  1,
+                        "enrichSvc":  0
+                    },
+    "commands":  [
+                     {
+                         "label":  "F6-add-timeout",
+                         "exitCode":  0,
+                         "output":  "Added downstream timeout toxic \u0027f6_timeout\u0027 on proxy \u0027enrich-proxy\u0027"
+                     },
+                     {
+                         "label":  "F6-request-tags",
+                         "exitCode":  52,
+                         "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                     }
+                 ]
+}

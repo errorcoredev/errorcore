@@ -9,9 +9,9 @@ export const SSN_REGEX = /\b\d{3}-\d{2}-\d{4}\b/g;
 export const JWT_REGEX =
   /\beyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g;
 
-export const BEARER_REGEX = /\bBearer\s+[a-zA-Z0-9_\-.~+/]+=*\b/gi;
+export const BEARER_REGEX = /\bBearer\s+[a-zA-Z0-9_\-.~+/=]+/gi;
 
-export const BASIC_AUTH_REGEX = /\bBasic\s+[A-Za-z0-9+/]+=*\b/gi;
+export const BASIC_AUTH_REGEX = /\bBasic\s+[A-Za-z0-9+/=]+/gi;
 
 export const AWS_ACCESS_KEY_REGEX = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
 
@@ -23,7 +23,7 @@ export const STRIPE_KEY_REGEX = /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g;
 export const GENERIC_SK_KEY_REGEX = /\bsk-[A-Za-z0-9]{10,}\b/g;
 
 export const PHONE_REGEX =
-  /(?:\+\d{1,3}[\s().-]*\d[\d(). -]{7,}\d|\(\d{2,4}\)[\s().-]*\d[\d(). -]{5,}\d|\b\d{3}[\s().-]\d{3}[\s().-]\d{4,}\b)/g;
+  /(?:\+\d{1,3}[\s().-]*\d(?:[\s().-]*\d){7,9}|\(\d{2,4}\)[\s().-]*\d(?:[\s().-]*\d){5,7}|\b\d{3}[\s().-]\d{3}[\s().-]\d{4,}\b)/g;
 
 export const IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
 
@@ -46,12 +46,16 @@ export const COMBINED_QUICK_TEST_REGEX = new RegExp(
 );
 
 export const SENSITIVE_KEY_EXACT_MATCHES = new Set([
+  'pass',
   'password',
+  'passcode',
+  'passphrase',
   'passwd',
   'secret',
   'token',
   'key',
   'auth',
+  'authorization',
   'credential',
   'ssn',
   'cvv',
@@ -64,12 +68,16 @@ export const SENSITIVE_KEY_EXACT_MATCHES = new Set([
 ]);
 
 export const SENSITIVE_KEY_FRAGMENTS = [
+  'pass',
   'password',
+  'passcode',
+  'passphrase',
   'passwd',
   'secret',
   'token',
   'key',
   'auth',
+  'authorization',
   'credential',
   'ssn',
   'cvv',
@@ -86,7 +94,7 @@ export const SENSITIVE_KEY_COMPLEX_REGEX =
   /social.*security|credit.*card|card.*number/i;
 
 export const SENSITIVE_KEY_REGEX =
-  /password|passwd|secret|token|key|auth|credential|ssn|social.*security|credit.*card|card.*number|cvv|cvc|expir|phone|session|cookie|oauth|private/i;
+  /(^|[-_.])(pass(?:words?|codes?|phrases?)?|passwd|secrets?|tokens?|keys?|auth(?:ori[sz]ation)?|credentials?|ssn|cvv|cvc|expir(?:y|ation)?|phone|session|cookie|oauth|private)([-_.]|$)|social.*security|credit.*card|card.*number/i;
 
 export function isValidLuhn(digits: string): boolean {
   if (!/^\d{13,19}$/.test(digits)) {

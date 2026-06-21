@@ -1,0 +1,266 @@
+{
+    "timestamp":  "2026-06-02T01:36:11.1373834+05:30",
+    "scenarios":  [
+                      {
+                          "scenario":  "F1-db-latency-timeout",
+                          "label":  "DB latency and timeout toxic during /api/tags",
+                          "fault":  "toxiproxy latency=5000ms+jitter and timeout=1000ms on postgres-proxy",
+                          "endpoint":  "GET /api/tags",
+                          "requestsIssued":  1,
+                          "timestamp":  "2026-06-02T01:32:46.5262230+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  0,
+                                                   "conduit-api":  0
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  0,
+                                                  "conduit-api":  1
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  1,
+                                              "enrichSvc":  0
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F1-add-latency",
+                                               "exitCode":  0,
+                                               "output":  "Added downstream latency toxic \u0027f1_latency\u0027 on proxy \u0027postgres-proxy\u0027"
+                                           },
+                                           {
+                                               "label":  "F1-add-timeout",
+                                               "exitCode":  0,
+                                               "output":  "Added downstream timeout toxic \u0027f1_timeout\u0027 on proxy \u0027postgres-proxy\u0027"
+                                           },
+                                           {
+                                               "label":  "F1-request-tags",
+                                               "exitCode":  52,
+                                               "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                                           }
+                                       ]
+                      },
+                      {
+                          "scenario":  "F2-db-reset-peer",
+                          "label":  "DB connection reset peer during /api/tags",
+                          "fault":  "toxiproxy reset_peer toxic on postgres-proxy",
+                          "endpoint":  "GET /api/tags",
+                          "requestsIssued":  1,
+                          "timestamp":  "2026-06-02T01:33:11.2730893+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  0,
+                                                   "conduit-api":  1
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  0,
+                                                  "conduit-api":  2
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  1,
+                                              "enrichSvc":  0
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F2-add-reset",
+                                               "exitCode":  0,
+                                               "output":  "Added downstream reset_peer toxic \u0027f2_reset\u0027 on proxy \u0027postgres-proxy\u0027"
+                                           },
+                                           {
+                                               "label":  "F2-request-tags",
+                                               "exitCode":  52,
+                                               "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                                           }
+                                       ]
+                      },
+                      {
+                          "scenario":  "F3-db-outage",
+                          "label":  "Postgres container stopped during /api/tags",
+                          "fault":  "docker compose stop postgres, request, docker compose start postgres",
+                          "endpoint":  "GET /api/tags",
+                          "requestsIssued":  1,
+                          "timestamp":  "2026-06-02T01:33:39.8333184+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  0,
+                                                   "conduit-api":  2
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  0,
+                                                  "conduit-api":  3
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  1,
+                                              "enrichSvc":  0
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F3-stop-postgres",
+                                               "exitCode":  0,
+                                               "output":  "docker :  Container errorcore-validation-postgres-1  Stopping\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:167 char:38\r\n+ ... d \"F3-stop-postgres\" { docker compose -f $ComposeFile stop postgres }\r\n+                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: ( Container erro...res-1  Stopping:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\n Container errorcore-validation-postgres-1  Stopped"
+                                           },
+                                           {
+                                               "label":  "F3-request-tags",
+                                               "exitCode":  52,
+                                               "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                                           },
+                                           {
+                                               "label":  "F3-start-postgres",
+                                               "exitCode":  0,
+                                               "output":  "docker :  Container errorcore-validation-postgres-1  Starting\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:170 char:39\r\n+ ... \"F3-start-postgres\" { docker compose -f $ComposeFile start postgres }\r\n+                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: ( Container erro...res-1  Starting:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\n Container errorcore-validation-postgres-1  Started"
+                                           }
+                                       ]
+                      },
+                      {
+                          "scenario":  "F4-pool-exhaustion",
+                          "label":  "High concurrency DB route with latency toxic",
+                          "fault":  "40 concurrent article writes with DB_POOL_MAX=1 while postgres-proxy has 2500ms latency",
+                          "endpoint":  "POST /api/articles",
+                          "requestsIssued":  40,
+                          "timestamp":  "2026-06-02T01:34:10.3498669+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  0,
+                                                   "conduit-api":  3
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  0,
+                                                  "conduit-api":  4
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  1,
+                                              "enrichSvc":  0
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F4-add-latency",
+                                               "exitCode":  0,
+                                               "output":  "Added downstream latency toxic \u0027f1_latency\u0027 on proxy \u0027postgres-proxy\u0027"
+                                           },
+                                           {
+                                               "label":  "F4-parallel-article-writes",
+                                               "exitCode":  0,
+                                               "output":  "The remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error."
+                                           }
+                                       ]
+                      },
+                      {
+                          "scenario":  "F5-redis-disconnect",
+                          "label":  "Redis proxy disabled during App-A to App-B enrichment",
+                          "fault":  "toxiproxy toggle redis-proxy down",
+                          "endpoint":  "GET /api/tags",
+                          "requestsIssued":  1,
+                          "timestamp":  "2026-06-02T01:34:35.3141838+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  0,
+                                                   "conduit-api":  4
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  1,
+                                                  "conduit-api":  5
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  1,
+                                              "enrichSvc":  1
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F5-disable-redis-proxy",
+                                               "exitCode":  0,
+                                               "output":  "Proxy redis-proxy is now disabled"
+                                           },
+                                           {
+                                               "label":  "F5-request-tags",
+                                               "exitCode":  52,
+                                               "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                                           }
+                                       ]
+                      },
+                      {
+                          "scenario":  "F6-cross-service-timeout",
+                          "label":  "A to B hop timeout through enrich-proxy",
+                          "fault":  "toxiproxy timeout toxic on enrich-proxy",
+                          "endpoint":  "GET /api/tags",
+                          "requestsIssued":  1,
+                          "timestamp":  "2026-06-02T01:35:10.6197573+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  1,
+                                                   "conduit-api":  5
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  1,
+                                                  "conduit-api":  6
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  1,
+                                              "enrichSvc":  0
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F6-add-timeout",
+                                               "exitCode":  0,
+                                               "output":  "Added downstream timeout toxic \u0027f6_timeout\u0027 on proxy \u0027enrich-proxy\u0027"
+                                           },
+                                           {
+                                               "label":  "F6-request-tags",
+                                               "exitCode":  52,
+                                               "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                                           }
+                                       ]
+                      },
+                      {
+                          "scenario":  "F7-hostile-valid-traffic",
+                          "label":  "Hostile-but-valid request with secrets in query plus downstream Redis outage",
+                          "fault":  "deep query/PII request to /api/tags while redis-proxy is disabled",
+                          "endpoint":  "GET /api/tags?token=...",
+                          "requestsIssued":  1,
+                          "timestamp":  "2026-06-02T01:35:35.5306546+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  1,
+                                                   "conduit-api":  6
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  2,
+                                                  "conduit-api":  7
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  1,
+                                              "enrichSvc":  1
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F7-disable-redis-proxy",
+                                               "exitCode":  0,
+                                               "output":  "Proxy redis-proxy is now disabled"
+                                           },
+                                           {
+                                               "label":  "F7-request-hostile-tags",
+                                               "exitCode":  52,
+                                               "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                                           }
+                                       ]
+                      },
+                      {
+                          "scenario":  "F8-memory-pressure",
+                          "label":  "Large valid JSON payload pressure on body parsing and allocation",
+                          "fault":  "Concurrent oversized-but-valid JSON user payloads through existing API",
+                          "endpoint":  "POST /api/users",
+                          "requestsIssued":  12,
+                          "timestamp":  "2026-06-02T01:36:11.1348698+05:30",
+                          "beforeLineCounts":  {
+                                                   "enrich-svc":  2,
+                                                   "conduit-api":  7
+                                               },
+                          "afterLineCounts":  {
+                                                  "enrich-svc":  2,
+                                                  "conduit-api":  7
+                                              },
+                          "newCaptures":  {
+                                              "conduitApi":  0,
+                                              "enrichSvc":  0
+                                          },
+                          "commands":  [
+                                           {
+                                               "label":  "F8-large-json-users",
+                                               "exitCode":  1,
+                                               "output":  "The remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error.\r\nThe remote server returned an error: (500) Internal Server Error."
+                                           }
+                                       ]
+                      }
+                  ]
+}

@@ -1,6 +1,9 @@
 
 import fs = require('node:fs');
 
+import { safeConsole } from '../debug-log';
+import { toTransportPayload, type TransportSendInput } from './payload';
+
 let warnedAboutStdoutTransport = false;
 
 function warnAboutStdoutTransport(): void {
@@ -9,14 +12,15 @@ function warnAboutStdoutTransport(): void {
   }
 
   warnedAboutStdoutTransport = true;
-  console.warn(
+  safeConsole.warn(
     '[ErrorCore] Stdout transport writes captured payloads to application logs; use it only for local development or controlled pipelines.'
   );
 }
 
 export class StdoutTransport {
-  public async send(payload: string | Buffer): Promise<void> {
+  public async send(input: TransportSendInput): Promise<void> {
     warnAboutStdoutTransport();
+    const payload = toTransportPayload(input).serialized;
     await new Promise<void>((resolve, reject) => {
       process.stdout.write(
         Buffer.isBuffer(payload) ? Buffer.concat([payload, Buffer.from('\n')]) : `${payload}\n`,

@@ -1,0 +1,37 @@
+{
+    "scenario":  "F1-db-latency-timeout",
+    "label":  "DB latency and timeout toxic during /api/tags",
+    "fault":  "toxiproxy latency=5000ms+jitter and timeout=1000ms on postgres-proxy",
+    "endpoint":  "GET /api/tags",
+    "requestsIssued":  1,
+    "timestamp":  "2026-06-02T01:32:46.5262230+05:30",
+    "beforeLineCounts":  {
+                             "enrich-svc":  0,
+                             "conduit-api":  0
+                         },
+    "afterLineCounts":  {
+                            "enrich-svc":  0,
+                            "conduit-api":  1
+                        },
+    "newCaptures":  {
+                        "conduitApi":  1,
+                        "enrichSvc":  0
+                    },
+    "commands":  [
+                     {
+                         "label":  "F1-add-latency",
+                         "exitCode":  0,
+                         "output":  "Added downstream latency toxic \u0027f1_latency\u0027 on proxy \u0027postgres-proxy\u0027"
+                     },
+                     {
+                         "label":  "F1-add-timeout",
+                         "exitCode":  0,
+                         "output":  "Added downstream timeout toxic \u0027f1_timeout\u0027 on proxy \u0027postgres-proxy\u0027"
+                     },
+                     {
+                         "label":  "F1-request-tags",
+                         "exitCode":  52,
+                         "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                     }
+                 ]
+}

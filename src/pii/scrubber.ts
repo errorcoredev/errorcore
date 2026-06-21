@@ -2,6 +2,7 @@
 import { homedir } from 'node:os';
 
 import type { ResolvedConfig, SerializationLimits } from '../types';
+import { safeConsole } from '../debug-log';
 import {
   AWS_ACCESS_KEY_REGEX,
   BASIC_AUTH_REGEX,
@@ -23,25 +24,42 @@ import {
 
 const REDACTED = '[REDACTED]';
 const DEPTH_LIMIT = '[DEPTH_LIMIT]';
-const MULTIPART_REDACTED = '[MULTIPART BODY OMITTED]';
+export const MULTIPART_REDACTED = 'MULTIPART_REDACTED';
 
-function resetRegex(pattern: RegExp): RegExp {
-  pattern.lastIndex = 0;
-  return pattern;
+function isPrivateOrInfrastructureIp(ip: string): boolean {
+  const parts = ip.split('.').map((p) => Number.parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
+    return false;
+  }
+  const [a, b] = parts;
+  // 0.0.0.0/8 (this network), 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+  // 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 multicast, 100.64.0.0/10 CGNAT.
+  if (a === 0) return true;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a >= 224 && a <= 239) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
 }
 
 function replacePattern(value: string, pattern: RegExp): string {
-  return value.replace(resetRegex(pattern), REDACTED);
+  // .replace() with a /g regex resets lastIndex internally per ECMAScript spec.
+  return value.replace(pattern, REDACTED);
 }
 
 function replaceCreditCards(value: string): string {
-  return value.replace(resetRegex(CREDIT_CARD_REGEX), (match) =>
+  return value.replace(CREDIT_CARD_REGEX, (match) =>
     isValidLuhn(match) ? REDACTED : match
   );
 }
 
 function matchesRegex(pattern: RegExp, value: string): boolean {
-  return resetRegex(pattern).test(value);
+  // Reset lastIndex: .test() on a /g regex uses and advances it. Caller must be synchronous.
+  pattern.lastIndex = 0;
+  return pattern.test(value);
 }
 
 function decodeQueryComponent(value: string): string {
@@ -53,7 +71,9 @@ function decodeQueryComponent(value: string): string {
 }
 
 function matchesSensitiveKey(key: string): boolean {
-  const normalizedKey = key.toLowerCase();
+  const normalizedKey = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .toLowerCase();
 
   if (SENSITIVE_KEY_EXACT_MATCHES.has(normalizedKey)) {
     return true;
@@ -61,6 +81,137 @@ function matchesSensitiveKey(key: string): boolean {
 
   return matchesRegex(SENSITIVE_KEY_REGEX, normalizedKey);
 }
+
+/**
+ * SDK-controlled fields whose values are nanosecond hrtime, byte counts,
+ * sequence numbers, or other non-PII telemetry. These keys are emitted
+ * by the SDK at known structural positions in the package, and were
+ * silently being [REDACTED] when their values happened to Luhn-match
+ * the credit-card regex (e.g. a 19-digit hrtimeNs string). We bypass
+ * value-pattern scrubbing for these keys.
+ *
+ * Safe because the scrubber walks the whole package root in
+ * package-builder.ts; user-controlled bodies are scrubbed earlier as
+ * leaf strings under request.body, so an inner `hrtimeNs` key inside
+ * a user's JSON body never reaches this layer.
+ */
+const ROOT_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'errorEventHrtimeNs', 'wallClockMs', 'durationMs', 'eventLoopLagMs',
+  'errorEventSeq', 'capturedAt', 'producedAt', 'receivedAt',
+  'fingerprint', 'eventId'
+]);
+
+const IO_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'hrtimeNs', 'startTime', 'endTime', 'seq', 'durationMs', 'statusCode',
+  'fd', 'requestBodyOriginalSize', 'responseBodyOriginalSize'
+]);
+
+const EVICTION_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'seq', 'startTime', 'evictedAt'
+]);
+
+const STATE_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'seq', 'hrtimeNs', 'timestamp'
+]);
+
+const ROOT_SDK_PACKAGE_ARRAY_KEYS = new Set<string>([
+  'ioTimeline',
+  'evictionLog',
+  'stateReads',
+  'stateWrites',
+  'concurrentRequests',
+  'localVariables'
+]);
+
+const PROCESS_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'pid', 'ppid', 'uptime',
+  'rss', 'heapTotal', 'heapUsed', 'external', 'arrayBuffers',
+  'activeHandles', 'activeRequests',
+  'eventLoopLagMs', 'wallClockMs', 'hrtimeNs'
+]);
+
+const LOCAL_FRAME_INFRASTRUCTURE_KEYS_PASSTHROUGH = new Set<string>([
+  'lineNumber', 'columnNumber', '_overflow', '_type', 'className'
+]);
+
+function isArrayIndexPathSegment(value: string | undefined): boolean {
+  return typeof value === 'string' && /^\d+$/.test(value);
+}
+
+function isRootSdkPackageArrayPath(path: string[]): boolean {
+  return path.length === 1 && ROOT_SDK_PACKAGE_ARRAY_KEYS.has(path[0] as string);
+}
+
+function isSdkInfrastructurePath(path: string[]): boolean {
+  const key = path[path.length - 1];
+  if (key === undefined) {
+    return false;
+  }
+
+  if (path.length === 1) {
+    return ROOT_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'eventClockRange' && path.length === 2) {
+    return key === 'min' || key === 'max';
+  }
+
+  if (path[0] === 'timeAnchor' && path.length === 2) {
+    return key === 'wallClockMs' || key === 'hrtimeNs';
+  }
+
+  if (path[0] === 'ioTimeline' && path.length === 3 && isArrayIndexPathSegment(path[1])) {
+    return IO_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'evictionLog' && path.length === 3 && isArrayIndexPathSegment(path[1])) {
+    return EVICTION_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (
+    (path[0] === 'stateReads' || path[0] === 'stateWrites') &&
+    path.length === 3 &&
+    isArrayIndexPathSegment(path[1])
+  ) {
+    return STATE_EVENT_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'processMetadata') {
+    return PROCESS_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'ambientContext') {
+    return key === 'totalBufferEventsAtCapture' ||
+      key === 'seqGaps' ||
+      key === 'retrievedCount' ||
+      key === 'min' ||
+      key === 'max';
+  }
+
+  if (path[0] === 'localVariables' && isArrayIndexPathSegment(path[1])) {
+    return path.length === 3 && LOCAL_FRAME_INFRASTRUCTURE_KEYS_PASSTHROUGH.has(key);
+  }
+
+  if (path[0] === 'ioTimeline' && path[2] === 'dbMeta' && key === 'rowCount') {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Header / value keys whose VALUE is operational metadata, not a
+ * secret. The header NAME is allowlisted in DEFAULT_HEADER_ALLOWLIST,
+ * but the SENSITIVE_KEY_REGEX still substring-matches `key` and
+ * redacts the value (`idempotency-key: abc-123` → REDACTED). This
+ * set bypasses value-side scrubbing for those known-operational keys.
+ */
+const SENSITIVE_KEY_EXACT_VALUE_PASSTHROUGH = new Set<string>([
+  'idempotency-key', 'x-idempotency-key',
+  'x-correlation-id', 'x-request-id', 'x-trace-id',
+  'traceparent', 'tracestate', 'retry-after',
+  'etag', 'if-match', 'if-none-match', 'range'
+]);
 
 function truncateString(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
@@ -111,7 +262,7 @@ export function looksLikeHighEntropySecret(value: string): boolean {
   return entropy >= 4.2;
 }
 
-function isTextualContentType(contentType: string | undefined): boolean {
+export function isTextualContentType(contentType: string | undefined): boolean {
   if (!contentType) {
     return false;
   }
@@ -125,6 +276,16 @@ function isTextualContentType(contentType: string | undefined): boolean {
   );
 }
 
+export function getBodyEncoding(contentType: string | undefined): BufferEncoding {
+  if (!contentType) {
+    return 'utf8';
+  }
+  if (contentType.includes('charset=latin1') || contentType.includes('charset=iso-8859-1')) {
+    return 'latin1';
+  }
+  return 'utf8';
+}
+
 function isMultipartContentType(contentType: string | undefined): boolean {
   if (!contentType) {
     return false;
@@ -133,16 +294,151 @@ function isMultipartContentType(contentType: string | undefined): boolean {
   return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'multipart/form-data';
 }
 
-function detectBodyEncoding(contentType: string | undefined): BufferEncoding {
+function isJsonContentType(contentType: string | undefined): boolean {
   if (!contentType) {
-    return 'utf8';
+    return false;
+  }
+  // application/json, application/vnd.api+json, text/json, etc.
+  const head = contentType.split(';', 1)[0]?.trim().toLowerCase() ?? '';
+  return head === 'application/json' || head === 'text/json' || head.endsWith('+json');
+}
+
+function isFormUrlEncodedContentType(contentType: string | undefined): boolean {
+  if (!contentType) {
+    return false;
+  }
+  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'application/x-www-form-urlencoded';
+}
+
+const detectBodyEncoding = getBodyEncoding;
+
+const SENSITIVE_SQL_QUICK_TEST =
+  /^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*(ALTER\s+(?:USER|ROLE|LOGIN)|CREATE\s+(?:USER|ROLE|LOGIN)|DROP\s+(?:USER|ROLE|LOGIN)|SET\s+PASSWORD|SET\s+SESSION\s+AUTHORIZATION|GRANT\b|REVOKE\b)/i;
+
+const SENSITIVE_SQL_LABELS: ReadonlyArray<[RegExp, string]> = [
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*ALTER\s+(?:USER|ROLE|LOGIN)/i, 'ALTER USER/ROLE'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*CREATE\s+(?:USER|ROLE|LOGIN)/i, 'CREATE USER/ROLE'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*DROP\s+(?:USER|ROLE|LOGIN)/i, 'DROP USER/ROLE'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*SET\s+PASSWORD/i, 'SET PASSWORD'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*SET\s+SESSION\s+AUTHORIZATION/i, 'SET SESSION AUTHORIZATION'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*GRANT\b/i, 'GRANT'],
+  [/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:--[^\n]*\n\s*)*REVOKE\b/i, 'REVOKE'],
+];
+
+const SQL_QUOTED_LITERAL_REGEX = /(?:\b[ENX])?'(?:''|\\.|[^'\\])*'/gi;
+const SQL_NUMERIC_LITERAL_REGEX =
+  /(^|[^\w$])(-?(?:(?:\d+\.\d+|\d+\.|\.\d+|\d+)(?:[eE][+-]?\d+)?))(?![\w])/g;
+
+const KEY_VALUE_ASSIGNMENT_REGEX =
+  /(^|[\s\r\n;&,])(\s*(?:export\s+)?)([A-Za-z][A-Za-z0-9_.-]{0,127})(\s*[:=]\s*)([^\r\n;&,]*)/gi;
+
+const CACHE_KEY_SEGMENT_SEPARATOR_REGEX = /([:/|])/g;
+
+function redactSqlLiterals(query: string): string {
+  try {
+    return query
+      .replace(SQL_QUOTED_LITERAL_REGEX, REDACTED)
+      .replace(SQL_NUMERIC_LITERAL_REGEX, (_match, prefix: string) => `${prefix}${REDACTED}`);
+  } catch {
+    return query;
+  }
+}
+
+export function redactSensitiveQueryText(query: string): string {
+  try {
+    if (SENSITIVE_SQL_QUICK_TEST.test(query)) {
+      for (const [pattern, label] of SENSITIVE_SQL_LABELS) {
+        if (pattern.test(query)) {
+          return `[REDACTED: ${label} statement]`;
+        }
+      }
+    }
+
+    return redactSqlLiterals(query);
+  } catch {
+    return query;
+  }
+}
+
+function scrubStringPatterns(value: string): string {
+  // Reset lastIndex before .test() on the global COMBINED_QUICK_TEST_REGEX.
+  // This function is synchronous end-to-end; do not introduce await between here and the .test() below.
+  COMBINED_QUICK_TEST_REGEX.lastIndex = 0;
+  if (!COMBINED_QUICK_TEST_REGEX.test(value)) {
+    return looksLikeHighEntropySecret(value) ? REDACTED : value;
   }
 
-  if (contentType.includes('charset=latin1') || contentType.includes('charset=iso-8859-1')) {
-    return 'latin1';
+  let scrubbed = value;
+
+  scrubbed = replacePattern(scrubbed, EMAIL_REGEX);
+  scrubbed = replaceCreditCards(scrubbed);
+  scrubbed = replacePattern(scrubbed, SSN_REGEX);
+  scrubbed = replacePattern(scrubbed, JWT_REGEX);
+  scrubbed = replacePattern(scrubbed, BEARER_REGEX);
+  scrubbed = replacePattern(scrubbed, BASIC_AUTH_REGEX);
+  scrubbed = replacePattern(scrubbed, AWS_ACCESS_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, GITHUB_TOKEN_REGEX);
+  scrubbed = replacePattern(scrubbed, STRIPE_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, GENERIC_SK_KEY_REGEX);
+  scrubbed = replacePattern(scrubbed, PHONE_REGEX);
+  // IPv4 redaction: only scrub public/routable IPs. Loopback, private,
+  // link-local, and multicast addresses are infrastructure metadata,
+  // not PII; redacting them produces noise like host: "[REDACTED]:3000"
+  // (was 127.0.0.1:3000) that buries real signal.
+  scrubbed = scrubbed.replace(IPV4_REGEX, (match) =>
+    isPrivateOrInfrastructureIp(match) ? match : REDACTED
+  );
+
+  if (looksLikeHighEntropySecret(scrubbed)) {
+    return REDACTED;
   }
 
-  return 'utf8';
+  return scrubbed;
+}
+
+export function scrubKeyValueAssignments(text: string): string {
+  try {
+    return text.replace(
+      KEY_VALUE_ASSIGNMENT_REGEX,
+      (
+        match: string,
+        prefix: string,
+        leader: string,
+        key: string,
+        separator: string,
+        value: string
+      ) => {
+        if (!matchesSensitiveKey(key)) {
+          return match;
+        }
+
+        if (/^(?:\[REDACTED\]|%5BREDACTED%5D)$/i.test(value.trim())) {
+          return match;
+        }
+
+        return `${prefix}${leader}${key}${separator}${REDACTED}`;
+      }
+    );
+  } catch {
+    return text;
+  }
+}
+
+export function scrubCacheKey(key: string): string {
+  try {
+    return key
+      .split(CACHE_KEY_SEGMENT_SEPARATOR_REGEX)
+      .map((segment) => {
+        if (segment === ':' || segment === '/' || segment === '|') {
+          return segment;
+        }
+
+        return scrubStringPatterns(scrubKeyValueAssignments(segment));
+      })
+      .join('');
+  } catch {
+    return key;
+  }
 }
 
 export class Scrubber {
@@ -236,19 +532,13 @@ export class Scrubber {
         return this.scrubRelativeUrl(rawUrl);
       }
 
-      const parsed = hasScheme
-        ? new URL(rawUrl)
-        : new URL(rawUrl, 'http://errorcore.local');
+      const parsed = new URL(rawUrl);
 
       for (const [key, value] of parsed.searchParams.entries()) {
         parsed.searchParams.set(key, String(this.scrubValue(key, value)));
       }
 
-      if (hasScheme) {
-        return parsed.toString();
-      }
-
-      return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      return parsed.toString();
     } catch {
       return this.scrubString(rawUrl);
     }
@@ -263,19 +553,86 @@ export class Scrubber {
       return Buffer.from(MULTIPART_REDACTED, 'utf8');
     }
 
-    if (!isTextualContentType(contentType)) {
-      return buffer;
+    if (isTextualContentType(contentType)) {
+      const encoding = detectBodyEncoding(contentType);
+      const decoded = buffer.toString(encoding);
+
+      // application/json: parse, walk via cloneAndScrub for key-aware
+      // redaction (catches `cvc: "123"` and other short opaque values that
+      // no value-pattern regex would match), re-stringify, then run
+      // scrubString as a belt-and-suspenders pass over CC numbers / JWTs
+      // that survived in non-sensitive keys. cloneAndScrub honors the
+      // configured serialization caps (depth 8, array 20, object 50,
+      // string 2048) - PII below those depths is redacted; PII at deeper
+      // nesting falls through to the string pass below.
+      if (isJsonContentType(contentType)) {
+        try {
+          const parsed = JSON.parse(decoded);
+          const walked = this.applyDefaultScrubber('', parsed);
+          const reserialized = JSON.stringify(walked);
+          const finalString = this.scrubString(reserialized);
+          if (finalString === decoded) {
+            return buffer;
+          }
+          return Buffer.from(finalString, encoding);
+        } catch {
+          // Parse failed - fall through to plain string scrub below.
+        }
+      }
+
+      // application/x-www-form-urlencoded: parse keys, redact sensitive
+      // values via the same key-aware check used for JSON objects.
+      if (isFormUrlEncodedContentType(contentType)) {
+        try {
+          const params = new URLSearchParams(decoded);
+          const out = new URLSearchParams();
+          for (const [key, value] of params.entries()) {
+            const lowerKey = key.toLowerCase();
+            // Operational keys (idempotency-key, etag, etc.) carry
+            // values that are not secrets - leave them alone even
+            // though their key-name substring-matches /key/.
+            const scrubbedValue = SENSITIVE_KEY_EXACT_VALUE_PASSTHROUGH.has(lowerKey)
+              ? value
+              : matchesSensitiveKey(key)
+              ? REDACTED
+              : this.scrubString(value);
+            out.append(key, scrubbedValue);
+          }
+          const reserialized = out.toString();
+          if (reserialized === decoded) {
+            return buffer;
+          }
+          return Buffer.from(reserialized, encoding);
+        } catch {
+          // URLSearchParams.toString edge cases - fall through.
+        }
+      }
+
+      const assignmentScrubbed = scrubKeyValueAssignments(decoded);
+      const scrubbed = this.scrubString(assignmentScrubbed);
+
+      if (scrubbed === decoded) {
+        return buffer;
+      }
+
+      return Buffer.from(scrubbed, encoding);
     }
 
-    const encoding = detectBodyEncoding(contentType);
-    const decoded = buffer.toString(encoding);
-    const scrubbed = this.scrubString(decoded);
-
-    if (scrubbed === decoded) {
+    // Non-textual content (octet-stream, image/*, application/pdf, etc.)
+    // is mostly binary, but may carry ASCII subsequences containing PII
+    // (a credit card number embedded in a multipart-disguised payload, a
+    // JWT in a binary protocol's metadata, etc.). The previous "secure
+    // by accident" behavior was relying on the byte-sample cap to
+    // truncate before reaching such patterns. Now: if the lossy UTF-8
+    // decode of the buffer matches a high-confidence PII pattern (CC
+    // with Luhn-check, JWT-shape), redact those bytes in place. Other
+    // binary content remains untouched.
+    const lossyDecoded = buffer.toString('utf8');
+    const scrubbed = this.scrubString(lossyDecoded);
+    if (scrubbed === lossyDecoded) {
       return buffer;
     }
-
-    return Buffer.from(scrubbed, encoding);
+    return Buffer.from(scrubbed, 'utf8');
   }
 
   private applyCustomScrubber(
@@ -287,7 +644,7 @@ export class Scrubber {
       return this.config.piiScrubber?.(key, value) ?? value;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[ErrorCore] Custom PII scrubber failed: ${message}`);
+      safeConsole.warn(`[ErrorCore] Custom PII scrubber failed: ${message}`);
       return getFallback();
     }
   }
@@ -297,6 +654,7 @@ export class Scrubber {
       return this.cloneAndScrub(
         key,
         value,
+        key === '' ? [] : [key],
         0,
         new WeakSet<object>(),
         this.config.serialization
@@ -309,12 +667,29 @@ export class Scrubber {
   private cloneAndScrub(
     key: string,
     value: unknown,
+    path: string[],
     depth: number,
     visited: WeakSet<object>,
     limits: SerializationLimits
   ): unknown {
     if (depth > Math.max(limits.maxDepth, 10)) {
       return DEPTH_LIMIT;
+    }
+
+    // SDK-internal infrastructure fields: pass values through without
+    // pattern matching only at known ErrorPackage paths. User-controlled
+    // objects can still contain keys like `hrtimeNs`, so key-only bypasses
+    // would create false negatives in request bodies and thrown objects.
+    if (isSdkInfrastructurePath(path)) {
+      return value;
+    }
+
+    // Operational header values (idempotency-key, correlation-id, etc.).
+    // The header name is in the allowlist; the value should not be
+    // pattern-scrubbed just because the key matches /key/.
+    const lowerKey = typeof key === 'string' ? key.toLowerCase() : '';
+    if (SENSITIVE_KEY_EXACT_VALUE_PASSTHROUGH.has(lowerKey)) {
+      return value;
     }
 
     if (matchesSensitiveKey(key)) {
@@ -415,20 +790,24 @@ export class Scrubber {
 
       visited.add(value);
       try {
-        const itemCount = Math.min(value.length, limits.maxArrayItems);
+        const preserveFullArray = isRootSdkPackageArrayPath(path);
+        const itemCount = preserveFullArray
+          ? value.length
+          : Math.min(value.length, limits.maxArrayItems);
         const items = new Array<unknown>(itemCount);
 
         for (let index = 0; index < itemCount; index += 1) {
           items[index] = this.cloneAndScrub(
             String(index),
             value[index],
+            [...path, String(index)],
             depth + 1,
             visited,
             limits
           );
         }
 
-        if (value.length <= limits.maxArrayItems) {
+        if (preserveFullArray || value.length <= limits.maxArrayItems) {
           return items;
         }
 
@@ -458,8 +837,22 @@ export class Scrubber {
           }
 
           entries.push([
-            this.cloneAndScrub(String(index), entryKey, depth + 1, visited, limits),
-            this.cloneAndScrub(String(index), entryValue, depth + 1, visited, limits)
+            this.cloneAndScrub(
+              String(index),
+              entryKey,
+              [...path, String(index), 'key'],
+              depth + 1,
+              visited,
+              limits
+            ),
+            this.cloneAndScrub(
+              String(index),
+              entryValue,
+              [...path, String(index), 'value'],
+              depth + 1,
+              visited,
+              limits
+            )
           ]);
           index += 1;
         }
@@ -490,7 +883,14 @@ export class Scrubber {
           }
 
           values.push(
-            this.cloneAndScrub(String(index), entryValue, depth + 1, visited, limits)
+            this.cloneAndScrub(
+              String(index),
+              entryValue,
+              [...path, String(index)],
+              depth + 1,
+              visited,
+              limits
+            )
           );
           index += 1;
         }
@@ -521,6 +921,7 @@ export class Scrubber {
           scrubbed[objectKey] = this.cloneAndScrub(
             objectKey,
             (value as Record<string, unknown>)[objectKey],
+            [...path, objectKey],
             depth + 1,
             visited,
             limits
@@ -542,31 +943,7 @@ export class Scrubber {
   }
 
   private scrubString(value: string): string {
-    resetRegex(COMBINED_QUICK_TEST_REGEX);
-    if (!COMBINED_QUICK_TEST_REGEX.test(value)) {
-      return looksLikeHighEntropySecret(value) ? REDACTED : value;
-    }
-
-    let scrubbed = value;
-
-    scrubbed = replacePattern(scrubbed, EMAIL_REGEX);
-    scrubbed = replaceCreditCards(scrubbed);
-    scrubbed = replacePattern(scrubbed, SSN_REGEX);
-    scrubbed = replacePattern(scrubbed, JWT_REGEX);
-    scrubbed = replacePattern(scrubbed, BEARER_REGEX);
-    scrubbed = replacePattern(scrubbed, BASIC_AUTH_REGEX);
-    scrubbed = replacePattern(scrubbed, AWS_ACCESS_KEY_REGEX);
-    scrubbed = replacePattern(scrubbed, GITHUB_TOKEN_REGEX);
-    scrubbed = replacePattern(scrubbed, STRIPE_KEY_REGEX);
-    scrubbed = replacePattern(scrubbed, GENERIC_SK_KEY_REGEX);
-    scrubbed = replacePattern(scrubbed, PHONE_REGEX);
-    scrubbed = replacePattern(scrubbed, IPV4_REGEX);
-
-    if (looksLikeHighEntropySecret(scrubbed)) {
-      return REDACTED;
-    }
-
-    return scrubbed;
+    return scrubStringPatterns(scrubKeyValueAssignments(value));
   }
 
   private scrubRelativeUrl(rawUrl: string): string {

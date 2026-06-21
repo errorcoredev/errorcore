@@ -1,0 +1,37 @@
+{
+    "scenario":  "F3-db-outage",
+    "label":  "Postgres container stopped during /api/tags",
+    "fault":  "docker compose stop postgres, request, docker compose start postgres",
+    "endpoint":  "GET /api/tags",
+    "requestsIssued":  1,
+    "timestamp":  "2026-06-02T01:33:39.8333184+05:30",
+    "beforeLineCounts":  {
+                             "enrich-svc":  0,
+                             "conduit-api":  2
+                         },
+    "afterLineCounts":  {
+                            "enrich-svc":  0,
+                            "conduit-api":  3
+                        },
+    "newCaptures":  {
+                        "conduitApi":  1,
+                        "enrichSvc":  0
+                    },
+    "commands":  [
+                     {
+                         "label":  "F3-stop-postgres",
+                         "exitCode":  0,
+                         "output":  "docker :  Container errorcore-validation-postgres-1  Stopping\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:167 char:38\r\n+ ... d \"F3-stop-postgres\" { docker compose -f $ComposeFile stop postgres }\r\n+                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: ( Container erro...res-1  Stopping:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\n Container errorcore-validation-postgres-1  Stopped"
+                     },
+                     {
+                         "label":  "F3-request-tags",
+                         "exitCode":  52,
+                         "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                     },
+                     {
+                         "label":  "F3-start-postgres",
+                         "exitCode":  0,
+                         "output":  "docker :  Container errorcore-validation-postgres-1  Starting\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:170 char:39\r\n+ ... \"F3-start-postgres\" { docker compose -f $ComposeFile start postgres }\r\n+                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: ( Container erro...res-1  Starting:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\n Container errorcore-validation-postgres-1  Started"
+                     }
+                 ]
+}

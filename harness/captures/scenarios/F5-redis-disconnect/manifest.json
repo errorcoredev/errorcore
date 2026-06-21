@@ -1,0 +1,32 @@
+{
+    "scenario":  "F5-redis-disconnect",
+    "label":  "Redis proxy disabled during App-A to App-B enrichment",
+    "fault":  "toxiproxy toggle redis-proxy down",
+    "endpoint":  "GET /api/tags",
+    "requestsIssued":  1,
+    "timestamp":  "2026-06-02T01:34:35.3141838+05:30",
+    "beforeLineCounts":  {
+                             "enrich-svc":  0,
+                             "conduit-api":  4
+                         },
+    "afterLineCounts":  {
+                            "enrich-svc":  1,
+                            "conduit-api":  5
+                        },
+    "newCaptures":  {
+                        "conduitApi":  1,
+                        "enrichSvc":  1
+                    },
+    "commands":  [
+                     {
+                         "label":  "F5-disable-redis-proxy",
+                         "exitCode":  0,
+                         "output":  "Proxy redis-proxy is now disabled"
+                     },
+                     {
+                         "label":  "F5-request-tags",
+                         "exitCode":  52,
+                         "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                     }
+                 ]
+}

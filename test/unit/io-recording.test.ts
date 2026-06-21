@@ -7,7 +7,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { IOEventBuffer } from '../../src/buffer/io-event-buffer';
 import { ALSManager } from '../../src/context/als-manager';
+import { EventClock } from '../../src/context/event-clock';
 import { RequestTracker } from '../../src/context/request-tracker';
+
+function makeBuffer(opts: { capacity: number; maxBytes: number }): IOEventBuffer {
+  const Ctor = IOEventBuffer;
+  return new Ctor({ ...opts, eventClock: new EventClock() });
+}
 import { HeaderFilter } from '../../src/pii/header-filter';
 import { Scrubber } from '../../src/pii/scrubber';
 import { BodyCapture } from '../../src/recording/body-capture';
@@ -16,6 +22,10 @@ import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 import { ERRORCORE_INTERNAL, HttpClientRecorder } from '../../src/recording/http-client';
 import { UndiciRecorder } from '../../src/recording/undici';
 import { NetDnsRecorder, runAsInternal } from '../../src/recording/net-dns';
+import { install as installPgPatch } from '../../src/recording/patches/pg';
+import { install as installMysql2Patch } from '../../src/recording/patches/mysql2';
+import { install as installMongodbPatch } from '../../src/recording/patches/mongodb';
+import { install as installIoredisPatch } from '../../src/recording/patches/ioredis';
 import { fastifyPlugin } from '../../src/middleware/fastify';
 import { createSDK } from '../../src/sdk';
 import type { RequestContext } from '../../src/types';
@@ -130,10 +140,13 @@ class MockClientRequest extends EventEmitter {
     }
   };
 
+  public sentChunks: Buffer[] = [];
+
   private readonly headers: Record<string, string> = {
     host: 'api.example.com',
     authorization: 'top-secret',
-    'user-agent': 'test-client'
+    'user-agent': 'test-client',
+    'content-type': 'application/json'
   };
 
   public getHeaders(): Record<string, string> {
@@ -142,6 +155,22 @@ class MockClientRequest extends EventEmitter {
 
   public getHeader(name: string): string | undefined {
     return this.headers[name];
+  }
+
+  public setHeader(name: string, value: string): void {
+    this.headers[name] = value;
+  }
+
+  public write(chunk: unknown, _encoding?: unknown, _cb?: unknown): boolean {
+    this.sentChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    return true;
+  }
+
+  public end(chunk?: unknown, _encoding?: unknown, _cb?: unknown): this {
+    if (chunk !== undefined && chunk !== null) {
+      this.sentChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    }
+    return this;
   }
 }
 
@@ -172,7 +201,7 @@ describe('Module 08 recorders', () => {
 
   it('records inbound HTTP requests, propagates ALS context, and attaches body capture', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const headerFilter = new HeaderFilter(config);
@@ -193,30 +222,21 @@ describe('Module 08 recorders', () => {
     const res = new MockServerResponse();
     let observedRequestId: string | undefined;
 
-    res.statusCode = 201;
+    res.statusCode = 500;
     res.setHeader('content-type', 'application/json');
     res.setHeader('set-cookie', 'hidden');
     recorder.install();
-    const fallbackEmitPatchInstalled = Server.prototype.emit !== originalEmit;
+
+    // Post-fix invariant: emit-patch is always installed, so emit('request')
+    // runs inside als.runWithContext() automatically.
+    expect(Server.prototype.emit).not.toBe(originalEmit);
 
     server.on('request', () => {
       observedRequestId = als.getRequestId();
     });
 
     try {
-      if (fallbackEmitPatchInstalled) {
-        server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
-      } else {
-        const context = (
-          recorder as unknown as {
-            getOrCreateContext(request: IncomingMessage): RequestContext;
-          }
-        ).getOrCreateContext(req as unknown as IncomingMessage);
-
-        als.runWithContext(context, () => {
-          server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
-        });
-      }
+      server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
 
       recorder.handleRequestStart({
         request: req as unknown as IncomingMessage,
@@ -242,7 +262,7 @@ describe('Module 08 recorders', () => {
         direction: 'inbound',
         method: 'GET',
         url: '/resource',
-        statusCode: 201,
+        statusCode: 500,
         requestHeaders: { host: 'service.local', 'content-type': 'application/json' },
         responseHeaders: { 'content-type': 'application/json' },
         aborted: false,
@@ -260,9 +280,52 @@ describe('Module 08 recorders', () => {
     }
   });
 
+  it('scrubs sensitive inbound URL query values before storing request metadata', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+    const req = new MockIncomingRequest();
+    const res = new MockServerResponse();
+
+    req.url = '/resource?password=hunter2&email=alice%40example.com&safe=ok';
+
+    try {
+      recorder.handleRequestStart({
+        request: req as unknown as IncomingMessage,
+        response: res as unknown as ServerResponse,
+        socket: req.socket as never,
+        server: new Server()
+      });
+
+      const [slot] = buffer.drain();
+
+      expect(slot?.url).toBe(
+        '/resource?password=%5BREDACTED%5D&email=%5BREDACTED%5D&safe=ok'
+      );
+      expect(slot?.url).not.toContain('hunter2');
+      expect(slot?.url).not.toContain('alice%40example.com');
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+    }
+  });
+
   it('reports whether bindStore or the emit patch is active at install time', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const emitSpy = vi.spyOn(process, 'emit');
@@ -280,13 +343,14 @@ describe('Module 08 recorders', () => {
     try {
       recorder.install();
 
-      const expectedPath =
-        Server.prototype.emit === originalEmit ? 'bindStore' : 'emit-patch';
+      // Post-fix: emit-patch is always installed, so Server.prototype.emit is
+      // always patched. getBindStorePath() reflects whether the bindStore
+      // subscription channel was available — not whether the emit-patch ran.
+      const bindStorePath = recorder.getBindStorePath();
 
-      expect(recorder.getBindStorePath()).toBe(expectedPath);
       expect(emitSpy).toHaveBeenCalledWith(
         'errorcore:init',
-        expect.objectContaining({ path: expectedPath })
+        expect.objectContaining({ path: bindStorePath })
       );
     } finally {
       recorder.shutdown();
@@ -296,7 +360,7 @@ describe('Module 08 recorders', () => {
 
   it('restores Server.prototype.emit on shutdown when the SDK owns the top wrapper', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const recorder = new HttpServerRecorder({
@@ -326,7 +390,7 @@ describe('Module 08 recorders', () => {
 
   it('leaves a third-party Server.prototype.emit wrapper in place during shutdown', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const recorder = new HttpServerRecorder({
@@ -360,7 +424,7 @@ describe('Module 08 recorders', () => {
 
   it('marks aborted inbound requests', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
     const recorder = new HttpServerRecorder({
@@ -390,6 +454,54 @@ describe('Module 08 recorders', () => {
 
       expect(slot?.aborted).toBe(true);
       expect(slot?.phase).toBe('done');
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+    }
+  });
+
+  it('does not let an early response-created diagnostic block final cleanup', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+    const req = new MockIncomingRequest();
+    const res = new MockServerResponse();
+
+    try {
+      recorder.handleResponseFinish({
+        request: req as unknown as IncomingMessage,
+        response: res as unknown as ServerResponse
+      });
+
+      recorder.handleRequestStart({
+        request: req as unknown as IncomingMessage,
+        response: res as unknown as ServerResponse,
+        socket: req.socket as never,
+        server: new Server()
+      });
+
+      const [context] = tracker.getAll();
+      expect(context?.ioEvents.length).toBeGreaterThan(0);
+
+      res.end('ok');
+
+      expect(buffer.drain()).toHaveLength(0);
+      expect(context?.ioEvents).toHaveLength(1);
+      expect(context?.ioEvents[0]?.phase).toBe('done');
+      expect(tracker.getCount()).toBe(0);
     } finally {
       recorder.shutdown();
       tracker.shutdown();
@@ -487,7 +599,7 @@ describe('Module 08 recorders', () => {
 
       response.end('done');
 
-      const slots = sdk.buffer.drain();
+      const slots = context.ioEvents;
 
       expect(slots).toHaveLength(2);
       expect(slots.map((slot) => slot.requestId)).toEqual([
@@ -499,15 +611,214 @@ describe('Module 08 recorders', () => {
         requestId: context.requestId,
         contextLost: false
       });
+      expect(sdk.buffer.drain()).toHaveLength(0);
       expect(sdk.requestTracker.getCount()).toBe(0);
     } finally {
       await sdk.shutdown();
     }
   });
 
+  it('scrubs sensitive outbound HTTP client URL query values before storing request metadata', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const context = createRequestContext(als);
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture: new BodyCapture(config),
+      headerFilter: new HeaderFilter(config)
+    });
+    const request = new MockClientRequest();
+
+    request.path = '/v1/items?password=hunter2&email=alice%40example.com&safe=ok';
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    const [slot] = buffer.drain();
+
+    expect(slot?.url).toBe(
+      'https://api.example.com:443/v1/items?password=%5BREDACTED%5D&email=%5BREDACTED%5D&safe=ok'
+    );
+    expect(slot?.url).not.toContain('hunter2');
+    expect(slot?.url).not.toContain('alice%40example.com');
+  });
+
+  it('captures outbound HTTP client request body via wrapped write/end', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const context = createRequestContext(als);
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: [
+        'application/json',
+        'application/x-www-form-urlencoded',
+        'text/plain',
+        'application/xml'
+      ]
+    });
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter: new HeaderFilter(config)
+    });
+    const request = new MockClientRequest();
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    request.write(Buffer.from('{"order":42}'));
+    request.end();
+
+    const [slot] = buffer.drain();
+    if (slot) {
+      bodyCapture.materializeSlotBodies(slot);
+    }
+
+    expect(slot?.requestBody?.toString()).toBe('{"order":42}');
+    expect(slot?.requestBodyTruncated).toBe(false);
+    expect(request.sentChunks.length).toBeGreaterThan(0);
+  });
+
+  it('materializes outbound JSON request body as readable string, not Buffer', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const context = createRequestContext(als);
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: [
+        'application/json',
+        'application/x-www-form-urlencoded',
+        'text/plain',
+        'application/xml'
+      ]
+    });
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter: new HeaderFilter(config)
+    });
+    const request = new MockClientRequest();
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    request.write(Buffer.from('{"orderId":"abc","amount":4242}'));
+    request.end();
+
+    const [slot] = buffer.drain();
+    if (slot) {
+      bodyCapture.materializeSlotBodies(slot);
+    }
+
+    expect(typeof slot?.requestBody).toBe('string');
+    expect(slot?.requestBody).toBe('{"orderId":"abc","amount":4242}');
+  });
+
+  it('captures synchronous undici outbound request body string/Buffer', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: [
+        'application/json',
+        'application/x-www-form-urlencoded',
+        'text/plain',
+        'application/xml'
+      ]
+    });
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter: new HeaderFilter(config),
+      bodyCapture
+    });
+    const context = createRequestContext(als, 'req-undici-body');
+    const undiciRequest = {
+      method: 'POST',
+      origin: 'https://api.example.com',
+      path: '/v1/charge',
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': 'undici-test'
+      },
+      body: '{"amount":100}'
+    };
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestCreate({ request: undiciRequest });
+    });
+
+    const [slot] = buffer.drain();
+    if (slot) {
+      bodyCapture.materializeSlotBodies(slot);
+    }
+
+    expect(slot?.requestBody?.toString()).toBe('{"amount":100}');
+    expect(slot?.requestBodyTruncated).toBe(false);
+    recorder.shutdown();
+  });
+
+  it('marks undici streaming body truncated without consuming the stream', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true,
+      bodyCaptureContentTypes: ['application/json']
+    });
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter: new HeaderFilter(config),
+      bodyCapture
+    });
+    const context = createRequestContext(als, 'req-undici-stream');
+    let pipeCalled = false;
+    const streamingBody = {
+      pipe(): void {
+        pipeCalled = true;
+      }
+    };
+    const undiciRequest = {
+      method: 'POST',
+      origin: 'https://api.example.com',
+      path: '/upload',
+      headers: { 'content-type': 'application/json' },
+      body: streamingBody
+    };
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestCreate({ request: undiciRequest });
+    });
+
+    const [slot] = buffer.drain();
+    expect(slot?.requestBody).toBeNull();
+    expect(slot?.requestBodyTruncated).toBe(true);
+    expect(pipeCalled).toBe(false);
+    recorder.shutdown();
+  });
+
   it('records outbound HTTP client requests and response metadata', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const context = createRequestContext(als);
     const bodyCapture = new BodyCapture(config);
@@ -554,7 +865,7 @@ describe('Module 08 recorders', () => {
 
   it('ignores SDK-internal outbound HTTP client requests', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new HttpClientRecorder({
       buffer,
       als: new ALSManager(),
@@ -574,7 +885,7 @@ describe('Module 08 recorders', () => {
 
   it('records outbound HTTP client errors with contextLost when ALS is unavailable', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new HttpClientRecorder({
       buffer,
       als: new ALSManager(),
@@ -601,7 +912,7 @@ describe('Module 08 recorders', () => {
 
   it('records undici request create, headers, and trailers without stale correlation', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const als = new ALSManager();
     const recorder = new UndiciRecorder({
       buffer,
@@ -670,9 +981,95 @@ describe('Module 08 recorders', () => {
     recorder.shutdown();
   });
 
+  it('propagates inbound traceFlags byte on undici outbound traceparent (sampled-out)', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter: new HeaderFilter(config)
+    });
+    const inboundTraceparent = '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00';
+    const context = als.createRequestContext({
+      method: 'GET',
+      url: '/origin',
+      headers: { host: 'localhost' },
+      traceparent: inboundTraceparent
+    });
+    const addedHeaders: Array<{ name: string; value: string }> = [];
+    const request = {
+      method: 'POST',
+      origin: 'https://undici.example.com',
+      path: '/items',
+      headers: {},
+      addHeader(name: string, value: string) {
+        addedHeaders.push({ name, value });
+        return this;
+      }
+    };
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestCreate({ request });
+    });
+
+    const traceparentHeader = addedHeaders.find((h) => h.name === 'traceparent');
+    expect(traceparentHeader).toBeDefined();
+    expect(traceparentHeader?.value).toMatch(/-00$/);
+    expect(traceparentHeader?.value.endsWith('-01')).toBe(false);
+    recorder.shutdown();
+  });
+
+  it('propagates inbound traceFlags byte on http-client outbound traceparent (sampled-out)', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const bodyCapture = new BodyCapture({
+      maxPayloadSize: 65536,
+      captureRequestBodies: true,
+      captureResponseBodies: true
+    });
+    const als = new ALSManager();
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter: new HeaderFilter(config)
+    });
+    const inboundTraceparent = '00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-00';
+    const context = als.createRequestContext({
+      method: 'GET',
+      url: '/origin',
+      headers: { host: 'localhost' },
+      traceparent: inboundTraceparent
+    });
+    const setHeaderCalls: Array<{ name: string; value: string }> = [];
+    const request = Object.assign(new EventEmitter(), {
+      method: 'POST',
+      host: 'svc.example.com',
+      port: 443,
+      path: '/charge',
+      protocol: 'https:',
+      socket: { _handle: { fd: 21 } },
+      getHeaders: () => ({}),
+      getHeader: () => undefined,
+      setHeader(name: string, value: string) {
+        setHeaderCalls.push({ name, value });
+      }
+    });
+
+    als.runWithContext(context, () => {
+      recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+    });
+
+    const traceparentSetHeader = setHeaderCalls.find((c) => c.name === 'traceparent');
+    expect(traceparentSetHeader).toBeDefined();
+    expect(traceparentSetHeader?.value).toMatch(/-00$/);
+    expect(traceparentSetHeader?.value.endsWith('-01')).toBe(false);
+  });
+
   it('ignores SDK-internal undici requests', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new UndiciRecorder({
       buffer,
       als: new ALSManager(),
@@ -694,7 +1091,7 @@ describe('Module 08 recorders', () => {
 
   it('records DNS lookups through the internal patch and marks contextLost when ALS is unavailable', async () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
     
     dnsModule.lookup = ((
@@ -741,7 +1138,7 @@ describe('Module 08 recorders', () => {
   });
 
   it('restores dns and net wrappers on shutdown when the SDK owns the top layer', () => {
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
     const originalConnect = netModule.connect;
     const originalCreateConnection = netModule.createConnection;
@@ -768,7 +1165,7 @@ describe('Module 08 recorders', () => {
   });
 
   it('leaves later third-party dns and net wrappers in place during shutdown', () => {
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
     const originalConnect = netModule.connect;
     const originalCreateConnection = netModule.createConnection;
@@ -818,7 +1215,7 @@ describe('Module 08 recorders', () => {
   });
 
   it('skips DNS lookups executed through runAsInternal', async () => {
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const originalLookup = dnsModule.lookup;
 
     dnsModule.lookup = ((
@@ -860,7 +1257,7 @@ describe('Module 08 recorders', () => {
 
   it('records TCP connect events via the net handler with contextLost when ALS is unavailable', () => {
     const config = createConfig();
-    const buffer = new IOEventBuffer({ capacity: 10, maxBytes: 100000 });
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
     const recorder = new NetDnsRecorder({
       buffer,
       als: new ALSManager()
@@ -885,6 +1282,424 @@ describe('Module 08 recorders', () => {
       });
     } finally {
       recorder.shutdown();
+    }
+  });
+
+  it('scrubs captured SQL bind params when opt-in capture is enabled', () => {
+    class FakePgClient {
+      public connectionParameters = {
+        host: 'postgres.local',
+        port: 5432,
+        database: 'app'
+      };
+
+      public query(_text: string, _values?: unknown[]): { rowCount: number } {
+        return { rowCount: 1 };
+      }
+    }
+
+    class FakeMysqlConnection {
+      public config = {
+        host: 'mysql.local',
+        port: 3306,
+        database: 'app'
+      };
+
+      public query(_sql: string, _values?: unknown[]): unknown[] {
+        return [{ affectedRows: 1 }];
+      }
+
+      public execute(_sql: string, _values?: unknown[]): unknown[] {
+        return [{ affectedRows: 1 }];
+      }
+    }
+
+    const config = resolveConfig({ captureDbBindParams: true });
+    const pgBuffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const mysqlBuffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const pgInstall = installPgPatch({
+      buffer: pgBuffer,
+      als: new ALSManager(),
+      config,
+      explicitDriver: { Client: FakePgClient }
+    });
+    const mysqlInstall = installMysql2Patch({
+      buffer: mysqlBuffer,
+      als: new ALSManager(),
+      config,
+      explicitDriver: { Connection: FakeMysqlConnection }
+    });
+
+    try {
+      new FakePgClient().query('SELECT $1::text, $2::text, $3::text, $4::text', [
+        'alice@example.com',
+        '4111111111111111',
+        'password=hunter2',
+        'visible-value'
+      ]);
+      new FakeMysqlConnection().execute('SELECT ?, ?, ?, ?', [
+        'alice@example.com',
+        '4111111111111111',
+        'password=hunter2',
+        'visible-value'
+      ]);
+
+      const [pgSlot] = pgBuffer.drain();
+      const [mysqlSlot] = mysqlBuffer.drain();
+
+      expect(pgSlot?.dbMeta?.params).not.toContain('alice@example.com');
+      expect(pgSlot?.dbMeta?.params).not.toContain('4111111111111111');
+      expect(pgSlot?.dbMeta?.params).not.toContain('hunter2');
+      expect(pgSlot?.dbMeta?.params).toContain('[REDACTED]');
+      expect(pgSlot?.dbMeta?.params).toContain('visible-value');
+      expect(mysqlSlot?.dbMeta?.params).not.toContain('alice@example.com');
+      expect(mysqlSlot?.dbMeta?.params).not.toContain('4111111111111111');
+      expect(mysqlSlot?.dbMeta?.params).not.toContain('hunter2');
+      expect(mysqlSlot?.dbMeta?.params).toContain('[REDACTED]');
+      expect(mysqlSlot?.dbMeta?.params).toContain('visible-value');
+    } finally {
+      pgInstall.uninstall();
+      mysqlInstall.uninstall();
+    }
+  });
+
+  it('scrubs captured MongoDB params when opt-in capture is enabled', () => {
+    class FakeCollection {
+      public collectionName = 'users';
+
+      public db = {
+        databaseName: 'app'
+      };
+
+      public insertOne(_document: unknown): { acknowledged: boolean; insertedId: string } {
+        return { acknowledged: true, insertedId: 'u1' };
+      }
+    }
+
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const install = installMongodbPatch({
+      buffer,
+      als: new ALSManager(),
+      config: resolveConfig({ captureDbBindParams: true }),
+      explicitDriver: { Collection: FakeCollection }
+    });
+
+    try {
+      new FakeCollection().insertOne({
+        email: 'alice@example.com',
+        card: '4111111111111111',
+        displayName: 'Alice'
+      });
+
+      const [slot] = buffer.drain();
+
+      expect(slot?.dbMeta?.params).not.toContain('alice@example.com');
+      expect(slot?.dbMeta?.params).not.toContain('4111111111111111');
+      expect(slot?.dbMeta?.params).toContain('[REDACTED]');
+      expect(slot?.dbMeta?.params).toContain('displayName');
+    } finally {
+      install.uninstall();
+    }
+  });
+
+  it('scrubs Redis cache keys before storing query and collection metadata', () => {
+    class FakeRedis {
+      public options = {
+        host: 'redis.local',
+        port: 6379
+      };
+
+      public sendCommand(_command: { name?: string; args?: unknown[] }): string {
+        return 'OK';
+      }
+    }
+
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const install = installIoredisPatch({
+      buffer,
+      als: new ALSManager(),
+      config: resolveConfig({}),
+      explicitDriver: FakeRedis
+    });
+
+    try {
+      new FakeRedis().sendCommand({
+        name: 'get',
+        args: ['session:alice@example.com:password=hunter2']
+      });
+
+      const [slot] = buffer.drain();
+
+      expect(slot?.dbMeta?.query).toBe('get session:[REDACTED]:password=[REDACTED]');
+      expect(slot?.dbMeta?.collection).toBe('session:[REDACTED]:password=[REDACTED]');
+      expect(slot?.dbMeta?.query).not.toContain('alice@example.com');
+      expect(slot?.dbMeta?.query).not.toContain('hunter2');
+    } finally {
+      install.uninstall();
+    }
+  });
+
+  it('reports driver patch installs with no wrapped methods as warnings', () => {
+    class EmptyRedis {}
+
+    const config = resolveConfig({});
+    const makeDeps = () => ({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config
+    });
+
+    const installs = [
+      installPgPatch({
+        ...makeDeps(),
+        explicitDriver: { Client: { prototype: {} }, Pool: { prototype: {} } }
+      }),
+      installMysql2Patch({
+        ...makeDeps(),
+        explicitDriver: { Connection: { prototype: {} } }
+      }),
+      installMongodbPatch({
+        ...makeDeps(),
+        explicitDriver: { Collection: { prototype: {} } }
+      }),
+      installIoredisPatch({
+        ...makeDeps(),
+        explicitDriver: EmptyRedis
+      })
+    ];
+
+    try {
+      for (const install of installs) {
+        expect(install.state).toEqual({
+          state: 'warn',
+          reason: 'no-supported-methods'
+        });
+      }
+    } finally {
+      for (const install of installs) {
+        install.uninstall();
+      }
+    }
+  });
+});
+
+describe('G2 — http-server shape: message.socket is optional', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('records request when diagnostic-channel payload omits socket', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const request = new MockIncomingRequest();
+    request.method = 'GET';
+    request.url = '/api/test';
+
+    const response = new MockServerResponse();
+    const server = new Server();
+
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    try {
+      // Payload without top-level socket — the real diagnostic-channel shape
+      recorder.handleRequestStart({
+        request: request as unknown as IncomingMessage,
+        response: response as unknown as ServerResponse,
+        server
+      } as never);
+
+      expect(pushSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'http-server',
+          direction: 'inbound',
+          method: 'GET',
+          url: '/api/test'
+        })
+      );
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
+    }
+  });
+
+  it('still records when socket is present (backward compat)', () => {
+    const config = createConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const request = new MockIncomingRequest();
+    const response = new MockServerResponse();
+    const server = new Server();
+
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    try {
+      // Payload with socket present — backward-compat path
+      recorder.handleRequestStart({
+        request: request as unknown as IncomingMessage,
+        response: response as unknown as ServerResponse,
+        socket: request.socket as never,
+        server
+      });
+
+      expect(pushSpy).toHaveBeenCalled();
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
+    }
+  });
+});
+
+describe('G2 — undici shape: RequestImpl, not ClientRequest', () => {
+  it('records outbound fetch when payload matches undici:request:create shape', () => {
+    const config = resolveConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const headerFilter = new HeaderFilter(config);
+    const recorder = new UndiciRecorder({
+      buffer,
+      als,
+      headerFilter
+    });
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    // undici RequestImpl shape. Headers often arrive as a flat array; the
+    // recorder must not assume Node core ClientRequest APIs (getHeader,
+    // socket, setHeader) exist on this object.
+    const request = {
+      origin: 'https://api.example.com',
+      path: '/v1/x',
+      method: 'GET',
+      headers: ['host', 'api.example.com', 'user-agent', 'test'],
+      body: null,
+      addHeader: () => undefined
+    };
+    recorder.handleRequestCreate({ request } as never);
+
+    expect(pushSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'undici',
+        direction: 'outbound',
+        method: 'GET',
+        url: 'https://api.example.com/v1/x'
+      })
+    );
+  });
+});
+
+describe('G2 — http-client shape: { request } only', () => {
+  it('records outbound request when payload contains only request', () => {
+    const config = resolveConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const recorder = new HttpClientRecorder({
+      buffer,
+      als,
+      bodyCapture,
+      headerFilter
+    });
+    const pushSpy = vi.spyOn(buffer, 'push');
+
+    // Construct a minimal ClientRequest-like object. Node's real
+    // http.client.request.start payload is literally { request } only.
+    const request = Object.assign(new EventEmitter(), {
+      method: 'POST',
+      host: 'api.example.com',
+      path: '/v1/x',
+      protocol: 'https:',
+      getHeaders: () => ({ host: 'api.example.com' }),
+      getHeader: (_: string) => 'api.example.com',
+      setHeader: () => undefined,
+    });
+
+    recorder.handleRequestStart({ request: request as unknown as ClientRequest });
+
+    expect(pushSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'http-client',
+        direction: 'outbound',
+        method: 'POST'
+      })
+    );
+  });
+});
+
+describe('G2 — ALS context propagation through server.emit', () => {
+  it('propagates ALS to handlers registered via server.on("request")', () => {
+    const config = resolveConfig();
+    const buffer = makeBuffer({ capacity: 10, maxBytes: 100000 });
+    const als = new ALSManager();
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60000 });
+    const headerFilter = new HeaderFilter(config);
+    const bodyCapture = new BodyCapture(config);
+    const scrubber = new Scrubber(config);
+    const recorder = new HttpServerRecorder({
+      buffer,
+      als,
+      requestTracker: tracker,
+      bodyCapture,
+      headerFilter,
+      scrubber,
+      config
+    });
+
+    const server = new Server();
+    const originalEmit = Server.prototype.emit;
+    const req = new MockIncomingRequest();
+    const res = new MockServerResponse();
+
+    recorder.install();
+
+    // Invariant under the fix: install() ALWAYS patches Server.prototype.emit,
+    // regardless of bindStore availability. This is the mechanism that makes
+    // ALS available to framework request handlers.
+    expect(Server.prototype.emit).not.toBe(originalEmit);
+
+    let contextInHandler: string | undefined;
+    server.on('request', () => {
+      contextInHandler = als.getRequestId();
+    });
+
+    try {
+      server.emit('request', req as unknown as IncomingMessage, res as unknown as ServerResponse);
+      expect(contextInHandler).not.toBeUndefined();
+      expect(typeof contextInHandler).toBe('string');
+    } finally {
+      recorder.shutdown();
+      tracker.shutdown();
+      server.close();
     }
   });
 });

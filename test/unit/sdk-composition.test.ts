@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Server } from 'node:http';
 import { channel } from 'node:diagnostics_channel';
 import * as fs from 'node:fs';
@@ -16,6 +16,13 @@ import {
 import { createSDK } from '../../src/sdk';
 import { Encryption } from '../../src/security/encryption';
 import { DeadLetterStore } from '../../src/transport/dead-letter-store';
+import {
+  detectBundler,
+  isNextJsNodeRuntime,
+  classifyRecorderStatus,
+  formatStartupLine,
+  formatWarnGuidance
+} from '../../src/sdk-diagnostics';
 
 function createTestSDK() {
   return createSDK({ transport: { type: 'stdout' }, allowUnencrypted: true });
@@ -47,6 +54,55 @@ describe('SDK composition', () => {
     }
   });
 
+  it('reinstalls the fetch wrapper at request start if a framework replaced fetch after activation', async () => {
+    const originalFetch = globalThis.fetch;
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    globalThis.fetch = vi.fn(async () => new Response('initial')) as typeof globalThis.fetch;
+
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureResponseBodies: true,
+      captureLocalVariables: false
+    });
+
+    try {
+      sdk.activate();
+
+      const frameworkFetch = vi.fn(async (_input, init) => {
+        const headers = new Headers(init?.headers);
+        expect(headers.get('traceparent')).toMatch(/^00-/);
+        expect(headers.get('tracestate')).toMatch(/^ec=clk:/);
+        return new Response('framework');
+      }) as typeof globalThis.fetch;
+      globalThis.fetch = frameworkFetch;
+
+      sdk.prepareForRequestStart();
+
+      expect(globalThis.fetch).not.toBe(frameworkFetch);
+
+      const context = sdk.als.createRequestContext({
+        method: 'GET',
+        url: '/framework-fetch',
+        headers: {}
+      });
+      const response = await sdk.als.runWithContext(context, () =>
+        fetch('http://framework-fetch.local', {
+          headers: { accept: 'text/plain' }
+        })
+      );
+
+      expect(await response.text()).toBe('framework');
+      expect(frameworkFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      await sdk.shutdown();
+      globalThis.fetch = originalFetch;
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    }
+  });
+
   it('does not expose collector authorization on the public config surface', async () => {
     const sdk = createSDK({
       allowUnencrypted: true,
@@ -60,11 +116,84 @@ describe('SDK composition', () => {
     try {
       expect(sdk.config.transport).toEqual({
         type: 'http',
-        url: 'https://collector.example.com/v1/errors'
+        url: 'https://collector.example.com/v1/errors',
+        protocol: 'auto'
       });
       expect(JSON.stringify(sdk.config)).not.toContain('super-secret');
     } finally {
       await sdk.shutdown();
+    }
+  });
+
+  it('does not call process.exit when the host has its own uncaughtException handler', async () => {
+    // Regression: the previous behavior was that the SDK always forced
+    // process.exit(1) after capturing an uncaught exception, even when
+    // the host application had installed its own handler that expected
+    // to keep the process alive.
+    const existingHostHandler = vi.fn();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((_code?: number) => {
+      // Do not actually exit during the test; we only need to observe
+      // whether the SDK tried to call exit.
+      return undefined as never;
+    }) as (code?: number | string | null | undefined) => never);
+
+    // Install the host handler BEFORE the SDK activates so the SDK's
+    // snapshot count sees a pre-existing listener.
+    process.on('uncaughtException', existingHostHandler);
+
+    let sdk: ReturnType<typeof createSDK> | undefined;
+    try {
+      sdk = createSDK({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        // Disable the worker path so capture is synchronous and we do not
+        // race with async package assembly.
+        useWorkerAssembly: false
+      });
+      sdk.activate();
+
+      // Find the SDK's uncaughtException handler and invoke it with a
+      // synthesized error.
+      const listeners = process.listeners('uncaughtException');
+      const sdkHandler = listeners[listeners.length - 1] as (err: Error) => void;
+      expect(typeof sdkHandler).toBe('function');
+
+      sdkHandler(new Error('injected-uncaught'));
+
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.off('uncaughtException', existingHostHandler);
+      if (sdk !== undefined) {
+        await sdk.shutdown();
+      }
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('does not auto-load errorcore.config.js from the current working directory', async () => {
+    // Regression test: init() used to call tryLoadConfigFile() which did
+    // require(process.cwd() + '/errorcore.config.js'). That was an RCE surface
+    // for anything that initialized errorcore from an untrusted directory.
+    // After the fix, init() must never require the cwd config file.
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'errorcore-auto-config-'));
+    const configPath = path.join(tempDir, 'errorcore.config.js');
+    fs.writeFileSync(
+      configPath,
+      'throw new Error("errorcore.config.js was auto-loaded - this is the RCE we fixed");\n'
+    );
+
+    const origCwd = process.cwd();
+    process.chdir(tempDir);
+
+    try {
+      // With a config file on disk but no config argument, init() must not
+      // load it. We pass an explicit stdout config so activation succeeds.
+      const instance = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+      expect(instance.isActive()).toBe(true);
+    } finally {
+      process.chdir(origCwd);
+      await shutdownFacade();
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
@@ -113,11 +242,23 @@ describe('SDK composition', () => {
     );
     const encryptionKey =
       'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
-    const payload = JSON.stringify(
-      new Encryption(encryptionKey).encrypt('{"ok":true}')
-    );
+    const enc = new Encryption(encryptionKey);
+    const envelope = enc.encryptToEnvelope(Buffer.from('{"ok":true}', 'utf8'), {
+      eventId: 'evt-dlq-replay'
+    });
+    const payload = JSON.stringify(envelope);
+    // The SDK reads the dead-letter file with an Encryption-derived HMAC
+    // (HKDF of encryptionKey under the hmac-key salt). Sign the fixture
+    // through the same Encryption instance so verification succeeds when
+    // the SDK replays it.
     const store = new DeadLetterStore(deadLetterPath, {
-      integrityKey: encryptionKey,
+      verifier: {
+        sign: (p) => enc.sign(p),
+        verifyKeyIndex: (p, m) => {
+          const r = enc.verify(p, m);
+          return r.ok ? r.keyIndex : null;
+        }
+      },
       requireEncryptedPayload: true
     });
 
@@ -140,7 +281,13 @@ describe('SDK composition', () => {
       await Promise.resolve();
 
       expect(sendSpy).toHaveBeenCalledTimes(1);
-      expect(sendSpy).toHaveBeenCalledWith(payload);
+      expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({
+        serialized: payload,
+        envelope: expect.objectContaining({
+          eventId: 'evt-dlq-replay',
+          keyId: envelope.keyId
+        })
+      }));
       expect(fs.existsSync(deadLetterPath)).toBe(false);
     } finally {
       await sdk.shutdown();
@@ -178,11 +325,107 @@ describe('SDK composition', () => {
       await Promise.resolve();
 
       expect(sendSpy).toHaveBeenCalledTimes(1);
-      expect(sendSpy).toHaveBeenCalledWith(payload);
+      expect(sendSpy).toHaveBeenCalledWith({
+        serialized: payload,
+        envelope: undefined
+      });
       expect(fs.existsSync(deadLetterPath)).toBe(false);
     } finally {
       await sdk.shutdown();
       fs.rmSync(deadLetterPath, { force: true });
+    }
+  });
+
+  it('replays auth-only dead-letter entries signed with previous collector authorization', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-auth-previous-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const payload = '{"ok":"previous-auth"}';
+    const store = new DeadLetterStore(deadLetterPath, {
+      integrityKey: 'Bearer old-replay-secret'
+    });
+
+    store.appendPayloadSync(payload);
+
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer current-replay-secret'
+      },
+      previousTransportAuthorizations: ['Bearer old-replay-secret'],
+      deadLetterPath
+    });
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy).toHaveBeenCalledWith({
+        serialized: payload,
+        envelope: undefined
+      });
+      expect(fs.existsSync(deadLetterPath)).toBe(false);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+    }
+  });
+
+  it('passes configured dead-letter rotation limits into the SDK-created store', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-sdk-dlq-rotate-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer rotation-secret'
+      },
+      deadLetterPath,
+      deadLetterMaxBytes: 1,
+      deadLetterMaxBackups: 1
+    });
+    const store = (sdk as unknown as {
+      deadLetterStore: DeadLetterStore | null;
+    }).deadLetterStore;
+
+    try {
+      expect(store).not.toBeNull();
+
+      store!.appendPayloadSync('{"p":1}');
+      store!.appendPayloadSync('{"p":2}');
+      store!.appendPayloadSync('{"p":3}');
+
+      const backups = fs
+        .readdirSync(path.dirname(deadLetterPath))
+        .filter((entry) =>
+          entry.startsWith(path.basename(deadLetterPath)) &&
+          entry.endsWith('.bak')
+        );
+
+      expect(backups).toHaveLength(1);
+      expect(store!.drain().entries.map((entry) => entry.payload)).toEqual([
+        '{"p":3}'
+      ]);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+      for (const backup of fs
+        .readdirSync(path.dirname(deadLetterPath))
+        .filter((entry) =>
+          entry.startsWith(path.basename(deadLetterPath)) &&
+          entry.endsWith('.bak')
+        )) {
+        fs.rmSync(path.join(path.dirname(deadLetterPath), backup), { force: true });
+      }
     }
   });
 
@@ -199,7 +442,8 @@ describe('SDK composition', () => {
       sdk.activate();
 
       expect(sdk.isActive()).toBe(true);
-      expect(collectSpy).toHaveBeenCalledTimes(1);
+      // collectStartupMetadata is called in the constructor, not activate()
+      expect(collectSpy).toHaveBeenCalledTimes(0);
       expect(installSpy).toHaveBeenCalledTimes(1);
       expect(subscribeSpy).toHaveBeenCalledTimes(1);
       expect(patchSpy).toHaveBeenCalledTimes(1);
@@ -218,17 +462,16 @@ describe('SDK composition', () => {
 
   it('does not patch Server.prototype.emit until activate and restores fallback patch on shutdown', async () => {
     const originalEmit = Server.prototype.emit;
-    const requestStartChannel = channel('http.server.request.start') as {
-      bindStore?: unknown;
-    };
-    const bindStoreAvailable = typeof requestStartChannel.bindStore === 'function';
     const sdk = createTestSDK();
 
     try {
       expect(Server.prototype.emit).toBe(originalEmit);
 
       sdk.activate();
-      expect(Server.prototype.emit === originalEmit).toBe(bindStoreAvailable);
+      // Post-fix (G2): emit-patch is always installed on activate, regardless
+      // of whether bindStore is available — it is the mechanism that propagates
+      // ALS to handlers registered via server.on('request', ...).
+      expect(Server.prototype.emit).not.toBe(originalEmit);
 
       await sdk.shutdown();
       expect(Server.prototype.emit).toBe(originalEmit);
@@ -253,6 +496,81 @@ describe('SDK composition', () => {
       expect(captureSpy).toHaveBeenCalledTimes(1);
     } finally {
       await sdk.shutdown();
+    }
+  });
+
+  it('normalizes primitive thrown values before direct capture', async () => {
+    const sdk = createTestSDK();
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture').mockReturnValue(null);
+
+    try {
+      sdk.activate();
+      sdk.captureError('secret=super-secret' as unknown);
+
+      const normalized = captureSpy.mock.calls[0]?.[0] as Error & {
+        thrownType?: string;
+        thrownValue?: unknown;
+      };
+      expect(normalized).toBeInstanceOf(Error);
+      expect(normalized.name).toBe('NonErrorThrown');
+      expect(normalized.message).toBe('Non-Error thrown (string): "secret=[REDACTED]"');
+      expect(normalized.thrownType).toBe('string');
+      expect(normalized.thrownValue).toBe('secret=[REDACTED]');
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('normalizes unhandledRejection reasons before capture', async () => {
+    const sdk = createTestSDK();
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture').mockReturnValue(null);
+    const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => true);
+
+    try {
+      sdk.activate();
+      const listeners = process.listeners('unhandledRejection');
+      const sdkHandler = listeners[listeners.length - 1] as (reason: unknown) => void;
+
+      sdkHandler({ card: '4111111111111111' });
+
+      const normalized = captureSpy.mock.calls[0]?.[0] as Error & {
+        thrownType?: string;
+        thrownValue?: unknown;
+      };
+      expect(normalized.name).toBe('NonErrorThrown');
+      expect(normalized.thrownType).toBe('object');
+      expect(normalized.thrownValue).toEqual({ card: '[REDACTED]' });
+    } finally {
+      warnSpy.mockRestore();
+      await sdk.shutdown();
+    }
+  });
+
+  it('does not let SDK uncaughtException capture failures escape when the host has a handler', async () => {
+    const existingHostHandler = vi.fn();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined as never) as typeof process.exit);
+    process.on('uncaughtException', existingHostHandler);
+
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      useWorkerAssembly: false
+    });
+    vi.spyOn(sdk.errorCapturer, 'capture').mockImplementation(() => {
+      throw new Error('capture pipeline failed');
+    });
+
+    try {
+      sdk.activate();
+      const listeners = process.listeners('uncaughtException');
+      const sdkHandler = listeners[listeners.length - 1] as (err: unknown) => void;
+
+      expect(() => sdkHandler('primitive-crash')).not.toThrow();
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.off('uncaughtException', existingHostHandler);
+      await sdk.shutdown();
+      exitSpy.mockRestore();
     }
   });
 
@@ -287,10 +605,15 @@ describe('SDK composition', () => {
     expect(sdk.isActive()).toBe(false);
   });
 
-  it('init twice throws and shutdown then init again works', async () => {
+  it('init twice warns and returns existing instance, shutdown then init again works', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const first = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
 
-    expect(() => init()).toThrow('SDK already initialized. Call shutdown() first.');
+    const duplicate = init();
+
+    expect(duplicate).toBe(first);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy.mock.calls[0][0]).toContain('already active');
 
     await shutdownFacade();
 
@@ -335,8 +658,16 @@ describe('SDK composition', () => {
     }
   });
 
-  it('trackState facade requires initialization and withContext facade passes through when absent', async () => {
-    expect(() => trackStateFacade('cache', new Map())).toThrow('SDK is not initialized');
+  it('trackState facade warns and returns container when uninitialized, withContext facade passes through when absent', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const container = new Map();
+    const result = trackStateFacade('cache', container);
+
+    expect(result).toBe(container);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy.mock.calls[0][0]).toContain('before init()');
+    warnSpy.mockRestore();
+
     expect(withContextFacade(() => 'value')).toBe('value');
 
     const sdk = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
@@ -437,5 +768,388 @@ describe('SDK composition', () => {
 
     expect(stdoutWrite).toHaveBeenCalled();
     expect(createSDKFacade).toBeDefined();
+  });
+});
+
+describe('G2 — bundler detection', () => {
+  it('detectBundler returns webpack when __webpack_require__ is defined', () => {
+    (globalThis as Record<string, unknown>).__webpack_require__ = () => undefined;
+    try {
+      expect(detectBundler()).toBe('webpack');
+    } finally {
+      delete (globalThis as Record<string, unknown>).__webpack_require__;
+    }
+  });
+
+  it('detectBundler returns unknown otherwise', () => {
+    expect(detectBundler()).toBe('unknown');
+  });
+
+  it('isNextJsNodeRuntime reads NEXT_RUNTIME === nodejs', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    process.env.NEXT_RUNTIME = 'nodejs';
+    try {
+      expect(isNextJsNodeRuntime()).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+
+  it('isNextJsNodeRuntime returns false when NEXT_RUNTIME is absent or edge', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    delete process.env.NEXT_RUNTIME;
+    try {
+      expect(isNextJsNodeRuntime()).toBe(false);
+      process.env.NEXT_RUNTIME = 'edge';
+      expect(isNextJsNodeRuntime()).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+});
+
+describe('G2 — recorder status assembly', () => {
+  it('classifyRecorderStatus emits ok / skip / warn correctly', () => {
+    expect(classifyRecorderStatus({ installed: true })).toEqual({ state: 'ok' });
+    expect(classifyRecorderStatus({ installed: false, reason: 'not-installed' })).toEqual({
+      state: 'skip',
+      reason: 'not-installed'
+    });
+    expect(classifyRecorderStatus({ installed: false, reason: 'bundled-unpatched' })).toEqual({
+      state: 'warn',
+      reason: 'bundled-unpatched'
+    });
+  });
+
+  it('classifyRecorderStatus defaults reason to unknown when omitted on installed=false', () => {
+    expect(classifyRecorderStatus({ installed: false })).toEqual({
+      state: 'skip',
+      reason: 'unknown'
+    });
+  });
+});
+
+describe('G2 — startup line formatting', () => {
+  it('formats a summary line with mixed ok/skip/warn states', () => {
+    const line = formatStartupLine({
+      version: '0.2.0',
+      nodeVersion: '20.11.0',
+      recorders: {
+        'http-server': { state: 'ok' },
+        'pg': { state: 'skip', reason: 'not-installed' },
+        'mongodb': { state: 'warn', reason: 'bundled-unpatched' }
+      }
+    });
+    expect(line).toBe(
+      '[errorcore] 0.2.0 node=20.11.0 recorders: http-server=ok pg=skip(not-installed) mongodb=warn(bundled-unpatched)'
+    );
+  });
+});
+
+describe('G2 — warn guidance formatting', () => {
+  it('returns null for non-warn states', () => {
+    expect(formatWarnGuidance('pg', { state: 'ok' }, { isNextJs: false })).toBeNull();
+    expect(
+      formatWarnGuidance('pg', { state: 'skip', reason: 'not-installed' }, { isNextJs: false })
+    ).toBeNull();
+  });
+
+  it('formats bundled-unpatched for Next.js recommending serverExternalPackages', () => {
+    const msg = formatWarnGuidance(
+      'pg',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: true }
+    );
+    expect(msg).toContain('serverExternalPackages');
+    expect(msg).toContain("'pg'");
+  });
+
+  it('formats bundled-unpatched for non-Next.js recommending drivers option', () => {
+    const msg = formatWarnGuidance(
+      'mongodb',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: false }
+    );
+    expect(msg).toContain("drivers:");
+    expect(msg).toContain("require('mongodb')");
+  });
+});
+
+describe('G2 — startup diagnostic emission', () => {
+  let origLog: typeof console.log;
+  let origInfo: typeof console.info;
+  let origWarn: typeof console.warn;
+  let logs: string[];
+
+  beforeEach(() => {
+    logs = [];
+    origLog = console.log;
+    origInfo = console.info;
+    origWarn = console.warn;
+    console.log = (msg: string) => { logs.push(String(msg)); };
+    console.info = (msg: string) => { logs.push(String(msg)); };
+    console.warn = (msg: string) => { logs.push(String(msg)); };
+  });
+  afterEach(() => {
+    console.log = origLog;
+    console.info = origInfo;
+    console.warn = origWarn;
+  });
+
+  it('emits a single summary line when silent is false', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: false
+    });
+    sdk.activate();
+    const line = logs.find((l) => /^\[errorcore\] .* node=.* recorders: /.test(l));
+    expect(line).toBeDefined();
+    expect(line).toContain('http-server=ok');
+    await sdk.shutdown();
+  });
+
+  it('emits nothing matching [errorcore] <version> when silent is true', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true
+    });
+    sdk.activate();
+    const summaryLines = logs.filter((l) => /^\[errorcore\] \d+\.\d+\.\d+ node=/.test(l));
+    expect(summaryLines).toEqual([]);
+    await sdk.shutdown();
+  });
+});
+
+describe('SDKInstance.getHealth', () => {
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+
+  beforeEach(() => {
+    // Silence the stdout transport so test output stays readable.
+    // Must preserve the callback contract — StdoutTransport awaits it.
+    process.stdout.write = ((
+      _chunk: unknown,
+      arg2?: unknown,
+      arg3?: unknown
+    ): boolean => {
+      const cb = typeof arg2 === 'function' ? arg2 : arg3;
+      if (typeof cb === 'function') {
+        (cb as (err?: Error | null) => void)();
+      }
+      return true;
+    }) as typeof process.stdout.write;
+  });
+
+  afterEach(async () => {
+    process.stdout.write = originalStdoutWrite;
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  function makeSDK(overrides: Record<string, unknown> = {}) {
+    return createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      useWorkerAssembly: false,
+      serverless: true, // skip event-loop-lag timer
+      ...overrides
+    });
+  }
+
+  it('returns zeros and nulls on a fresh SDK with no captures', () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(0);
+      expect(health.dropped).toBe(0);
+      expect(health.droppedBreakdown).toEqual({
+        rateLimited: 0,
+        captureFailed: 0,
+        deadLetterWriteFailed: 0
+      });
+      expect(health.transportFailures).toBe(0);
+      expect(health.payloadSpool).toEqual({
+        pressureWarnings: 0,
+        previewFallbacks: 0,
+        drops: 0
+      });
+      expect(health.transportQueueDepth).toBe(0);
+      expect(health.deadLetterDepth).toBe(0);
+      expect(health.ioBufferDepth).toBe(0);
+      expect(health.flushLatencyP50).toBe(0);
+      expect(health.flushLatencyP99).toBe(0);
+      expect(health.lastFailureReason).toBeNull();
+      expect(health.lastFailureAt).toBeNull();
+    } finally {
+      void sdk.shutdown();
+    }
+  });
+
+  it('counts each successful capture and records a flush latency sample', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('boom-1'));
+      sdk.captureError(new Error('boom-2'));
+      sdk.captureError(new Error('boom-3'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(3);
+      expect(health.dropped).toBe(0);
+      expect(health.transportFailures).toBe(0);
+      expect(health.lastFailureReason).toBeNull();
+      expect(health.flushLatencyP50).toBeGreaterThanOrEqual(0);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('monotonicity: repeated reads return equal counter values when nothing changes', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('one'));
+      await sdk.flush();
+
+      const first = sdk.getHealth();
+      const second = sdk.getHealth();
+
+      expect(second.captured).toBe(first.captured);
+      expect(second.dropped).toBe(first.dropped);
+      expect(second.transportFailures).toBe(first.transportFailures);
+      expect(second.droppedBreakdown).toEqual(first.droppedBreakdown);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('invariant: dropped === sum of the three droppedBreakdown buckets', async () => {
+    const sdk = makeSDK({ rateLimitPerMinute: 1 });
+    sdk.activate();
+    try {
+      // One acquires, one is rate-limited.
+      sdk.captureError(new Error('a'));
+      sdk.captureError(new Error('b'));
+      sdk.captureError(new Error('c'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+      const sum =
+        health.droppedBreakdown.rateLimited +
+        health.droppedBreakdown.captureFailed +
+        health.droppedBreakdown.deadLetterWriteFailed;
+
+      expect(health.dropped).toBe(sum);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('rate-limit overflow increments droppedBreakdown.rateLimited, not captured', async () => {
+    const sdk = makeSDK({ rateLimitPerMinute: 1 });
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('first'));
+      sdk.captureError(new Error('limited-1'));
+      sdk.captureError(new Error('limited-2'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(1);
+      expect(health.droppedBreakdown.rateLimited).toBe(2);
+      expect(health.dropped).toBe(2);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('records transport rejections as transportFailures and surfaces the last reason', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    vi.spyOn(sdk.transport, 'send').mockRejectedValue(new Error('collector offline'));
+    try {
+      sdk.captureError(new Error('boom'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(1);
+      expect(health.transportFailures).toBe(1);
+      expect(health.lastFailureReason).toContain('collector offline');
+      expect(health.lastFailureAt).toBeTypeOf('number');
+      // No DLQ configured -> the payload is genuinely lost.
+      expect(health.dropped).toBe(1);
+      expect(health.droppedBreakdown.deadLetterWriteFailed).toBe(1);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('dead-letters transport failures when a dead-letter store is configured, without counting them as dropped', async () => {
+    const dlqPath = path.join(
+      os.tmpdir(),
+      `errorcore-health-dlq-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    // 64 hex chars = 32 bytes, matches crypto.randomBytes(32).toString('hex').
+    // Using a fixed, high-entropy key keeps the test deterministic and passes
+    // the Shannon entropy gate in resolveConfig.
+    const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const sdk = makeSDK({
+      encryptionKey: hexKey,
+      deadLetterPath: dlqPath,
+      allowUnencrypted: false
+    });
+    sdk.activate();
+    vi.spyOn(sdk.transport, 'send').mockRejectedValue(new Error('collector offline'));
+    try {
+      sdk.captureError(new Error('boom'));
+      sdk.captureError(new Error('boom-2'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(2);
+      expect(health.transportFailures).toBe(2);
+      expect(health.deadLetterDepth).toBe(2);
+      expect(health.dropped).toBe(0);
+    } finally {
+      await sdk.shutdown();
+      try { fs.unlinkSync(dlqPath); } catch { /* best-effort */ }
+    }
+  });
+});
+
+describe('module-level getHealth()', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  it('returns null before init()', async () => {
+    const mod = await import('../../src/index');
+    expect(mod.getHealth()).toBeNull();
+  });
+
+  it('returns a HealthSnapshot after init()', async () => {
+    init({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      useWorkerAssembly: false,
+      serverless: true
+    });
+    const mod = await import('../../src/index');
+    const health = mod.getHealth();
+    expect(health).not.toBeNull();
+    expect(health!.captured).toBe(0);
   });
 });

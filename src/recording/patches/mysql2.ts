@@ -1,29 +1,54 @@
 
-import type { IOEventSlot, RequestContext } from '../../types';
+import { createRequire } from 'node:module';
+
+import type { IOEventSlot, RequestContext, ResolvedConfig } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+import {
+  Scrubber,
+  redactSensitiveQueryText,
+  scrubKeyValueAssignments
+} from '../../pii/scrubber';
+import { pushIOEvent } from '../utils';
+import type { RecorderState } from '../../sdk-diagnostics';
+import { detectBundler } from '../../sdk-diagnostics';
+import { safeConsole } from '../../debug-log';
 
-function formatParams(values: unknown[], captureActualValues: boolean): string | undefined {
+const nodeRequire = createRequire(__filename);
+
+function stringifyParam(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function scrubParam(value: unknown, scrubber: Scrubber): unknown {
+  const scrubbed = scrubber.scrubValue('', value);
+  if (typeof scrubbed === 'string') {
+    return scrubKeyValueAssignments(scrubbed);
+  }
+
+  return scrubbed;
+}
+
+function formatParams(values: unknown[], config: ResolvedConfig): string | undefined {
   if (values.length === 0) {
     return undefined;
   }
 
-  if (!captureActualValues) {
+  if (!config.captureDbBindParams) {
     return values.map((_, index) => `[PARAM_${index + 1}]`).join(', ');
   }
 
+  const scrubber = new Scrubber(config);
   return values
-    .map((value) => {
-      if (typeof value === 'string') {
-        return value;
-      }
-
-      try {
-        return JSON.stringify(value);
-      } catch {
-        return String(value);
-      }
-    })
+    .map((value) => stringifyParam(scrubParam(value, scrubber)))
     .join(', ');
 }
 
@@ -85,10 +110,10 @@ function resolveRowCount(result: unknown): number | null {
 function pushEvent(
   deps: PatchInstallDeps,
   context: RequestContext | undefined,
-  event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>
+  event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>
 ): void {
   const { slot } = deps.buffer.push(event);
-  context?.ioEvents.push(slot);
+  pushIOEvent(context, slot, deps.config.bufferSize);
 }
 
 function instrumentMethod(
@@ -99,7 +124,7 @@ function instrumentMethod(
   return function patchedMysqlMethod(this: unknown, ...args: unknown[]) {
     const parsed = parseArgs(args);
     const context = deps.als.getContext();
-    const event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'> = {
+    const event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'> = {
       phase: 'active',
       startTime: process.hrtime.bigint(),
       endTime: null,
@@ -124,8 +149,8 @@ function instrumentMethod(
       error: null,
       aborted: false,
       dbMeta: {
-        query: parsed.sql,
-        params: formatParams(parsed.values, deps.config.captureDbBindParams),
+        query: redactSensitiveQueryText(parsed.sql),
+        params: formatParams(parsed.values, deps.config),
         rowCount: null
       }
     };
@@ -193,32 +218,63 @@ function instrumentMethod(
   };
 }
 
-export function install(deps: PatchInstallDeps): () => void {
+export function install(deps: PatchInstallDeps): { uninstall: () => void; state: RecorderState } {
+  if (deps.explicitDriver === undefined && detectBundler() === 'webpack') {
+    return {
+      uninstall: () => undefined,
+      state: { state: 'warn', reason: 'bundled-unpatched' }
+    };
+  }
   try {
-    const mysql2 = require('mysql2') as {
+    const mysql2 = (deps.explicitDriver ?? nodeRequire('mysql2')) as {
       Connection?: { prototype?: object };
     };
 
-    if (mysql2.Connection?.prototype !== undefined) {
+    let wrappedMethods = 0;
+
+    if (
+      mysql2.Connection?.prototype !== undefined &&
+      typeof (mysql2.Connection.prototype as Record<string, unknown>).query === 'function'
+    ) {
       wrapMethod(mysql2.Connection.prototype, 'query', (original) =>
         instrumentMethod(deps, 'query', original)
       );
+      wrappedMethods += 1;
+    }
+
+    if (
+      mysql2.Connection?.prototype !== undefined &&
+      typeof (mysql2.Connection.prototype as Record<string, unknown>).execute === 'function'
+    ) {
       wrapMethod(mysql2.Connection.prototype, 'execute', (original) =>
         instrumentMethod(deps, 'execute', original)
       );
+      wrappedMethods += 1;
     }
 
-    return () => {
+    const uninstall = () => {
       if (mysql2.Connection?.prototype !== undefined) {
         unwrapMethod(mysql2.Connection.prototype, 'query');
         unwrapMethod(mysql2.Connection.prototype, 'execute');
       }
     };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') {
-      console.warn('[ErrorCore] Failed to install mysql2 patch');
+
+    if (wrappedMethods === 0) {
+      return { uninstall, state: { state: 'warn', reason: 'no-supported-methods' } };
     }
 
-    return () => undefined;
+    return { uninstall, state: { state: 'ok' } };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {
+      return {
+        uninstall: () => undefined,
+        state: { state: 'skip', reason: 'not-installed' }
+      };
+    }
+    safeConsole.warn('[ErrorCore] Failed to install mysql2 patch');
+    return {
+      uninstall: () => undefined,
+      state: { state: 'skip', reason: 'install-failed' }
+    };
   }
 }

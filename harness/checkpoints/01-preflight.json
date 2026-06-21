@@ -1,0 +1,32 @@
+{
+    "phase":  "01-preflight",
+    "timestamp":  "2026-06-02T01:38:03.7034143+05:30",
+    "workspace":  "C:\\Users\\harin\\Downloads\\errorcore\\ec-master",
+    "toolVersions":  {
+                         "docker":  "Docker version 28.5.2, build ecc6942",
+                         "dockerCompose":  "Docker Compose version v2.40.3-desktop.1",
+                         "node":  "v22.14.0",
+                         "npm":  "11.12.1",
+                         "npx":  "11.12.1",
+                         "git":  "git version 2.49.0.windows.1"
+                     },
+    "commands":  [
+                     {
+                         "label":  "npm-ci",
+                         "exitCode":  0
+                     },
+                     {
+                         "label":  "npm-run-build",
+                         "exitCode":  0
+                     },
+                     {
+                         "label":  "npm-pack",
+                         "exitCode":  0
+                     }
+                 ],
+    "ecTgz":  "C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\errorcore-0.2.0.tgz",
+    "ecTgzSha256":  "F858277F9C6366A04BAA2DB3F004590C4411EC589E7174B983D96100ACF2E7FA",
+    "notes":  [
+                  "No SDK source files were read or edited by the harness run. Build/pack consumed the workspace as a black-box producer artifact."
+              ]
+}

@@ -1,7 +1,20 @@
 
-import type { IOEventSlot, RequestContext } from '../../types';
+import { createRequire } from 'node:module';
+import * as path from 'node:path';
+
+import type { IOEventSlot, RequestContext, ResolvedConfig } from '../../types';
 import type { PatchInstallDeps } from './patch-manager';
 import { wrapMethod, unwrapMethod } from './patch-manager';
+import { Scrubber } from '../../pii/scrubber';
+import { pushIOEvent } from '../utils';
+import type { RecorderState } from '../../sdk-diagnostics';
+import { detectBundler } from '../../sdk-diagnostics';
+import { safeConsole } from '../../debug-log';
+
+// Resolve drivers from the application's require root rather than the
+// SDK's own node_modules - the latter walks the SDK's devDependency
+// tree and reports drivers as patched even when the app doesn't use them.
+const appRequire = createRequire(path.join(process.cwd(), 'noop.js'));
 
 const COLLECTION_METHODS = [
   'find',
@@ -45,12 +58,33 @@ function summarizeKeys(value: unknown): string | undefined {
   return undefined;
 }
 
+function stringifyParams(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatParams(args: unknown[], config: ResolvedConfig): string | undefined {
+  if (!config.captureDbBindParams || args.length === 0) {
+    return undefined;
+  }
+
+  const scrubber = new Scrubber(config);
+  return stringifyParams(scrubber.scrubValue('', args));
+}
+
 function resolveRowCount(result: unknown): number | null {
   const candidate = result as
     | {
         insertedCount?: unknown;
         modifiedCount?: unknown;
         deletedCount?: unknown;
+        // mongodb v6+ InsertOneResult is { acknowledged, insertedId }
+        // with no count field. Treat acknowledged singletons as rowCount=1.
+        acknowledged?: unknown;
+        insertedId?: unknown;
       }
     | undefined;
 
@@ -66,16 +100,20 @@ function resolveRowCount(result: unknown): number | null {
     return candidate.deletedCount;
   }
 
+  if (candidate?.acknowledged === true && candidate.insertedId !== undefined) {
+    return 1;
+  }
+
   return null;
 }
 
 function pushEvent(
   deps: PatchInstallDeps,
   context: RequestContext | undefined,
-  event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'>
+  event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'>
 ): void {
   const { slot } = deps.buffer.push(event);
-  context?.ioEvents.push(slot);
+  pushIOEvent(context, slot, deps.config.bufferSize);
 }
 
 function instrumentMethod(
@@ -89,7 +127,7 @@ function instrumentMethod(
       db?: { databaseName?: string };
     };
     const context = deps.als.getContext();
-    const event: Omit<IOEventSlot, 'seq' | 'estimatedBytes'> = {
+    const event: Omit<IOEventSlot, 'seq' | 'hrtimeNs' | 'estimatedBytes'> = {
       phase: 'active',
       startTime: process.hrtime.bigint(),
       endTime: null,
@@ -115,6 +153,7 @@ function instrumentMethod(
       aborted: false,
       dbMeta: {
         query: summarizeKeys(args[0]),
+        params: formatParams(args, deps.config),
         collection: collection.collectionName
       }
     };
@@ -170,32 +209,60 @@ function instrumentMethod(
   };
 }
 
-export function install(deps: PatchInstallDeps): () => void {
+export function install(deps: PatchInstallDeps): { uninstall: () => void; state: RecorderState } {
+  if (deps.explicitDriver === undefined && detectBundler() === 'webpack') {
+    return {
+      uninstall: () => undefined,
+      state: { state: 'warn', reason: 'bundled-unpatched' }
+    };
+  }
   try {
-    const mongodb = require('mongodb') as {
+    const mongodb = (deps.explicitDriver ?? appRequire('mongodb')) as {
       Collection?: { prototype?: object };
     };
 
+    let wrappedMethods = 0;
+
     if (mongodb.Collection?.prototype !== undefined) {
       for (const methodName of COLLECTION_METHODS) {
+        if (
+          typeof (mongodb.Collection.prototype as Record<string, unknown>)[methodName] !==
+          'function'
+        ) {
+          continue;
+        }
+
         wrapMethod(mongodb.Collection.prototype, methodName, (original) =>
           instrumentMethod(deps, methodName, original)
         );
+        wrappedMethods += 1;
       }
     }
 
-    return () => {
+    const uninstall = () => {
       if (mongodb.Collection?.prototype !== undefined) {
         for (const methodName of COLLECTION_METHODS) {
           unwrapMethod(mongodb.Collection.prototype, methodName);
         }
       }
     };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') {
-      console.warn('[ErrorCore] Failed to install mongodb patch');
+
+    if (wrappedMethods === 0) {
+      return { uninstall, state: { state: 'warn', reason: 'no-supported-methods' } };
     }
 
-    return () => undefined;
+    return { uninstall, state: { state: 'ok' } };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') {
+      return {
+        uninstall: () => undefined,
+        state: { state: 'skip', reason: 'not-installed' }
+      };
+    }
+    safeConsole.warn('[ErrorCore] Failed to install mongodb patch');
+    return {
+      uninstall: () => undefined,
+      state: { state: 'skip', reason: 'install-failed' }
+    };
   }
 }

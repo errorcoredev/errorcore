@@ -229,3 +229,57 @@ Body capture for undici response: use `undici:request:bodyChunkReceived` if avai
 - ALS context entry works for HTTP server requests.
 - Body capture attached where applicable.
 - All unit tests pass.
+
+---
+
+## 0.2.0 Additions
+
+### Tiered driver support (G2)
+
+Errorcore records IO events at different fidelity levels depending on the runtime environment. Canonical tiers (mirrored in README and `spec/09-database-patches.md`):
+
+**Tier 1 — Plain Node.js** (Express, Fastify, Koa, NestJS, raw `http`): automatic. No config needed. All recorders install against the same `require()` graph the app uses.
+
+**Tier 2 — Single-graph bundlers** (Vite SSR, esbuild, plain webpack): automatic if the driver is not tree-shaken, or pass explicit references via the `drivers` config option:
+
+```ts
+errorcore.init({
+  drivers: { pg: require('pg'), mongodb: require('mongodb') },
+});
+```
+
+**Tier 3 — Next.js App Router**: externalize drivers from the webpack bundle:
+
+```js
+// next.config.js
+module.exports = {
+  serverExternalPackages: ['pg', 'mongodb', 'mysql2', 'ioredis'],
+};
+```
+
+Without this, the DB timeline will not populate — the startup diagnostic will report `warn(bundled-unpatched)`. HTTP inbound, HTTP outbound, and `fetch` (undici) recording work in all three tiers because they hook `diagnostics_channel`, not module prototypes.
+
+### Channel payload shape contracts (G2)
+
+Audit results for actual Node channel payload shapes (Node 18/20/22/24). These are the authoritative shapes handlers must accept:
+
+| Channel | Actual payload shape | Fix applied in 0.2.0 |
+|---------|---------------------|----------------------|
+| `http.server.request.start` | `{ request, response, server }` — `socket` is **not** part of this payload in any Node version | Removed `message.socket === undefined` early-return; `socket` is read from `request.socket` instead |
+| `http.client.request.start` | `{ request }` only — socket attaches later via `response` event | Removed socket early-return; `request.socket` used if present, else null |
+| `undici:request:create` | undici `RequestImpl` shape — distinct from Node `ClientRequest` | Audited against undici types; normalized before passing to body capture |
+| `http.server.response.finish` | response-finished event (older Node) | Both this and `http.server.response.created` are now subscribed; deduplicated by request identity via `WeakSet<IncomingMessage>` |
+| `http.server.response.created` | response-finished event (newer Node) | See above |
+
+**Shape-assertion tests** (added in `test/unit/io-recording.test.ts`) construct the real channel payload per Node major version and assert the recorder does not early-return or throw.
+
+**Test matrix:**
+
+| Recorder | 18 | 20 | 22 | 24 | Rationale |
+|----------|----|----|----|----|-----------|
+| http-server | CI | CI | CI | CI | shape drift observed |
+| undici | CI | CI | CI | CI | internal API changed between versions |
+| pg / mongodb / mysql2 / ioredis | CI only | CI only | CI only | CI only | fail for reasons orthogonal to Node version |
+| http-client | — | CI only | — | — | single-version unless bug surfaces |
+| net | — | CI only | — | — | stable |
+| dns | — | CI only | — | — | stable |

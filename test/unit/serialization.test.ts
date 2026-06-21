@@ -328,4 +328,23 @@ describe('cloneAndLimit', () => {
     expect(level5['key-49']).toBe(49);
     expect(level5['key-50']).toBeUndefined();
   });
+
+  it('caps huge string values using the payload budget, not just maxStringLength', () => {
+    const hugeString = 'a'.repeat(10_000_000);
+    const input = { x: hugeString };
+
+    const result = cloneAndLimit(
+      input,
+      createLimits({ maxPayloadSize: 1_000_000, maxStringLength: 20_000_000 })
+    ) as Record<string, unknown>;
+
+    const value = result.x;
+    expect(typeof value === 'string' || result._truncated === true).toBe(true);
+    if (typeof value === 'string') {
+      expect(value.length).toBeLessThan(hugeString.length);
+    }
+
+    const serialized = JSON.stringify(result);
+    expect(serialized.length).toBeLessThan(1_200_000);
+  });
 });

@@ -1,0 +1,32 @@
+{
+    "scenario":  "F7-hostile-valid-traffic",
+    "label":  "Hostile-but-valid request with secrets in query plus downstream Redis outage",
+    "fault":  "deep query/PII request to /api/tags while redis-proxy is disabled",
+    "endpoint":  "GET /api/tags?token=...",
+    "requestsIssued":  1,
+    "timestamp":  "2026-06-02T01:35:35.5306546+05:30",
+    "beforeLineCounts":  {
+                             "enrich-svc":  1,
+                             "conduit-api":  6
+                         },
+    "afterLineCounts":  {
+                            "enrich-svc":  2,
+                            "conduit-api":  7
+                        },
+    "newCaptures":  {
+                        "conduitApi":  1,
+                        "enrichSvc":  1
+                    },
+    "commands":  [
+                     {
+                         "label":  "F7-disable-redis-proxy",
+                         "exitCode":  0,
+                         "output":  "Proxy redis-proxy is now disabled"
+                     },
+                     {
+                         "label":  "F7-request-hostile-tags",
+                         "exitCode":  52,
+                         "output":  "curl.exe : curl: (52) Empty reply from server\r\nAt C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\faults\\run-fault-catalog.ps1:57 char:5\r\n+     \u0026 curl.exe -sS -i --max-time $TimeoutSec -X $Method $Url\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: (curl: (52) Empty reply from server:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\ncurl_exit=52"
+                     }
+                 ]
+}

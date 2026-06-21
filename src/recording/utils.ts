@@ -46,3 +46,17 @@ export function extractFd(socket: unknown): number | null {
 
   return typeof maybeFd === 'number' ? maybeFd : null;
 }
+
+const DEFAULT_MAX_IO_EVENTS_PER_CONTEXT = 500;
+
+export function pushIOEvent(
+  context: { ioEvents: unknown[] } | undefined,
+  slot: unknown,
+  cap: number = DEFAULT_MAX_IO_EVENTS_PER_CONTEXT
+): void {
+  if (context === undefined || context.ioEvents.length >= cap) {
+    return;
+  }
+
+  context.ioEvents.push(slot);
+}

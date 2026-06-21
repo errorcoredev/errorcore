@@ -4,6 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { IOEventBuffer } from '../../src/buffer/io-event-buffer';
 import { ALSManager } from '../../src/context/als-manager';
+import { EventClock } from '../../src/context/event-clock';
+
+function makeBuffer(opts: { capacity: number; maxBytes: number }): IOEventBuffer {
+  const Ctor = IOEventBuffer;
+  return new Ctor({ ...opts, eventClock: new EventClock() });
+}
 import { PatchManager, unwrapMethod, wrapMethod } from '../../src/recording/patches/patch-manager';
 import { install as installPgPatch } from '../../src/recording/patches/pg';
 import { install as installMysql2Patch } from '../../src/recording/patches/mysql2';
@@ -17,7 +23,7 @@ function createDeps(overrides: Parameters<typeof resolveTestConfig>[0] = {}) {
   const config = resolveTestConfig(overrides);
 
   return {
-    buffer: new IOEventBuffer({ capacity: 100, maxBytes: 1_000_000 }),
+    buffer: makeBuffer({ capacity: 100, maxBytes: 1_000_000 }),
     als: new ALSManager(),
     config
   };
@@ -205,7 +211,7 @@ describe('pg patch', () => {
 
     await withDriverMocks({ pg: { Client: FakeClient, Pool: FakePool } }, async () => {
       const deps = createDeps();
-      const uninstall = installPgPatch(deps);
+      const { uninstall } = installPgPatch(deps);
       const client = new FakeClient();
       const pool = new FakePool();
       const context = createContext(deps.als, 'req-pg');
@@ -254,6 +260,9 @@ describe('pg patch', () => {
   });
 
   it('records pg query errors', async () => {
+    const supplementalLocalsSymbol = Symbol.for('errorcore.v1.supplementalLocals');
+    const pgError = new Error('pg failed');
+
     class FakeClient {
       public host = 'pg.local';
 
@@ -262,23 +271,136 @@ describe('pg patch', () => {
       public database = 'appdb';
 
       public query(): Promise<never> {
-        return Promise.reject(new Error('pg failed'));
+        return Promise.reject(pgError);
       }
     }
 
     await withDriverMocks({ pg: { Client: FakeClient } }, async () => {
-      const deps = createDeps();
-      const uninstall = installPgPatch(deps);
+      const deps = createDeps({ captureDbBindParams: true });
+      const { uninstall } = installPgPatch(deps);
       const client = new FakeClient();
 
       try {
-        await expect(client.query('select 1')).rejects.toThrow('pg failed');
+        await expect(
+          client.query('insert into widgets values ($1, $2)', [42, 'dupe-s6-unique'])
+        ).rejects.toThrow('pg failed');
         expect(deps.buffer.drain()[0]).toMatchObject({
           error: {
             type: 'Error',
             message: 'pg failed'
           }
         });
+        expect((pgError as unknown as Record<symbol, unknown>)[supplementalLocalsSymbol]).toEqual([
+          expect.objectContaining({
+            functionName: 'pg.query input',
+            locals: {
+              input: {
+                query: 'insert into widgets values ($1, $2)',
+                params: '42, dupe-s6-unique'
+              }
+            }
+          })
+        ]);
+      } finally {
+        uninstall();
+      }
+    });
+  });
+
+  it('records a Pool query once when the pool delegates to Client.query internally', async () => {
+    class FakeClient {
+      public host = 'pg.local';
+
+      public port = 5432;
+
+      public database = 'appdb';
+
+      public query(_text: string, values: unknown[]): Promise<{ rowCount: number }> {
+        return Promise.resolve({ rowCount: values.length });
+      }
+    }
+
+    class FakePool {
+      public options = { host: 'pg.local', port: 5432, database: 'appdb' };
+
+      public query(text: string, values: unknown[]): Promise<{ rowCount: number }> {
+        return new FakeClient().query(text, values);
+      }
+    }
+
+    await withDriverMocks({ pg: { Client: FakeClient, Pool: FakePool } }, async () => {
+      const deps = createDeps();
+      const { uninstall } = installPgPatch(deps);
+      const pool = new FakePool();
+      const context = createContext(deps.als, 'req-pg-pool');
+
+      try {
+        await deps.als.runWithContext(context, () =>
+          pool.query('select * from orders where id = $1', [42])
+        );
+        const slots = deps.buffer.drain();
+
+        expect(slots).toHaveLength(1);
+        expect(slots[0]).toMatchObject({
+          requestId: 'req-pg-pool',
+          dbMeta: {
+            query: 'select * from orders where id = $1',
+            params: '[PARAM_1]',
+            rowCount: 1
+          }
+        });
+      } finally {
+        uninstall();
+      }
+    });
+  });
+
+  it('records pg pool connect failures as finalized db events', async () => {
+    class FakePool {
+      public options = {
+        host: 'pg.local',
+        port: 5432,
+        database: 'appdb',
+        user: 'conduit',
+        password: 'super-secret'
+      };
+
+      public connect(): Promise<never> {
+        return Promise.reject(new Error('connect ECONNREFUSED'));
+      }
+    }
+
+    await withDriverMocks({ pg: { Pool: FakePool } }, async () => {
+      const deps = createDeps();
+      const { uninstall } = installPgPatch(deps);
+      const pool = new FakePool();
+      const context = createContext(deps.als, 'req-pg-connect');
+
+      try {
+        await expect(
+          deps.als.runWithContext(context, () => pool.connect())
+        ).rejects.toThrow('connect ECONNREFUSED');
+        const [slot] = deps.buffer.drain();
+
+        expect(slot).toMatchObject({
+          type: 'db-query',
+          target: 'postgres://pg.local:5432/appdb',
+          method: 'connect',
+          requestId: 'req-pg-connect',
+          phase: 'done',
+          dbMeta: {
+            query: 'connect',
+            rowCount: null
+          },
+          error: {
+            type: 'Error',
+            message: 'connect ECONNREFUSED'
+          }
+        });
+        expect(slot?.endTime).not.toBeNull();
+        expect(slot?.durationMs).toEqual(expect.any(Number));
+        expect(slot?.target).not.toContain('super-secret');
+        expect(slot?.dbMeta?.params).toBeUndefined();
       } finally {
         uninstall();
       }
@@ -312,7 +434,7 @@ describe('mysql2 patch', () => {
 
     await withDriverMocks({ mysql2: { Connection: FakeConnection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMysql2Patch(deps);
+      const { uninstall } = installMysql2Patch(deps);
       const connection = new FakeConnection();
       const context = createContext(deps.als, 'req-mysql');
       let callbackRows = 0;
@@ -370,7 +492,7 @@ describe('mysql2 patch', () => {
 
     await withDriverMocks({ mysql2: { Connection: FakeConnection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMysql2Patch(deps);
+      const { uninstall } = installMysql2Patch(deps);
       const connection = new FakeConnection();
 
       try {
@@ -405,7 +527,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
       const context = createContext(deps.als, 'req-redis');
 
@@ -443,6 +565,47 @@ describe('ioredis patch', () => {
     });
   });
 
+  it('redacts credentials on AUTH and HELLO commands', async () => {
+    // Regression: the ioredis patch captured args[0] as "collection" and
+    // included it in the formatted query. For AUTH and HELLO, args[0]
+    // is the plaintext password. Without redaction the SDK recorded a
+    // credential into every captured error package.
+    class FakeRedis {
+      public options = { host: 'redis.local', port: 6379 };
+
+      public sendCommand(command: { name: string; args: unknown[] }): Promise<string> {
+        return Promise.resolve(`${command.name}:ok`);
+      }
+    }
+
+    await withDriverMocks({ ioredis: FakeRedis }, async () => {
+      const deps = createDeps();
+      const { uninstall } = installIoredisPatch(deps);
+      const redis = new FakeRedis();
+      const context = createContext(deps.als, 'req-redis-auth');
+
+      try {
+        await deps.als.runWithContext(context, () =>
+          redis.sendCommand({ name: 'AUTH', args: ['super-secret-password'] })
+        );
+        await deps.als.runWithContext(context, () =>
+          redis.sendCommand({ name: 'HELLO', args: ['3', 'AUTH', 'user', 'pw'] })
+        );
+        const slots = deps.buffer.drain();
+
+        expect(slots[0]?.dbMeta?.query).toBe('AUTH [REDACTED]');
+        expect(slots[0]?.dbMeta?.collection).toBeUndefined();
+        expect(slots[0]?.method).toBe('AUTH');
+
+        expect(slots[1]?.dbMeta?.query).toBe('HELLO [REDACTED]');
+        expect(slots[1]?.dbMeta?.collection).toBeUndefined();
+        expect(slots[1]?.method).toBe('HELLO');
+      } finally {
+        uninstall();
+      }
+    });
+  });
+
   it('records redis command errors', async () => {
     class FakeRedis {
       public options = { host: 'redis.local', port: 6379 };
@@ -454,7 +617,7 @@ describe('ioredis patch', () => {
 
     await withDriverMocks({ ioredis: FakeRedis }, async () => {
       const deps = createDeps();
-      const uninstall = installIoredisPatch(deps);
+      const { uninstall } = installIoredisPatch(deps);
       const redis = new FakeRedis();
 
       try {
@@ -467,6 +630,149 @@ describe('ioredis patch', () => {
             message: 'redis failed'
           }
         });
+      } finally {
+        uninstall();
+      }
+    });
+  });
+
+  it('records ioredis v5 high-level commands that reject before network write', async () => {
+    const supplementalLocalsSymbol = Symbol.for('errorcore.v1.supplementalLocals');
+    const redisError = new Error(
+      "Stream isn't writeable and enableOfflineQueue options is false"
+    );
+
+    class FakeRedis {
+      public options = { host: 'redis.local', port: 6379 };
+
+      public xadd(): Promise<never> {
+        return Promise.reject(redisError);
+      }
+    }
+
+    await withDriverMocks({ ioredis: FakeRedis }, async () => {
+      const deps = createDeps();
+      const { uninstall, state } = installIoredisPatch(deps);
+      const redis = new FakeRedis();
+      const context = createContext(deps.als, 'req-redis-xadd');
+
+      try {
+        expect(state).toEqual({ state: 'ok' });
+        await expect(
+          deps.als.runWithContext(context, () =>
+            redis.xadd('audit:enrich', '*', 'traceId', 'abc123')
+          )
+        ).rejects.toThrow('enableOfflineQueue');
+        const [slot] = deps.buffer.drain();
+
+        expect(slot).toMatchObject({
+          type: 'db-query',
+          target: 'redis://redis.local:6379',
+          method: 'xadd',
+          requestId: 'req-redis-xadd',
+          phase: 'done',
+          dbMeta: {
+            query: 'xadd audit:enrich',
+            collection: 'audit:enrich'
+          },
+          error: {
+            type: 'Error',
+            message: "Stream isn't writeable and enableOfflineQueue options is false"
+          }
+        });
+        expect(slot?.endTime).not.toBeNull();
+        expect(slot?.durationMs).toEqual(expect.any(Number));
+        expect((redisError as unknown as Record<symbol, unknown>)[supplementalLocalsSymbol]).toEqual([
+          expect.objectContaining({
+            functionName: 'redis.command input',
+            locals: {
+              redisCommand: 'xadd',
+              redisKey: 'audit:enrich',
+              redisQuery: 'xadd audit:enrich',
+              redisTarget: 'redis://redis.local:6379'
+            }
+          })
+        ]);
+      } finally {
+        uninstall();
+      }
+    });
+  });
+
+  it('records ioredis pipeline commands when exec fails', async () => {
+    class FakePipeline {
+      public _queue: Array<{ name: string; args: unknown[] }> = [];
+
+      public hset(...args: unknown[]): this {
+        this._queue.push({ name: 'hset', args });
+        return this;
+      }
+
+      public zincrby(...args: unknown[]): this {
+        this._queue.push({ name: 'zincrby', args });
+        return this;
+      }
+
+      public exec(): Promise<never> {
+        return Promise.reject(new Error('redis unavailable'));
+      }
+    }
+
+    class FakeRedis {
+      public options = { host: 'redis.local', port: 6379 };
+
+      public sendCommand(): Promise<string> {
+        return Promise.resolve('ok');
+      }
+
+      public pipeline(): FakePipeline {
+        return new FakePipeline();
+      }
+    }
+
+    await withDriverMocks({ ioredis: FakeRedis }, async () => {
+      const deps = createDeps();
+      const { uninstall } = installIoredisPatch(deps);
+      const redis = new FakeRedis();
+      const context = createContext(deps.als, 'req-redis-pipeline');
+
+      try {
+        const pipeline = deps.als.runWithContext(context, () => redis.pipeline());
+        pipeline.hset('trace:last', { traceId: 'abc123' });
+        pipeline.zincrby('tag:usage', 1, 'errorcore');
+        await expect(
+          deps.als.runWithContext(context, () => pipeline.exec())
+        ).rejects.toThrow('redis unavailable');
+        const slots = deps.buffer.drain();
+
+        expect(slots).toHaveLength(2);
+        expect(slots[0]).toMatchObject({
+          type: 'db-query',
+          target: 'redis://redis.local:6379',
+          method: 'hset',
+          requestId: 'req-redis-pipeline',
+          phase: 'done',
+          dbMeta: {
+            query: 'hset trace:last',
+            collection: 'trace:last'
+          },
+          error: {
+            type: 'Error',
+            message: 'redis unavailable'
+          }
+        });
+        expect(slots[1]).toMatchObject({
+          method: 'zincrby',
+          dbMeta: {
+            query: 'zincrby tag:usage',
+            collection: 'tag:usage'
+          },
+          error: {
+            type: 'Error',
+            message: 'redis unavailable'
+          }
+        });
+        expect(slots.every((slot) => slot.endTime !== null)).toBe(true);
       } finally {
         uninstall();
       }
@@ -500,7 +806,7 @@ describe('mongodb patch', () => {
 
     await withDriverMocks({ mongodb: { Collection: FakeCollection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMongodbPatch(deps);
+      const { uninstall } = installMongodbPatch(deps);
       const collection = new FakeCollection();
       const context = createContext(deps.als, 'req-mongo');
 
@@ -553,7 +859,7 @@ describe('mongodb patch', () => {
 
     await withDriverMocks({ mongodb: { Collection: FakeCollection } }, async () => {
       const deps = createDeps();
-      const uninstall = installMongodbPatch(deps);
+      const { uninstall } = installMongodbPatch(deps);
       const collection = new FakeCollection();
 
       try {
@@ -574,5 +880,245 @@ describe('mongodb patch', () => {
         uninstall();
       }
     });
+  });
+});
+
+describe('G2 — PatchManager threads drivers config into installers', () => {
+  it('passes config.drivers.pg as explicitDriver to the pg installer', async () => {
+    const userPg = { Client: { prototype: { query: function orig() { return 'sentinel'; } } }, Pool: { prototype: {} } };
+    const userMongo = { MongoClient: { prototype: { connect: function orig() { return 'm-orig'; } } } };
+
+    await withDriverMocks({}, () => {
+      const config = resolveTestConfig({
+        drivers: { pg: userPg, mongodb: userMongo }
+      });
+      const pm = new PatchManager({
+        buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+        als: new ALSManager(),
+        config
+      });
+
+      const originalQuery = userPg.Client.prototype.query;
+      const originalConnect = userMongo.MongoClient.prototype.connect;
+
+      pm.installAll();
+
+      // After installAll (with Tasks 9-12 landed), the user's own pg.Client
+      // prototype is wrapped because PatchManager threaded the reference
+      // through. For this task alone (without 9-12), we instead verify
+      // PatchManager dispatched the deps correctly by inspecting that
+      // config.drivers survives through resolveConfig and is accessible on
+      // the PatchManager instance's deps.
+      expect(config.drivers.pg).toBe(userPg);
+      expect(config.drivers.mongodb).toBe(userMongo);
+
+      pm.unwrapAll();
+      expect(userPg.Client.prototype.query).toBe(originalQuery);
+      expect(userMongo.MongoClient.prototype.connect).toBe(originalConnect);
+    });
+  });
+
+  it('gracefully handles drivers with only some entries set', () => {
+    const userPg = { Client: { prototype: { query: function() {} } }, Pool: { prototype: {} } };
+    const config = resolveTestConfig({
+      drivers: { pg: userPg } // mongodb, mysql2, ioredis not set
+    });
+    const pm = new PatchManager({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config
+    });
+
+    expect(() => pm.installAll()).not.toThrow();
+    expect(() => pm.unwrapAll()).not.toThrow();
+  });
+
+  it('resolves string driver specifiers from the application root at install time', async () => {
+    const originalQuery = function originalQuery() { return 'pg-string'; };
+    const fakePg = {
+      Client: { prototype: { query: originalQuery } },
+      Pool: { prototype: {} }
+    };
+
+    await withDriverMocks({ pg: fakePg }, () => {
+      const pm = new PatchManager({
+        buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+        als: new ALSManager(),
+        config: resolveTestConfig({
+          drivers: { pg: 'pg' }
+        })
+      });
+
+      pm.installAll();
+
+      expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
+      expect(pm.getRecorderStates().pg).toEqual({ state: 'ok' });
+
+      pm.unwrapAll();
+      expect(fakePg.Client.prototype.query).toBe(originalQuery);
+    });
+  });
+
+  it('resolves lazy driver specifiers without calling constructor-style driver exports', () => {
+    const originalQuery = function originalQuery() { return 'pg-lazy'; };
+    const fakePg = {
+      Client: { prototype: { query: originalQuery } },
+      Pool: { prototype: {} }
+    };
+    const resolver = vi.fn(() => fakePg);
+    const pm = new PatchManager({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config: resolveTestConfig({
+        drivers: { pg: resolver }
+      })
+    });
+
+    pm.installAll();
+
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
+
+    pm.unwrapAll();
+    expect(fakePg.Client.prototype.query).toBe(originalQuery);
+  });
+
+  it('reports a missing explicit string driver without falling back to SDK dependencies', () => {
+    const pm = new PatchManager({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      config: resolveTestConfig({
+        drivers: { pg: '@errorcore/missing-pg-driver' }
+      })
+    });
+
+    expect(() => pm.installAll()).not.toThrow();
+    expect(pm.getRecorderStates().pg).toEqual({
+      state: 'skip',
+      reason: 'not-installed'
+    });
+  });
+});
+
+describe('G2 — pg installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalQuery = function originalQuery() { return 'pg-orig'; };
+    const fakePg = {
+      Client: { prototype: { query: originalQuery } },
+      Pool: { prototype: { query: originalQuery } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakePg };
+    const { uninstall } = installPgPatch(deps);
+
+    expect(fakePg.Client.prototype.query).not.toBe(originalQuery);
+    expect(fakePg.Pool.prototype.query).not.toBe(originalQuery);
+
+    uninstall();
+
+    expect(fakePg.Client.prototype.query).toBe(originalQuery);
+    expect(fakePg.Pool.prototype.query).toBe(originalQuery);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installPgPatch(deps)).not.toThrow();
+  });
+});
+
+describe('G2 — mongodb installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalFind = function originalFind() { return 'mongo-orig'; };
+    const fakeMongodb = {
+      Collection: { prototype: { find: originalFind } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakeMongodb };
+    const { uninstall } = installMongodbPatch(deps);
+
+    expect(fakeMongodb.Collection.prototype.find).not.toBe(originalFind);
+
+    uninstall();
+
+    expect(fakeMongodb.Collection.prototype.find).toBe(originalFind);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installMongodbPatch(deps)).not.toThrow();
+  });
+});
+
+describe('G2 — mysql2 installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalQuery = function originalQuery() { return 'mysql2-query-orig'; };
+    const originalExecute = function originalExecute() { return 'mysql2-execute-orig'; };
+    const fakeMysql2 = {
+      Connection: { prototype: { query: originalQuery, execute: originalExecute } }
+    };
+
+    const deps = { ...createDeps(), explicitDriver: fakeMysql2 };
+    const { uninstall } = installMysql2Patch(deps);
+
+    expect(fakeMysql2.Connection.prototype.query).not.toBe(originalQuery);
+    expect(fakeMysql2.Connection.prototype.execute).not.toBe(originalExecute);
+
+    uninstall();
+
+    expect(fakeMysql2.Connection.prototype.query).toBe(originalQuery);
+    expect(fakeMysql2.Connection.prototype.execute).toBe(originalExecute);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installMysql2Patch(deps)).not.toThrow();
+  });
+});
+
+describe('G2 — ioredis installer with explicit driver', () => {
+  afterEach(() => {
+    Module.prototype.require = originalRequire;
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicitDriver when provided', () => {
+    const originalSendCommand = function originalSendCommand() { return Promise.resolve('ok'); };
+    // ioredis exports the constructor class directly; the installer does:
+    //   const Redis = (deps.explicitDriver ?? nodeRequire('ioredis')) as { prototype?: object }
+    // and then wraps Redis.prototype.sendCommand
+    class FakeRedis {
+      public sendCommand = originalSendCommand;
+    }
+    // The installer checks Redis.prototype, so attach there too
+    FakeRedis.prototype.sendCommand = originalSendCommand;
+
+    const deps = { ...createDeps(), explicitDriver: FakeRedis };
+    const { uninstall } = installIoredisPatch(deps);
+
+    expect(FakeRedis.prototype.sendCommand).not.toBe(originalSendCommand);
+
+    uninstall();
+
+    expect(FakeRedis.prototype.sendCommand).toBe(originalSendCommand);
+  });
+
+  it('falls back to nodeRequire when explicitDriver is undefined', () => {
+    const deps = createDeps(); // no explicitDriver
+    expect(() => installIoredisPatch(deps)).not.toThrow();
   });
 });

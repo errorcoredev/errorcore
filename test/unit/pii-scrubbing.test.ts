@@ -3,7 +3,8 @@ import { homedir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { HeaderFilter } from '../../src/pii/header-filter';
-import { looksLikeHighEntropySecret, Scrubber } from '../../src/pii/scrubber';
+import { looksLikeHighEntropySecret, redactSensitiveQueryText, Scrubber } from '../../src/pii/scrubber';
+import * as scrubberExports from '../../src/pii/scrubber';
 import { isValidLuhn } from '../../src/pii/patterns';
 import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 
@@ -36,6 +37,11 @@ function referenceShannonEntropy(value: string): number {
   return entropy;
 }
 
+const scrubberHelpers = scrubberExports as typeof scrubberExports & {
+  scrubCacheKey?: (key: string) => string;
+  scrubKeyValueAssignments?: (text: string) => string;
+};
+
 describe('Scrubber', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -45,7 +51,11 @@ describe('Scrubber', () => {
     const scrubber = new Scrubber(resolveConfig({}));
 
     for (const key of [
+      'pass',
       'password',
+      'passcode',
+      'passphrase',
+      'passwd',
       'apiKey',
       'secret_token',
       'auth',
@@ -63,6 +73,20 @@ describe('Scrubber', () => {
     expect(scrubber.scrubValue('message', 'Contact john@example.com today')).toBe(
       'Contact [REDACTED] today'
     );
+  });
+
+  it('redacts common secret strings in generic messages and locals', () => {
+    const scrubber = new Scrubber(resolveConfig({}));
+
+    expect(
+      scrubber.scrubValue('message', 'Authorization: Bearer abc.def==')
+    ).toBe('Authorization: [REDACTED]');
+    expect(
+      scrubber.scrubValue('message', 'Cookie: sid=abc123; theme=dark')
+    ).toBe('Cookie: [REDACTED]; theme=dark');
+    expect(scrubber.scrubValue('message', 'password=hunter2')).toBe('password=[REDACTED]');
+    expect(scrubber.scrubValue('message', 'api_key=abc123456789')).toBe('api_key=[REDACTED]');
+    expect(scrubber.scrubValue('message', 'secret_token=supersecretvalue')).toBe('secret_token=[REDACTED]');
   });
 
   it('redacts only Luhn-valid credit card numbers', () => {
@@ -104,7 +128,7 @@ describe('Scrubber', () => {
       'JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature',
       'JWT [REDACTED]'
     ],
-    ['Bearer tokens', 'Bearer abc.def/ghi+123=', '[REDACTED]='],
+    ['Bearer tokens', 'Bearer abc.def/ghi+123=', '[REDACTED]'],
     ['Basic auth headers', 'Basic dXNlcjpwYXNz', '[REDACTED]'],
     [
       'AWS access keys',
@@ -123,7 +147,8 @@ describe('Scrubber', () => {
     ],
     ['generic sk keys', 'Token sk-abcdefghijklmno', 'Token [REDACTED]'],
     ['phone numbers', 'Call +1 (555) 123-4567 now', 'Call [REDACTED] now'],
-    ['IPv4 addresses', 'Connect to 192.168.1.1', 'Connect to [REDACTED]'],
+    ['public IPv4 addresses', 'Connect to 8.8.8.8', 'Connect to [REDACTED]'],
+    ['private IPv4 addresses are preserved', 'Connect to 192.168.1.1', 'Connect to 192.168.1.1'],
     [
       'valid credit cards',
       'Card 4111111111111111 was charged',
@@ -290,7 +315,236 @@ describe('Scrubber', () => {
       scrubber.scrubBodyBuffer(Buffer.from('raw multipart secret'), {
         'content-type': 'multipart/form-data; boundary=abc123'
       }).toString('utf8')
-    ).toBe('[MULTIPART BODY OMITTED]');
+    ).toBe('MULTIPART_REDACTED');
+  });
+
+  it('only bypasses value-pattern scrubbing for SDK-owned infrastructure paths', () => {
+    const scrubber = new Scrubber(resolveConfig({}));
+    const luhnLikeHrtime = '4111111111111111';
+
+    const scrubbed = scrubber.scrubObject({
+      errorEventHrtimeNs: luhnLikeHrtime,
+      ioTimeline: [
+        {
+          seq: 1,
+          hrtimeNs: luhnLikeHrtime,
+          startTime: luhnLikeHrtime,
+          requestBody: {
+            hrtimeNs: luhnLikeHrtime
+          }
+        }
+      ],
+      error: {
+        properties: {
+          hrtimeNs: luhnLikeHrtime
+        }
+      }
+    }) as {
+      errorEventHrtimeNs: string;
+      ioTimeline: Array<{
+        hrtimeNs: string;
+        startTime: string;
+        requestBody: { hrtimeNs: string };
+      }>;
+      error: { properties: { hrtimeNs: string } };
+    };
+
+    expect(scrubbed.errorEventHrtimeNs).toBe(luhnLikeHrtime);
+    expect(scrubbed.ioTimeline[0].hrtimeNs).toBe(luhnLikeHrtime);
+    expect(scrubbed.ioTimeline[0].startTime).toBe(luhnLikeHrtime);
+    expect(scrubbed.ioTimeline[0].requestBody.hrtimeNs).toBe('[REDACTED]');
+    expect(scrubbed.error.properties.hrtimeNs).toBe('[REDACTED]');
+  });
+
+  it('preserves root SDK package arrays while truncating user-controlled arrays', () => {
+    const scrubber = new Scrubber(resolveConfig({}));
+    const longArray = Array.from({ length: 25 }, (_value, index) => ({ index }));
+
+    const scrubbed = scrubber.scrubObject({
+      ioTimeline: longArray,
+      evictionLog: longArray,
+      stateReads: longArray,
+      stateWrites: longArray,
+      concurrentRequests: longArray,
+      localVariables: longArray,
+      error: {
+        properties: {
+          items: longArray
+        }
+      }
+    }) as {
+      ioTimeline: unknown;
+      evictionLog: unknown;
+      stateReads: unknown;
+      stateWrites: unknown;
+      concurrentRequests: unknown;
+      localVariables: unknown;
+      error: {
+        properties: {
+          items: unknown;
+        };
+      };
+    };
+
+    expect(Array.isArray(scrubbed.ioTimeline)).toBe(true);
+    expect(Array.isArray(scrubbed.evictionLog)).toBe(true);
+    expect(Array.isArray(scrubbed.stateReads)).toBe(true);
+    expect(Array.isArray(scrubbed.stateWrites)).toBe(true);
+    expect(Array.isArray(scrubbed.concurrentRequests)).toBe(true);
+    expect(Array.isArray(scrubbed.localVariables)).toBe(true);
+    expect(scrubbed.ioTimeline).toHaveLength(25);
+    expect(scrubbed.error.properties.items).toEqual({
+      _items: expect.any(Array),
+      _truncated: true,
+      _originalLength: 25
+    });
+  });
+
+  describe('scrubBodyBuffer — structural JSON walk', () => {
+    it('redacts cvc, password, and token via key-aware walk in JSON bodies', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = JSON.stringify({
+        user: {
+          email: 'alice@example.com',
+          card: {
+            // 16 contiguous digits with valid Luhn — caught by the value
+            // pattern. Hyphenated CC numbers are an existing scrubString
+            // limitation outside Fix 4's scope.
+            number: '4111111111111111',
+            cvc: '424',
+            exp: '12/29'
+          },
+          name: 'Alice'
+        },
+        password: 'p@ssw0rd',
+        access_token: 'tok_123abc'
+      });
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/json'
+        })
+        .toString('utf8');
+
+      const parsed = JSON.parse(out) as {
+        user: { card: { number: string; cvc: string; exp: string }; name: string; email: string };
+        password: string;
+        access_token: string;
+      };
+
+      // Key-aware redaction: cvc would not match any value pattern, but the
+      // structural walk catches it via SENSITIVE_KEY_EXACT_MATCHES.
+      expect(parsed.user.card.cvc).toBe('[REDACTED]');
+      expect(parsed.user.card.number).toBe('[REDACTED]');
+      expect(parsed.password).toBe('[REDACTED]');
+      expect(parsed.access_token).toBe('[REDACTED]');
+      // Email scrubbed via value-pattern regex.
+      expect(parsed.user.email).toBe('[REDACTED]');
+      // Non-sensitive fields preserved.
+      expect(parsed.user.name).toBe('Alice');
+      expect(parsed.user.card.exp).toBe('12/29');
+    });
+
+    it('walks application/vnd.api+json content types', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = JSON.stringify({ data: { type: 'user', attributes: { cvc: '999' } } });
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/vnd.api+json'
+        })
+        .toString('utf8');
+
+      expect(JSON.parse(out)).toEqual({
+        data: { type: 'user', attributes: { cvc: '[REDACTED]' } }
+      });
+    });
+
+    it('falls back to string scrub when JSON.parse fails', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const malformed = '{"email":"alice@example.com","cvc":';
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(malformed, 'utf8'), {
+          'content-type': 'application/json'
+        })
+        .toString('utf8');
+
+      // Email regex still fires on the partial body — value-pattern fallback works.
+      // cvc is NOT redacted in fallback (no structural walk on broken JSON).
+      expect(out).toContain('[REDACTED]');
+      expect(out).not.toContain('alice@example.com');
+    });
+
+    it('redacts sensitive form-urlencoded fields by key name', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = 'name=Alice&cvc=424&password=hunter2&color=blue';
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/x-www-form-urlencoded'
+        })
+        .toString('utf8');
+
+      const params = new URLSearchParams(out);
+      expect(params.get('name')).toBe('Alice');
+      expect(params.get('cvc')).toBe('[REDACTED]');
+      expect(params.get('password')).toBe('[REDACTED]');
+      expect(params.get('color')).toBe('blue');
+    });
+
+    it('redacts sensitive key-value assignments in text/plain body bytes', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = [
+        'username=Alice',
+        'password=hunter2',
+        'passcode: 123456',
+        'passphrase = correct horse battery staple',
+        'compass=west'
+      ].join('\n');
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'text/plain'
+        })
+        .toString('utf8');
+
+      expect(out).toContain('username=Alice');
+      expect(out).toContain('password=[REDACTED]');
+      expect(out).toContain('passcode: [REDACTED]');
+      expect(out).toContain('passphrase = [REDACTED]');
+      expect(out).toContain('compass=west');
+      expect(out).not.toContain('hunter2');
+      expect(out).not.toContain('123456');
+      expect(out).not.toContain('correct horse battery staple');
+    });
+
+    it('preserves non-PII bytes verbatim (no spurious changes)', () => {
+      const scrubber = new Scrubber(resolveConfig({}));
+      const body = JSON.stringify({ kind: 'order', items: 3, total: 45.5 });
+
+      const result = scrubber.scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+        'content-type': 'application/json'
+      });
+
+      expect(result.toString('utf8')).toBe(body);
+    });
+
+    it('redacts deeply-nested PII up to the configured depth cap', () => {
+      const scrubber = new Scrubber(resolveConfig({ serialization: { maxDepth: 8 } }));
+      const body = JSON.stringify({
+        a: { b: { c: { d: { e: { f: { cvc: '123' } } } } } }
+      });
+
+      const out = scrubber
+        .scrubBodyBuffer(Buffer.from(body, 'utf8'), {
+          'content-type': 'application/json'
+        })
+        .toString('utf8');
+
+      const parsed = JSON.parse(out) as { a: { b: { c: { d: { e: { f: { cvc: string } } } } } } };
+      expect(parsed.a.b.c.d.e.f.cvc).toBe('[REDACTED]');
+    });
   });
 
   it('does not mutate the input object passed to scrubObject', () => {
@@ -394,5 +648,107 @@ describe('HeaderFilter', () => {
       'content-type': 'application/json',
       'x-request-id': 'req-1'
     });
+  });
+});
+
+describe('redactSensitiveQueryText', () => {
+
+  it.each([
+    ['SELECT * FROM users', 'SELECT * FROM users'],
+    ['INSERT INTO logs VALUES ($1, $2)', 'INSERT INTO logs VALUES ($1, $2)'],
+    ['UPDATE users SET name = $1', 'UPDATE users SET name = $1'],
+    ['DELETE FROM sessions WHERE expired = true', 'DELETE FROM sessions WHERE expired = true'],
+    ['CREATE TABLE users (id SERIAL)', 'CREATE TABLE users (id SERIAL)'],
+    ['ALTER TABLE users ADD COLUMN email TEXT', 'ALTER TABLE users ADD COLUMN email TEXT'],
+    ['DROP TABLE temp_data', 'DROP TABLE temp_data'],
+    ['CREATE INDEX idx_name ON users (name)', 'CREATE INDEX idx_name ON users (name)'],
+    ['', ''],
+  ])('passes through safe query: %s', (input, expected) => {
+    expect(redactSensitiveQueryText(input)).toBe(expected);
+  });
+
+  it.each([
+    ["ALTER USER admin WITH PASSWORD 'secret123'", '[REDACTED: ALTER USER/ROLE statement]'],
+    ["CREATE USER 'newuser' IDENTIFIED BY 'pass'", '[REDACTED: CREATE USER/ROLE statement]'],
+    ["ALTER ROLE myuser WITH PASSWORD 'secret'", '[REDACTED: ALTER USER/ROLE statement]'],
+    ["CREATE ROLE dba WITH LOGIN PASSWORD 'x'", '[REDACTED: CREATE USER/ROLE statement]'],
+    ['DROP USER olduser', '[REDACTED: DROP USER/ROLE statement]'],
+    ['DROP ROLE testrole', '[REDACTED: DROP USER/ROLE statement]'],
+    ["SET PASSWORD = 'newsecret'", '[REDACTED: SET PASSWORD statement]'],
+    ['SET SESSION AUTHORIZATION admin', '[REDACTED: SET SESSION AUTHORIZATION statement]'],
+    ['GRANT SELECT ON users TO readonly', '[REDACTED: GRANT statement]'],
+    ['REVOKE ALL ON users FROM public', '[REDACTED: REVOKE statement]'],
+  ])('redacts sensitive query: %s', (input, expected) => {
+    expect(redactSensitiveQueryText(input)).toBe(expected);
+  });
+
+  it('redacts with leading whitespace', () => {
+    expect(redactSensitiveQueryText("  ALTER USER admin PASSWORD 'x'"))
+      .toBe('[REDACTED: ALTER USER/ROLE statement]');
+  });
+
+  it('redacts with leading SQL block comment', () => {
+    expect(redactSensitiveQueryText("/* prisma */ CREATE USER test IDENTIFIED BY 'y'"))
+      .toBe('[REDACTED: CREATE USER/ROLE statement]');
+  });
+
+  it('redacts with leading SQL line comment', () => {
+    expect(redactSensitiveQueryText("-- comment\nGRANT ALL ON schema TO admin"))
+      .toBe('[REDACTED: GRANT statement]');
+  });
+
+  it('does not classify GRANT-like strings mid-query as privileged SQL', () => {
+    expect(redactSensitiveQueryText("SELECT * FROM users WHERE role = 'GRANT_ADMIN'"))
+      .toBe('SELECT * FROM users WHERE role = [REDACTED]');
+  });
+
+  it('redacts quoted strings and numeric literals in captured query text', () => {
+    expect(
+      redactSensitiveQueryText(
+        "SELECT * FROM users WHERE email = 'alice@example.com' AND age >= 42 AND balance = -12.50 LIMIT 10"
+      )
+    ).toBe(
+      'SELECT * FROM users WHERE email = [REDACTED] AND age >= [REDACTED] AND balance = [REDACTED] LIMIT [REDACTED]'
+    );
+  });
+
+  it('preserves bind placeholders while redacting inline literals', () => {
+    expect(
+      redactSensitiveQueryText(
+        "UPDATE users SET name = 'Alice', score = 7 WHERE id = $1 AND active = ?"
+      )
+    ).toBe(
+      'UPDATE users SET name = [REDACTED], score = [REDACTED] WHERE id = $1 AND active = ?'
+    );
+  });
+
+  it('redacts escaped quoted SQL strings as a single literal', () => {
+    expect(redactSensitiveQueryText("INSERT INTO audit (message) VALUES ('can''t login')"))
+      .toBe('INSERT INTO audit (message) VALUES ([REDACTED])');
+  });
+});
+
+describe('scrubKeyValueAssignments', () => {
+  it('redacts sensitive assignment values without touching non-sensitive assignments', () => {
+    expect(
+      scrubberHelpers.scrubKeyValueAssignments?.(
+        'username=alice\npasscode: 123456\napiKey = abc123\ncompass=west'
+      )
+    ).toBe('username=alice\npasscode: [REDACTED]\napiKey = [REDACTED]\ncompass=west');
+  });
+});
+
+describe('scrubCacheKey', () => {
+  it('redacts PII patterns and sensitive key-value segments in cache keys', () => {
+    expect(
+      scrubberHelpers.scrubCacheKey?.(
+        'session:user=jane@example.com:token=abc123:profile'
+      )
+    ).toBe('session:user=[REDACTED]:token=[REDACTED]:profile');
+  });
+
+  it('preserves cache-key structure when no sensitive segment is present', () => {
+    expect(scrubberHelpers.scrubCacheKey?.('catalog:compass=west:page=2'))
+      .toBe('catalog:compass=west:page=2');
   });
 });

@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 
 import { Scrubber } from '../../src/pii/scrubber';
+import { PayloadSpool } from '../../src/spool/payload-spool';
 import { BodyCapture } from '../../src/recording/body-capture';
 import type { IOEventSlot, RequestContext } from '../../src/types';
 import { resolveTestConfig } from '../helpers/test-config';
@@ -94,6 +95,7 @@ function createBodyCapture(input: {
   captureBodyDigest?: boolean;
   bodyCaptureContentTypes?: string[];
   scrubber?: InstanceType<typeof Scrubber>;
+  payloadSpool?: PayloadSpool;
 } = {}): BodyCapture {
   return new BodyCapture({
     maxPayloadSize: input.maxPayloadSize ?? 32,
@@ -105,7 +107,8 @@ function createBodyCapture(input: {
     ...(input.bodyCaptureContentTypes === undefined
       ? {}
       : { bodyCaptureContentTypes: input.bodyCaptureContentTypes }),
-    ...(input.scrubber === undefined ? {} : { scrubber: input.scrubber })
+    ...(input.scrubber === undefined ? {} : { scrubber: input.scrubber }),
+    ...(input.payloadSpool === undefined ? {} : { payloadSpool: input.payloadSpool })
   });
 }
 
@@ -162,6 +165,79 @@ describe('BodyCapture', () => {
     expect(slot.requestBody?.toString()).toBe('abcde');
     expect(slot.requestBodyTruncated).toBe(true);
     expect(slot.requestBodyOriginalSize).toBe(6);
+  });
+
+  it('stores oversized scrubbed bodies in the payload spool and leaves a bounded preview ref on the slot', () => {
+    const spool = new PayloadSpool({
+      globalMaxBytes: 1024,
+      perRequestMaxBytes: 1024,
+      perBlobMaxBytes: 512,
+      previewBytes: 8,
+      completedTtlMs: 1000,
+      now: () => 100
+    });
+    const config = resolveTestConfig();
+    const capture = createBodyCapture({
+      maxPayloadSize: 8,
+      payloadSpool: spool,
+      scrubber: new Scrubber(config)
+    });
+    const req = new MockIncomingMessage();
+    const slot = createSlot({
+      requestHeaders: { 'content-type': 'application/json' }
+    });
+
+    capture.captureInboundRequest(req as IncomingMessage, slot, slot.seq, () => undefined);
+    req.on('data', () => undefined);
+    req.emit('data', Buffer.from('{"token":"secret-token","ok":true}'));
+    req.emit('end');
+    capture.materializeSlotBodies(slot);
+
+    expect(slot.requestBody).toBe('{"token"');
+    expect(slot.requestBodyTruncated).toBe(true);
+    expect(slot.requestBodyOriginalSize).toBe(34);
+    expect(slot.requestPayloadRef).toMatchObject({
+      storage: 'spool',
+      requestId: 'req-1',
+      mimeType: 'application/json',
+      size: 34
+    });
+    const entry = spool.get(slot.requestPayloadRef!.blobId);
+    expect(entry?.bytes.toString()).not.toContain('secret-token');
+    expect(entry?.bytes.toString()).toContain('[REDACTED]');
+  });
+
+  it('uses preview-only refs when the spool cannot store the full body', () => {
+    const spool = new PayloadSpool({
+      globalMaxBytes: 1024,
+      perRequestMaxBytes: 1024,
+      perBlobMaxBytes: 10,
+      previewBytes: 4,
+      completedTtlMs: 1000,
+      now: () => 100
+    });
+    const capture = createBodyCapture({
+      maxPayloadSize: 4,
+      payloadSpool: spool
+    });
+    const req = new MockIncomingMessage();
+    const slot = createSlot({
+      requestHeaders: { 'content-type': 'text/plain' }
+    });
+
+    capture.captureInboundRequest(req as IncomingMessage, slot, slot.seq, () => undefined);
+    req.on('data', () => undefined);
+    req.emit('data', Buffer.from('abcdefghijkl'));
+    req.emit('end');
+    capture.materializeSlotBodies(slot);
+
+    expect(slot.requestBody).toBe('abcd');
+    expect(slot.requestPayloadRef).toMatchObject({
+      storage: 'preview',
+      reason: 'per_blob_cap',
+      size: 12
+    });
+    expect(spool.get(slot.requestPayloadRef!.blobId)).toBeNull();
   });
 
   it('skips inbound request capture for disallowed content types', () => {
@@ -272,6 +348,25 @@ describe('BodyCapture', () => {
     capture.materializeSlotBodies(slot);
 
     expect(slot.responseBody?.toString()).toBe('hello');
+  });
+
+  it('releases deferred slot bodies without materializing successful responses', () => {
+    const capture = createBodyCapture();
+    const res = new MockServerResponse();
+    const slot = createSlot();
+
+    capture.captureOutboundResponse(
+      res as unknown as ServerResponse,
+      slot,
+      slot.seq,
+      () => undefined
+    );
+
+    res.end('success payload');
+    capture.releaseSlotBodies(slot);
+    capture.materializeSlotBodies(slot);
+
+    expect(slot.responseBody).toBeNull();
   });
 
   it('skips outbound response capture for disallowed content types after the first write', () => {
@@ -531,18 +626,20 @@ describe('BodyCapture', () => {
   it('materializes multipart bodies as a safe placeholder instead of raw bytes', () => {
     const capture = createBodyCapture({
       maxPayloadSize: 64,
+      captureBodyDigest: true,
       scrubber: new Scrubber(resolveTestConfig())
     });
     const req = new MockIncomingMessage();
     const slot = createSlot({
       requestHeaders: { 'content-type': 'multipart/form-data; boundary=test' }
     });
+    const onBytesChanged = vi.fn();
 
     capture.captureInboundRequest(
       req as IncomingMessage,
       slot,
       slot.seq,
-      () => undefined
+      onBytesChanged
     );
 
     req.on('data', () => undefined);
@@ -550,7 +647,28 @@ describe('BodyCapture', () => {
     req.emit('end');
     capture.materializeSlotBodies(slot);
 
-    expect(slot.requestBody?.toString('utf8')).toBe('[MULTIPART BODY OMITTED]');
+    expect(slot.requestBody?.toString('utf8')).toBe('MULTIPART_REDACTED');
+    expect(slot.requestBodyOriginalSize).toBeNull();
+    expect(slot.requestBodyDigest).toBeNull();
+    expect(onBytesChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it('scrubs sensitive key-value assignments in text/plain bodies', () => {
+    const capture = createBodyCapture({ maxPayloadSize: 128 });
+    const slot = createSlot({
+      requestHeaders: { 'content-type': 'text/plain; charset=utf-8' }
+    });
+
+    const replacement = capture.captureClientRequestBody(
+      slot,
+      slot.seq,
+      'password=super-secret\nnote=keep-me',
+      () => undefined
+    );
+
+    expect(replacement).toBeUndefined();
+    capture.materializeSlotBodies(slot);
+    expect(slot.requestBody).toBe('password=[REDACTED]\nnote=keep-me');
   });
 
   it('can capture only request bodies without response bodies', () => {
@@ -652,5 +770,205 @@ describe('BodyCapture', () => {
 
     expect(context.body?.toString()).toBe('latest');
     expect(context.bodyTruncated).toBe(true);
+  });
+
+  describe('captureClientRequestBody — AsyncGenerator coercion', () => {
+    async function* asyncGenFromStrings(parts: string[]): AsyncGenerator<Buffer> {
+      for (const p of parts) {
+        yield Buffer.from(p);
+      }
+    }
+
+    async function drainGenerator(
+      gen: AsyncGenerator<unknown> | undefined
+    ): Promise<Buffer> {
+      const chunks: Buffer[] = [];
+      if (gen === undefined) return Buffer.alloc(0);
+      for await (const chunk of gen) {
+        if (Buffer.isBuffer(chunk)) {
+          chunks.push(chunk);
+        } else if (chunk instanceof Uint8Array) {
+          chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        } else if (typeof chunk === 'string') {
+          chunks.push(Buffer.from(chunk));
+        }
+      }
+      return Buffer.concat(chunks);
+    }
+
+    it('returns a tee\'d generator for AsyncIterable bodies and decodes JSON', async () => {
+      const capture = createBodyCapture({
+        maxPayloadSize: 1024,
+        captureRequestBodies: true
+      });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+      capture.materializeSlotBodies(slot);
+
+      const source = asyncGenFromStrings(['{"a":1', ',"b":2}']);
+      const replacement = capture.captureClientRequestBody(slot, slot.seq, source, () => undefined);
+
+      expect(replacement).toBeDefined();
+      const sentBytes = await drainGenerator(replacement);
+
+      expect(sentBytes.toString('utf8')).toBe('{"a":1,"b":2}');
+
+      capture.materializeSlotBodies(slot);
+      expect(typeof slot.requestBody).toBe('string');
+      expect(slot.requestBody).toBe('{"a":1,"b":2}');
+      expect(slot.requestBodyTruncated).toBe(false);
+    });
+
+    it('does not return a generator for sync Buffer bodies', () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        Buffer.from('{"x":1}'),
+        () => undefined
+      );
+
+      expect(replacement).toBeUndefined();
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBody).toBe('{"x":1}');
+    });
+
+    it('does not return a generator for string bodies', () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        '{"y":2}',
+        () => undefined
+      );
+
+      expect(replacement).toBeUndefined();
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBody).toBe('{"y":2}');
+    });
+
+    it('captures Uint8Array chunks via the AsyncGenerator branch', async () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      async function* uintGen(): AsyncGenerator<Uint8Array> {
+        yield new TextEncoder().encode('{"u":');
+        yield new TextEncoder().encode('"v"}');
+      }
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        uintGen(),
+        () => undefined
+      );
+
+      const sentBytes = await drainGenerator(replacement);
+      expect(sentBytes.toString('utf8')).toBe('{"u":"v"}');
+
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBody).toBe('{"u":"v"}');
+    });
+
+    it('marks truncated when AsyncGenerator output exceeds maxPayloadSize', async () => {
+      const capture = createBodyCapture({
+        maxPayloadSize: 8,
+        captureRequestBodies: true
+      });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const source = asyncGenFromStrings(['1234567890', 'AAAAA']);
+      const replacement = capture.captureClientRequestBody(slot, slot.seq, source, () => undefined);
+
+      const sentBytes = await drainGenerator(replacement);
+      // Application still receives the full body — the tee yields each chunk
+      // unchanged regardless of the capture's truncation.
+      expect(sentBytes.toString('utf8')).toBe('1234567890AAAAA');
+
+      capture.materializeSlotBodies(slot);
+      expect(slot.requestBodyTruncated).toBe(true);
+      expect(slot.requestBodyOriginalSize).toBeGreaterThan(8);
+    });
+
+    it('returns a Readable as truncated without tee\'ing (existing pipe-shape branch)', () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      // Synthesize a Readable-like with both `pipe` and `Symbol.asyncIterator`.
+      // The pipe-shape branch must come first and short-circuit the
+      // AsyncIterable branch, otherwise we would try to consume a node stream
+      // through the tee.
+      const fakeReadable = {
+        pipe: () => undefined,
+        async *[Symbol.asyncIterator]() {
+          yield Buffer.from('hi');
+        }
+      };
+
+      const replacement = capture.captureClientRequestBody(
+        slot,
+        slot.seq,
+        fakeReadable,
+        () => undefined
+      );
+
+      expect(replacement).toBeUndefined();
+      expect(slot.requestBodyTruncated).toBe(true);
+      expect(slot.requestBodyOriginalSize).toBeNull();
+    });
+
+    it('finalizes the capture even when the consumer aborts mid-stream', async () => {
+      const capture = createBodyCapture({ captureRequestBodies: true });
+      const slot = createSlot({
+        type: 'undici',
+        direction: 'outbound',
+        requestHeaders: { 'content-type': 'application/json' }
+      });
+
+      const source = asyncGenFromStrings(['{"k":"v1', '","k2":"v2"}']);
+      const replacement = capture.captureClientRequestBody(slot, slot.seq, source, () => undefined);
+      expect(replacement).toBeDefined();
+
+      // Consume one chunk then break — for-await calls .return() on the
+      // generator on early exit, which fires our `finally` and finalizes.
+      let firstChunk: Buffer | undefined;
+      for await (const chunk of replacement!) {
+        firstChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+        break;
+      }
+
+      expect(firstChunk?.toString('utf8')).toBe('{"k":"v1');
+
+      capture.materializeSlotBodies(slot);
+      expect(typeof slot.requestBody).toBe('string');
+      expect(slot.requestBody).toBe('{"k":"v1');
+    });
   });
 });

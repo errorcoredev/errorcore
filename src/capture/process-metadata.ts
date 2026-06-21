@@ -11,8 +11,10 @@ interface StartupMetadata {
   platform: string;
   arch: string;
   pid: number;
+  ppid?: number;
   hostname: string;
   containerId?: string;
+  deploymentEnv?: string;
 }
 
 interface RuntimeMetadata {
@@ -39,13 +41,19 @@ export class ProcessMetadata {
 
   private timeAnchor: TimeAnchor = { wallClockMs: 0, hrtimeNs: '0' };
 
-  private codeVersion: { gitSha?: string; packageVersion?: string } = {};
+  private codeVersion: { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string } = {};
+
+  private codeVersionResolved = false;
+
+  private serverlessMeta: { functionName: string; functionVersion: string; invokedFunctionArn: string; lambdaRequestId: string } | null = null;
 
   private environment: Record<string, string> = {};
 
   private eventLoopLagMs = 0;
 
   private lagTimer: NodeJS.Timeout | null = null;
+
+  private lagStopped = false;
 
   public constructor(config: ResolvedConfig) {
     this.config = config;
@@ -63,17 +71,31 @@ export class ProcessMetadata {
       platform: process.platform,
       arch: process.arch,
       pid: process.pid,
+      ppid: process.ppid,
       hostname: this.readHostname(),
-      containerId: this.readContainerId()
+      containerId: this.readContainerId(),
+      // Spec §5: prefer explicit config, then ERRORCORE_ENVIRONMENT,
+      // then nothing. NODE_ENV is intentionally NOT used as a fallback -
+      // operators routinely set NODE_ENV=production in non-prod fleets
+      // (preview, staging) and the resulting label is misleading.
+      deploymentEnv:
+        this.config.deploymentEnv ??
+        process.env.ERRORCORE_ENVIRONMENT ??
+        undefined
     };
     this.codeVersion = {
       gitSha:
+        process.env.ERRORCORE_RELEASE ??
         process.env.GIT_SHA ??
         process.env.COMMIT_SHA ??
         process.env.SOURCE_VERSION ??
         this.readGitHead(),
-      packageVersion: process.env.npm_package_version
+      // Resolve package version eagerly at init so that readPackageVersion()
+      // (which does synchronous directory walk-up) never runs on the error
+      // capture hot path.
+      packageVersion: process.env.npm_package_version || this.readPackageVersion() || undefined
     };
+    this.codeVersionResolved = true;
     this.environment = this.filterEnvironment(process.env as Record<string, string | undefined>);
   }
 
@@ -110,46 +132,72 @@ export class ProcessMetadata {
     if (this.lagTimer !== null) {
       return;
     }
+    this.lagStopped = false;
 
-    const schedule = () => {
-      const scheduledAt = Date.now();
-
-      this.lagTimer = setTimeout(() => {
-        this.eventLoopLagMs = Math.max(
-          0,
-          Date.now() - scheduledAt - ProcessMetadata.LAG_SAMPLE_INTERVAL_MS
-        );
-        this.lagTimer = null;
-        schedule();
-      }, ProcessMetadata.LAG_SAMPLE_INTERVAL_MS);
-      this.lagTimer.unref();
-    };
-
-    schedule();
+    // setInterval instead of recursive setTimeout. Under a stalled event
+    // loop, the recursive form queued new setTimeout callbacks inside a
+    // callback that was itself delayed, amplifying the backlog exactly
+    // when the measurement was least useful. setInterval lets Node
+    // coalesce missed ticks into a single callback. unref() keeps the
+    // timer from holding the process alive.
+    let scheduledAt = Date.now();
+    this.lagTimer = setInterval(() => {
+      if (this.lagStopped) return;
+      const now = Date.now();
+      this.eventLoopLagMs = Math.max(
+        0,
+        now - scheduledAt - ProcessMetadata.LAG_SAMPLE_INTERVAL_MS
+      );
+      scheduledAt = now;
+    }, ProcessMetadata.LAG_SAMPLE_INTERVAL_MS);
+    this.lagTimer.unref();
   }
 
   public getTimeAnchor(): TimeAnchor {
     return { ...this.timeAnchor };
   }
 
-  public getCodeVersion(): { gitSha?: string; packageVersion?: string } {
+  public getCodeVersion(): { gitSha?: string; packageVersion?: string; functionVersion?: string; functionArn?: string } {
     return { ...this.codeVersion };
+  }
+
+  public setServerlessMetadata(meta: {
+    functionName: string;
+    functionVersion: string;
+    invokedFunctionArn: string;
+    lambdaRequestId: string;
+  }): void {
+    this.serverlessMeta = meta;
+    this.codeVersion = {
+      ...this.codeVersion,
+      functionVersion: meta.functionVersion,
+      functionArn: meta.invokedFunctionArn
+    };
   }
 
   public getEnvironment(): Record<string, string> {
     return { ...this.environment };
   }
 
+  public getProcessStartAnchor(): TimeAnchor {
+    return { ...this.timeAnchor };
+  }
+
   public getMergedMetadata(): ProcessMetadataShape {
     return {
       ...this.getStartupMetadata(),
-      ...this.getRuntimeMetadata()
+      ...this.getRuntimeMetadata(),
+      processStartAnchor: this.getProcessStartAnchor()
     };
   }
 
   public shutdown(): void {
+    // lagStopped guards against a lag callback that Node has already
+    // queued for this microtask; shutdown sets the flag, and the
+    // callback returns without writing state.
+    this.lagStopped = true;
     if (this.lagTimer !== null) {
-      clearTimeout(this.lagTimer);
+      clearInterval(this.lagTimer);
       this.lagTimer = null;
     }
   }
@@ -189,38 +237,64 @@ export class ProcessMetadata {
       return envHostname;
     }
 
+    if (this.config.serverless) {
+      return undefined;
+    }
+
     if (process.platform !== 'linux') {
       return undefined;
     }
 
-    try {
-      const cgroup = fs.readFileSync('/proc/self/cgroup', 'utf8');
+    // Cap the read. /proc/self/cgroup and /proc/self/mountinfo are
+    // normally a few kB each. In pathological container configurations
+    // these files can be multi-megabyte. Container-id detection is a
+    // best-effort observability feature, not worth blocking the SDK
+    // init on a large-file read.
+    const readCappedProcFile = (filePath: string, capBytes: number): string | null => {
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(filePath, 'r');
+        const buffer = Buffer.allocUnsafe(capBytes);
+        const bytesRead = fs.readSync(fd, buffer, 0, capBytes, 0);
+        return buffer.slice(0, bytesRead).toString('utf8');
+      } catch {
+        return null;
+      } finally {
+        if (fd !== undefined) {
+          try { fs.closeSync(fd); } catch { /* already closed */ }
+        }
+      }
+    };
 
+    const CONTAINER_ID_READ_CAP = 65536;
+    const cgroup = readCappedProcFile('/proc/self/cgroup', CONTAINER_ID_READ_CAP);
+    if (cgroup !== null) {
       for (const line of cgroup.split('\n')) {
         const match = /[0-9a-f]{64}/.exec(line);
-
         if (match !== null) {
           return match[0];
         }
       }
+    }
 
-      const mountinfo = fs.readFileSync('/proc/self/mountinfo', 'utf8');
-
+    const mountinfo = readCappedProcFile('/proc/self/mountinfo', CONTAINER_ID_READ_CAP);
+    if (mountinfo !== null) {
       for (const line of mountinfo.split('\n')) {
         const match = /[0-9a-f]{64}/.exec(line);
-
         if (match !== null) {
           return match[0];
         }
       }
-    } catch {
-      // Not in a container or no access to cgroup/mountinfo
     }
 
     return undefined;
   }
 
   private readGitHead(): string | undefined {
+    if (this.config.serverless) {
+      return undefined;
+    }
+
     try {
       const gitDir = path.join(process.cwd(), '.git');
       const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
@@ -236,6 +310,37 @@ export class ProcessMetadata {
     } catch {
       return undefined;
     }
+  }
+
+  private readPackageVersion(): string | undefined {
+    try {
+      const pkgPath = path.join(process.cwd(), 'package.json');
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: string };
+      if (typeof pkg.version === 'string') {
+        return pkg.version;
+      }
+    } catch {
+    }
+
+    try {
+      let dir = __dirname;
+      for (let i = 0; i < 10; i++) {
+        const pkgPath = path.join(dir, 'package.json');
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: string };
+          if (typeof pkg.version === 'string') {
+            return pkg.version;
+          }
+        } catch {
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    } catch {
+    }
+
+    return undefined;
   }
 
   private getActiveResourceCounts(): Pick<RuntimeMetadata, 'activeHandles' | 'activeRequests' | 'activeResourceTypes'> {

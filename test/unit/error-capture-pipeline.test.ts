@@ -3,11 +3,21 @@ import { createRequire } from 'node:module';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Scrubber } from '../../src/pii/scrubber';
+import { PayloadSpool } from '../../src/spool/payload-spool';
 import { Encryption } from '../../src/security/encryption';
+import { decryptFieldValue } from '../../src/scrubber/encoder';
+import { Scrubber as FieldScrubber } from '../../src/scrubber/scrubber';
 import { RateLimiter } from '../../src/security/rate-limiter';
 import { ALSManager } from '../../src/context/als-manager';
+import { EventClock } from '../../src/context/event-clock';
 import { RequestTracker } from '../../src/context/request-tracker';
 import { IOEventBuffer } from '../../src/buffer/io-event-buffer';
+import { StateTracker } from '../../src/state/state-tracker';
+
+function makeBuffer(opts: { capacity: number; maxBytes: number }): IOEventBuffer {
+  const Ctor = IOEventBuffer;
+  return new Ctor({ ...opts, eventClock: new EventClock() });
+}
 import {
   buildPackageAssemblyResult,
   finalizePackageAssemblyResult,
@@ -26,6 +36,8 @@ import type {
   PackageAssemblyWorkerResponse,
   RequestContext
 } from '../../src/types';
+import type { Field } from '../../src/scrubber/types';
+import { SourceMapResolver } from '../../src/capture/source-map-resolver';
 import { resolveTestConfig as resolveConfig } from '../helpers/test-config';
 
 const require = createRequire(import.meta.url);
@@ -38,6 +50,8 @@ const noopBodyCapture = {
   materializeSlotBodies: () => undefined,
   materializeContextBody: () => undefined
 };
+const FIELD_KEY =
+  '0123456789abcdeffedcba987654321089abcdef0123456776543210fedcba98';
 
 function withMissingWorkerThreads<T>(run: () => Promise<T> | T): Promise<T> | T {
   nodeModule.prototype.require = function patchedRequire(
@@ -85,6 +99,7 @@ function withWorkerThreadsMock<T>(
 function createSlot(overrides: Partial<IOEventSlot> = {}): IOEventSlot {
   return {
     seq: 1,
+    hrtimeNs: 1n,
     phase: 'done',
     startTime: 1n,
     endTime: 2n,
@@ -125,19 +140,23 @@ function createContext(als: ALSManager, requestId: string): RequestContext {
 }
 
 function createTimeoutStubs() {
+  // ProcessMetadata's event-loop-lag measurement now uses setInterval
+  // (previously setTimeout recursively rescheduled itself). The stub
+  // spies on both setInterval and clearInterval and exposes the
+  // captured callbacks via `timers`.
   const timers: Array<{ id: NodeJS.Timeout; fn: () => void; unref: ReturnType<typeof vi.fn> }> =
     [];
   const setTimeoutSpy = vi
-    .spyOn(globalThis, 'setTimeout')
+    .spyOn(globalThis, 'setInterval')
     .mockImplementation(((fn: TimerHandler) => {
       const unref = vi.fn();
       const timer = { unref } as unknown as NodeJS.Timeout;
 
       timers.push({ id: timer, fn: fn as () => void, unref });
       return timer;
-    }) as typeof setTimeout);
+    }) as typeof setInterval);
   const clearTimeoutSpy = vi
-    .spyOn(globalThis, 'clearTimeout')
+    .spyOn(globalThis, 'clearInterval')
     .mockImplementation(() => undefined as never);
 
   return { timers, setTimeoutSpy, clearTimeoutSpy };
@@ -148,6 +167,8 @@ function createPackageParts(
   overrides: Partial<ErrorPackageParts> = {}
 ): ErrorPackageParts {
   return {
+    errorEventSeq: 1,
+    errorEventHrtimeNs: process.hrtime.bigint(),
     error: {
       type: 'Error',
       message: 'boom',
@@ -170,6 +191,7 @@ function createPackageParts(
     ioTimeline: [],
     evictionLog: [],
     stateReads: context?.stateReads ?? [],
+    stateWrites: context?.stateWrites ?? [],
     concurrentRequests: [],
     processMetadata: {
       nodeVersion: process.version,
@@ -245,6 +267,12 @@ function createTempDeadLetterPath(): string {
   );
 }
 
+function expectField(value: unknown, mode: Field['mode']): Field {
+  const field = value as Field;
+  expect(field.mode).toBe(mode);
+  return field;
+}
+
 class FakeWorker {
   private readonly messageListeners: Array<(message: PackageAssemblyWorkerResponse) => void> = [];
 
@@ -311,6 +339,50 @@ class FakeWorker {
 
 afterEach(() => {
   nodeModule.prototype.require = originalRequire;
+});
+
+describe('module lifecycle', () => {
+  it('does not clear a newer global instance when an older shutdown resolves later', async () => {
+    const sdkModule = await import('../../src/index');
+    const instanceKey = Symbol.for('errorcore.sdk.instance');
+    const captureWarningKey = Symbol.for('errorcore.capture.warned');
+    const initializingKey = Symbol.for('errorcore.sdk.initializing');
+    const globals = globalThis as Record<symbol, unknown>;
+    let resolveFirstShutdown!: () => void;
+    const firstInstance = {
+      isActive: vi.fn(() => false),
+      shutdown: vi.fn(
+        () => new Promise<void>((resolve) => {
+          resolveFirstShutdown = resolve;
+        })
+      )
+    };
+    const secondInstance = {
+      isActive: vi.fn(() => true),
+      shutdown: vi.fn(async () => undefined)
+    };
+
+    globals[instanceKey] = firstInstance;
+
+    try {
+      const pendingShutdown = sdkModule.shutdown();
+
+      expect(firstInstance.shutdown).toHaveBeenCalledTimes(1);
+
+      globals[instanceKey] = secondInstance;
+      resolveFirstShutdown();
+
+      await pendingShutdown;
+
+      expect(globals[instanceKey]).toBe(secondInstance);
+    } finally {
+      if (globals[instanceKey] === secondInstance || globals[instanceKey] === firstInstance) {
+        globals[instanceKey] = null;
+      }
+      globals[captureWarningKey] = false;
+      globals[initializingKey] = false;
+    }
+  });
 });
 
 describe('ProcessMetadata', () => {
@@ -419,6 +491,8 @@ describe('PackageBuilder', () => {
     });
 
     const pkg = builder.build({
+      errorEventSeq: 1,
+      errorEventHrtimeNs: 0n,
       error: {
         type: 'Error',
         message: 'password leaked',
@@ -444,6 +518,7 @@ describe('PackageBuilder', () => {
       ],
       evictionLog: [],
       stateReads: context.stateReads,
+      stateWrites: [],
       concurrentRequests: [
         {
           requestId: 'req-2',
@@ -481,16 +556,11 @@ describe('PackageBuilder', () => {
       usedAmbientEvents: false
     });
 
-    expect(pkg.schemaVersion).toBe('1.0.0');
+    expect(pkg.schemaVersion).toBe('1.2.0');
     expect(new Date(pkg.capturedAt).toISOString()).toBe(pkg.capturedAt);
     expect(pkg.error.properties.password).toBe('[REDACTED]');
-    expect(pkg.localVariables?.[0]?.locals.apiKey).toBe('[REDACTED]');
-    expect(pkg.request?.body).toEqual({
-      _type: 'Buffer',
-      encoding: 'base64',
-      data: expect.any(String),
-      length: Buffer.from('email=user@example.com').length
-    });
+    expectField(pkg.localVariables?.[0]?.locals.apiKey, 'meta');
+    expectField(pkg.request?.body, 'meta');
     expect(pkg.request?.url).toBe('/login?email=%5BREDACTED%5D&token=%5BREDACTED%5D');
     expect(pkg.ioTimeline[0]?.url).toBe('/resource?apiKey=%5BREDACTED%5D');
     expect(pkg.completeness).toMatchObject({
@@ -508,9 +578,356 @@ describe('PackageBuilder', () => {
     });
   });
 
-  it('progressively sheds oversized payloads to stay under the UTF-8 byte size limit', () => {
+  it('preserves long SDK-owned ioTimeline arrays through scrub and completeness recompute', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config
+    });
+    const ioTimeline = Array.from({ length: 25 }, (_value, index) =>
+      createSlot({
+        seq: index + 2,
+        requestBodyTruncated: index % 5 === 0,
+        responseBodyTruncated: index % 7 === 0
+      })
+    );
+    const expectedTruncatedPayloads = ioTimeline.reduce((count, event) => {
+      return count + Number(event.requestBodyTruncated) + Number(event.responseBodyTruncated);
+    }, 0);
+
+    const pkg = builder.build(createPackageParts(undefined, {
+      ioTimeline
+    }));
+
+    expect(Array.isArray(pkg.ioTimeline)).toBe(true);
+    expect(pkg.ioTimeline).toHaveLength(25);
+    expect(pkg.completeness.ioTimelineCaptured).toBe(true);
+    expect(pkg.completeness.ioPayloadsTruncated).toBe(expectedTruncatedPayloads);
+  });
+
+  it('preserves long SDK-owned concurrent request arrays through scrub and completeness recompute', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config
+    });
+    const concurrentRequests = Array.from({ length: 25 }, (_value, index) => ({
+      requestId: `req-${index}`,
+      method: 'GET',
+      url: `/items/${index}`,
+      startTime: String(index + 1)
+    }));
+
+    const pkg = builder.build(createPackageParts(undefined, {
+      concurrentRequests
+    }));
+
+    expect(Array.isArray(pkg.concurrentRequests)).toBe(true);
+    expect(pkg.concurrentRequests).toHaveLength(25);
+    expect(pkg.completeness.concurrentRequestsCaptured).toBe(true);
+  });
+
+  it('fieldizes captured values while leaving telemetry primitive', () => {
     const config = resolveConfig({
-      serialization: { maxTotalPackageSize: 1100 }
+      encryptionKey: FIELD_KEY,
+      captureDbBindParams: true,
+      scrubberPolicy: { spoolBytes: 1024, maxField: 4096 }
+    });
+    const encryption = new Encryption(FIELD_KEY);
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config,
+      encryption
+    });
+    const als = new ALSManager();
+    const context = createContext(als, 'req-fields');
+
+    context.headers = {
+      host: 'service.local',
+      authorization: 'Bearer secret'
+    };
+    context.body = 'hello world';
+    context.stateReads.push({
+      seq: 2,
+      container: 'cache',
+      operation: 'get',
+      key: 'user:1',
+      value: { plan: 'pro' },
+      timestamp: 3n
+    });
+    context.stateWrites.push({
+      seq: 3,
+      hrtimeNs: 4n,
+      container: 'cache',
+      operation: 'set',
+      key: 'user:1',
+      value: { plan: 'team' }
+    });
+
+    const pkg = builder.build(createPackageParts(context, {
+      localVariables: [
+        {
+          functionName: 'handler',
+          filePath: '/app/src/handler.js',
+          lineNumber: 1,
+          columnNumber: 1,
+          locals: {
+            count: 2,
+            password: 'secret'
+          }
+        }
+      ],
+      ioTimeline: [
+        createSlot({
+          type: 'db-query',
+          direction: 'outbound',
+          dbMeta: {
+            query: 'select * from users where id = $1',
+            params: '1',
+            rowCount: 1
+          }
+        }),
+        createSlot({
+          type: 'http-client',
+          direction: 'outbound',
+          requestHeaders: { host: 'api.local' },
+          requestBody: 'outgoing',
+          responseHeaders: { 'content-type': 'application/json' },
+          responseBody: '{"ok":true}'
+        })
+      ],
+      stateReads: context.stateReads,
+      stateWrites: context.stateWrites
+    }));
+
+    const localCount = pkg.localVariables?.[0]?.locals.count as import('../../src/scrubber/types').Field;
+    const localPassword = pkg.localVariables?.[0]?.locals.password as import('../../src/scrubber/types').Field;
+    const requestHost = pkg.request?.headers.host as import('../../src/scrubber/types').Field;
+    const requestAuthorization = pkg.request?.headers.authorization as import('../../src/scrubber/types').Field;
+    const requestBody = pkg.request?.body as import('../../src/scrubber/types').Field;
+    const httpRequestBody = pkg.ioTimeline[1]?.requestBody as import('../../src/scrubber/types').Field;
+    const stateValue = pkg.stateReads[0]?.value as import('../../src/scrubber/types').Field;
+
+    expect(pkg.ioTimeline[0]?.seq).toBe(1);
+    expect(pkg.ioTimeline[0]?.durationMs).toBe(0.001);
+    expect(localCount.mode).toBe('encrypted');
+    expect(localPassword.mode).toBe('meta');
+    expect(requestHost.mode).toBe('encrypted');
+    expect(requestAuthorization.mode).toBe('meta');
+    expect(requestBody.mode).toBe('encrypted');
+    expect(pkg.ioTimeline[0]?.dbMeta?.query).toBe('select * from users where id = $1');
+    expect(pkg.ioTimeline[0]?.dbMeta?.params).toBe('1');
+    expect(httpRequestBody.mode).toBe('encrypted');
+    expect(stateValue.mode).toBe('encrypted');
+
+    expect(
+      JSON.parse(decryptFieldValue(localCount, { encryption }).toString('utf8'))
+    ).toBe(2);
+    expect(
+      JSON.parse(decryptFieldValue(requestBody, { encryption }).toString('utf8'))
+    ).toBe('hello world');
+  });
+
+  it('preserves scrubbed db timeline metadata in encrypted captures', () => {
+    const config = resolveConfig({
+      encryptionKey: FIELD_KEY,
+      captureDbBindParams: true,
+      scrubberPolicy: { spoolBytes: 1024, maxField: 4096 }
+    });
+    const encryption = new Encryption(FIELD_KEY);
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config,
+      encryption
+    });
+
+    const pkg = builder.build(createPackageParts(undefined, {
+      ioTimeline: [
+        createSlot({
+          type: 'db-query',
+          direction: 'outbound',
+          target: 'postgres://db:5432/app',
+          method: 'query',
+          dbMeta: {
+            query: 'SELECT * FROM widgets WHERE id = $1',
+            params: '[PARAM_1]',
+            rowCount: 1
+          }
+        }),
+        createSlot({
+          type: 'db-query',
+          direction: 'outbound',
+          target: 'redis://cache:6379',
+          method: 'get',
+          dbMeta: {
+            query: 'get widget:42',
+            collection: 'widget:42'
+          }
+        })
+      ]
+    }));
+
+    expect(pkg.ioTimeline[0]?.dbMeta?.query).toBe('SELECT * FROM widgets WHERE id = $1');
+    expect(pkg.ioTimeline[0]?.dbMeta?.params).toBe('[PARAM_1]');
+    expect(pkg.ioTimeline[0]?.dbMeta?.rowCount).toBe(1);
+    expect(pkg.ioTimeline[1]?.dbMeta?.query).toBe('get widget:42');
+    expect(pkg.ioTimeline[1]?.dbMeta?.collection).toBe('widget:42');
+  });
+
+  it('uses existing http incoming payload spool refs as Field refs', () => {
+    const config = resolveConfig({
+      encryptionKey: FIELD_KEY,
+      scrubberPolicy: { spoolBytes: 8, maxField: 4096 }
+    });
+    const encryption = new Encryption(FIELD_KEY);
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config,
+      encryption
+    });
+    const pkg = builder.build(createPackageParts(undefined, {
+      ioTimeline: [
+        createSlot({
+          type: 'http-server',
+          direction: 'inbound',
+          requestBody: 'preview',
+          requestPayloadRef: {
+            blobId: 'blob_1',
+            storage: 'spool',
+            requestId: 'req-1',
+            lineageId: 'req-1',
+            mimeType: 'text/plain',
+            size: 70_000,
+            capturedSize: 70_000,
+            sha256: 'hash',
+            previewBytes: 7,
+            previewTruncated: true
+          }
+        })
+      ]
+    }));
+
+    const field = pkg.ioTimeline[0]?.requestBody as Field;
+    expect(field.mode).toBe('encrypted');
+    if (field.mode !== 'encrypted') throw new Error('expected encrypted field');
+    expect(field.cipher).toEqual({ type: 'ref', id: 'blob_1', bytes: 70_000 });
+  });
+
+  it('routes raw-preserved package values through the field scrubber without changing shape', () => {
+    const config = resolveConfig({
+      encryptionKey: FIELD_KEY,
+      envAllowlist: ['ROUTE_SENTINEL']
+    });
+    const processSpy = vi.spyOn(FieldScrubber.prototype, 'process');
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config,
+      encryption: new Encryption(FIELD_KEY)
+    });
+    const als = new ALSManager();
+    const context = createContext(als, 'route-req');
+
+    context.url = '/route?value=route-url';
+
+    const pkg = builder.build(createPackageParts(context, {
+      error: {
+        type: 'RouteError',
+        message: 'route-message',
+        stack: 'RouteError: route-stack',
+        rawStack: 'RouteError: route-raw-stack',
+        cause: {
+          type: 'CauseError',
+          message: 'route-cause-message',
+          stack: 'CauseError: route-cause-stack',
+          properties: { custom: 'route-cause-property' }
+        },
+        properties: { custom: 'route-error-property' }
+      },
+      ioTimeline: [
+        createSlot({
+          target: 'route-target',
+          url: '/io?value=route-io-url',
+          requestBodyDigest: 'route-request-digest',
+          responseBodyDigest: 'route-response-digest',
+          error: { type: 'Error', message: 'route-io-error' }
+        })
+      ],
+      ambientContext: {
+        totalBufferEventsAtCapture: 1,
+        seqRange: { min: 1, max: 2 },
+        seqGaps: 0,
+        distinctRequestIds: ['route-ambient-req'],
+        retrievedCount: 1
+      },
+      codeVersion: { gitSha: 'route-sha' },
+      environment: { ROUTE_SENTINEL: 'route-env' },
+      captureFailures: ['route-capture-failure'],
+      fingerprint: 'route-fingerprint'
+    }));
+
+    expect(pkg.error.message).toBe('route-message');
+    expect(pkg.error.properties.custom).toBe('route-error-property');
+    expect(pkg.request?.id).toBe('route-req');
+    expect(pkg.request?.url).toBe('/route?value=route-url');
+    expect(pkg.ioTimeline[0]?.target).toBe('route-target');
+    expect(pkg.completeness.captureFailures).toContain('route-capture-failure');
+    expect(processSpy).toHaveBeenCalledWith('message', 'route-message', 'app');
+    expect(processSpy).toHaveBeenCalledWith('custom', 'route-error-property', 'app');
+    expect(processSpy).toHaveBeenCalledWith('requestId', 'route-req', 'http_incoming');
+    expect(processSpy).toHaveBeenCalledWith('url', '/route?value=route-url', 'http_incoming');
+    expect(processSpy).toHaveBeenCalledWith('target', 'route-target', 'http_incoming');
+    expect(processSpy).toHaveBeenCalledWith('requestId', 'route-ambient-req', 'app');
+    expect(processSpy).toHaveBeenCalledWith('gitSha', 'route-sha', 'app');
+    expect(processSpy).toHaveBeenCalledWith('ROUTE_SENTINEL', 'route-env', 'app');
+    expect(processSpy).toHaveBeenCalledWith('captureFailure', 'route-capture-failure', 'app');
+    expect(processSpy).toHaveBeenCalledWith('fingerprint', 'route-fingerprint', 'app');
+  });
+
+  it('scrubs home directory prefixes from stack and local frame file paths', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config
+    });
+    const home = osModule.homedir();
+    const filePath = pathModule.join(home, 'project', 'src', 'handler.js');
+    const stack = `Error: boom\n    at handler (${filePath}:10:2)`;
+
+    const pkg = builder.build(createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'boom',
+        stack,
+        rawStack: stack,
+        properties: {}
+      },
+      localVariables: [
+        {
+          functionName: 'handler',
+          filePath,
+          lineNumber: 10,
+          columnNumber: 2,
+          locals: { value: 1 }
+        }
+      ]
+    }));
+
+    expect(pkg.error.stack).not.toContain(home);
+    expect(pkg.error.rawStack).not.toContain(home);
+    expect(pkg.localVariables?.[0]?.filePath).not.toContain(home);
+    expect(pkg.error.stack).toContain('/~/');
+    expect(pkg.error.rawStack).toContain('/~/');
+    expect(pkg.localVariables?.[0]?.filePath).toContain('/~/');
+  });
+
+  it('progressively sheds oversized payloads to stay under the UTF-8 byte size limit', () => {
+    // Bumped again in v1.2.0 to accommodate structured error-origin metadata.
+    // package fields (errorEventSeq, errorEventHrtimeNs, eventClockRange,
+    // hrtimeNs on each IO event, seq on each state read). The test still
+    // demonstrates that the shedding pipeline brings an oversized package
+    // under any configured cap; only the absolute byte count moved.
+    const config = resolveConfig({
+      serialization: { maxTotalPackageSize: 1400 }
     });
     const builder = new PackageBuilder({
       scrubber: new Scrubber(config),
@@ -520,6 +937,8 @@ describe('PackageBuilder', () => {
     const unicodePayload = '漢🙂'.repeat(512);
 
     const pkg = builder.build({
+      errorEventSeq: 1,
+      errorEventHrtimeNs: 0n,
       error: {
         type: 'Error',
         message: 'boom',
@@ -538,6 +957,7 @@ describe('PackageBuilder', () => {
       evictionLog: [],
       stateReads: [
         {
+          seq: 2,
           container: 'cache',
           operation: 'get',
           key: 'key',
@@ -545,6 +965,7 @@ describe('PackageBuilder', () => {
           timestamp: 1n
         }
       ],
+      stateWrites: [],
       concurrentRequests: [],
       processMetadata: {
         nodeVersion: process.version,
@@ -605,8 +1026,11 @@ describe('PackageBuilder', () => {
       config
     });
 
+    // Each build() mints a fresh eventId, so structural-equality on the
+    // packageObject must ignore eventId + capturedAt/receivedAt.
     expect(sharedResult.packageObject).toMatchObject({
       ...inlineResult.packageObject,
+      eventId: expect.any(String),
       capturedAt: expect.any(String),
       request: inlineResult.packageObject.request
         ? {
@@ -615,16 +1039,18 @@ describe('PackageBuilder', () => {
           }
         : undefined
     });
-    expect(JSON.parse(sharedResult.payload)).toMatchObject({
-      ...JSON.parse(inlineResult.payload),
-      capturedAt: expect.any(String),
-      request: inlineResult.packageObject.request
-        ? {
-            ...JSON.parse(inlineResult.payload).request,
-            receivedAt: expect.any(String)
-          }
-        : undefined
+    // The wire payload is now the JSON-stringified envelope. Both helpers
+    // emit the same shape; the inner ciphertext differs because each
+    // capture has its own eventId/iv.
+    const inlineEnv = JSON.parse(inlineResult.payload);
+    const sharedEnv = JSON.parse(sharedResult.payload);
+    expect(sharedEnv).toMatchObject({
+      v: inlineEnv.v,
+      sdk: inlineEnv.sdk,
+      compressed: expect.any(Boolean)
     });
+    expect(typeof sharedEnv.eventId).toBe('string');
+    expect(typeof sharedEnv.ciphertext).toBe('string');
   });
 
   it('assembles packages through the dispatcher worker contract and shuts down cleanly', async () => {
@@ -657,9 +1083,10 @@ describe('PackageBuilder', () => {
     const result = await dispatcher.assemble(parts);
 
     expect(result.packageObject.request?.id).toBe('req-dispatch');
-    expect(JSON.parse(result.payload)).toMatchObject({
-      schemaVersion: '1.0.0'
-    });
+    expect(result.packageObject.schemaVersion).toBe('1.2.0');
+    const envelope = JSON.parse(result.payload);
+    expect(envelope.v).toBe(1);
+    expect(typeof envelope.eventId).toBe('string');
 
     await dispatcher.shutdown();
   });
@@ -732,6 +1159,158 @@ describe('PackageBuilder', () => {
     expect(pkg.completeness.localVariablesCaptured).toBe(true);
     expect(pkg.completeness.localVariablesTruncated).toBe(true);
   });
+
+  it('Layer 3: marks alignment=full when local frames ≤ rendered stack frames', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'boom',
+        stack: 'Error: boom\n    at handler (/app/src/handler.js:10:5)\n    at process (/app/src/server.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'handler', filePath: '/app/src/handler.js', lineNumber: 10, columnNumber: 5, locals: { x: 1 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 2 rendered frames, 1 local variable frame → no trimming
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+
+  it('Layer 3: trims locals to rendered frame count and marks alignment=prefix_only', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'clipped',
+        stack: 'Error: clipped\n    at outer (/app/src/handler.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'outer', filePath: '/app/src/handler.js', lineNumber: 1, columnNumber: 1, locals: { a: 1 } },
+        { functionName: 'inner', filePath: '/app/src/inner.js', lineNumber: 2, columnNumber: 1, locals: { b: 2 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 1 rendered frame, 2 local frames → trim to 1
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.localVariables?.[0]?.functionName).toBe('outer');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('prefix_only');
+  });
+
+  it('Layer 3: skips trimming when stack has no at-frames (zero rendered count)', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'minimal',
+        stack: 'Error: minimal',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'fn', filePath: '/app/src/fn.js', lineNumber: 1, columnNumber: 1, locals: { z: 1 } }
+      ]
+    });
+
+    const pkg = builder.build(parts);
+
+    // 0 rendered frames → no trimming (safe fallback)
+    expect(pkg.localVariables).toHaveLength(1);
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+});
+
+describe('StateTracker', () => {
+  it('uses configured serialization limits when cloning captured state reads and writes', () => {
+    const config = resolveConfig({
+      serialization: {
+        maxStringLength: 8,
+        maxArrayItems: 2,
+        maxObjectKeys: 2,
+        maxDepth: 2,
+        maxPayloadSize: 256
+      }
+    });
+    const als = new ALSManager();
+    const context = createContext(als, 'req-state');
+    const tracker = new StateTracker({
+      als: { getContext: () => context },
+      eventClock: new EventClock(),
+      config
+    });
+    const tracked = tracker.track('cache', new Map<unknown, unknown>([
+      ['long-key', 'abcdefghijklmnopqrstuvwxyz']
+    ]));
+
+    tracked.get('long-key');
+    tracked.set('long-key', 'zyxwvutsrqponmlkjihgfedcba');
+
+    expect(context.stateReads[0]?.value).toBe('abcdefgh...[truncated, 26 chars]');
+    expect(context.stateWrites[0]?.value).toBe('zyxwvuts...[truncated, 26 chars]');
+  });
+});
+
+describe('G1 — Layer 3 alignment helpers', () => {
+  it('localVariablesFrameAlignment is undefined when no locals captured', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, { localVariables: null });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesFrameAlignment).toBeUndefined();
+  });
+});
+
+describe('G1 — Layer 1/2/3 telemetry in completeness', () => {
+  it('threads captureLayer and degradation from parts into completeness', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'test',
+        stack: 'Error: test\n    at fn (/app/src/fn.js:1:1)',
+        properties: {}
+      },
+      localVariables: [
+        { functionName: 'fn', filePath: '/app/src/fn.js', lineNumber: 1, columnNumber: 1, locals: { x: 1 } }
+      ],
+      localVariablesCaptureLayer: 'tag',
+      localVariablesDegradation: 'exact'
+    });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesCaptureLayer).toBe('tag');
+    expect(pkg.completeness.localVariablesDegradation).toBe('exact');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBe('full');
+  });
+
+  it('threads identity+dropped_hash telemetry into completeness', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({ scrubber: new Scrubber(config), config });
+    const parts = createPackageParts(undefined, {
+      localVariables: null,
+      localVariablesCaptureLayer: 'identity',
+      localVariablesDegradation: 'dropped_hash'
+    });
+
+    const pkg = builder.build(parts);
+
+    expect(pkg.completeness.localVariablesCaptureLayer).toBe('identity');
+    expect(pkg.completeness.localVariablesDegradation).toBe('dropped_hash');
+    expect(pkg.completeness.localVariablesFrameAlignment).toBeUndefined();
+  });
 });
 
 describe('ErrorCapturer', () => {
@@ -741,7 +1320,7 @@ describe('ErrorCapturer', () => {
 
   it('captures a full package with context, locals, io events, encryption, and transport handoff', async () => {
     const config = resolveConfig({ encryptionKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789' });
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-err');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -752,7 +1331,8 @@ describe('ErrorCapturer', () => {
     const encryption = new Encryption('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789');
     const packageBuilder = new PackageBuilder({
       scrubber: new Scrubber(config),
-      config
+      config,
+      encryption
     });
     const inspector = {
       getLocals: vi.fn(() => [
@@ -815,25 +1395,26 @@ describe('ErrorCapturer', () => {
     const pkg = als.runWithContext(context, () => capturer.capture(error));
     await flushMicrotasks();
 
-    const sentPayload = transport.send.mock.calls[0]?.[0] as string;
-    const decrypted = encryption.decrypt(JSON.parse(sentPayload) as {
-      salt: string;
-      iv: string;
-      ciphertext: string;
-      authTag: string;
-    });
+    const sentPayload = (transport.send.mock.calls[0]?.[0] as { serialized: string }).serialized;
+    const envelope = JSON.parse(sentPayload) as import('../../src/types').EncryptedEnvelope;
+    expect(envelope.v).toBe(1);
+    expect(typeof envelope.eventId).toBe('string');
+    expect(envelope.keyId).toMatch(/^[0-9a-f]{16}$/);
+    const decrypted = encryption.decrypt(envelope);
 
     expect(pkg).not.toBeNull();
     expect(pkg?.completeness.encrypted).toBe(true);
-    expect(pkg?.integrity?.algorithm).toBe('HMAC-SHA256');
+    // The pre-0.3 `integrity` field is removed; the outer HMAC lives on
+    // the envelope, not in the package plaintext.
+    expect((pkg as unknown as { integrity?: unknown })?.integrity).toBeUndefined();
     expect(pkg?.request?.id).toBe('req-err');
     expect(pkg?.ioTimeline).toHaveLength(1);
     expect(pkg?.completeness.usedAmbientEvents).toBe(false);
-    expect(pkg?.localVariables?.[0]?.locals.password).toBe('[REDACTED]');
+    expectField(pkg?.localVariables?.[0]?.locals.password, 'meta');
     expect(pkg?.error.properties.code).toBe('E_BANG');
     expect(transport.send).toHaveBeenCalledTimes(1);
     expect(JSON.parse(decrypted)).toMatchObject({
-      schemaVersion: '1.0.0',
+      schemaVersion: '1.2.0',
       completeness: {
         encrypted: true
       }
@@ -843,9 +1424,318 @@ describe('ErrorCapturer', () => {
     processMetadata.shutdown();
   });
 
+  it('merges supplemental query input locals into the captured inspector frame', async () => {
+    const config = resolveConfig();
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const als = new ALSManager();
+    const context = createContext(als, 'req-pg-input');
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const processMetadata = new ProcessMetadata(config);
+    const packageBuilder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config
+    });
+    const inspector = {
+      getLocalsWithDiagnostics: vi.fn(() => ({
+        frames: [
+          {
+            functionName: 'pgCallback',
+            filePath: '/app/node_modules/pg-pool/index.js',
+            lineNumber: 45,
+            columnNumber: 11,
+            locals: { err: 'pg failed' }
+          }
+        ],
+        missReason: null,
+        captureLayer: 'tag',
+        degradation: 'exact'
+      }))
+    };
+    const capturer = new ErrorCapturer({
+      buffer,
+      als,
+      inspector: inspector as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker: tracker,
+      processMetadata,
+      packageBuilder,
+      transport: { send: vi.fn() },
+      bodyCapture: noopBodyCapture,
+      config
+    });
+    const error = new Error('duplicate key');
+    (error as unknown as Record<symbol, unknown>)[
+      Symbol.for('errorcore.v1.supplementalLocals')
+    ] = [
+      {
+        functionName: 'pg.query input',
+        filePath: '',
+        lineNumber: 0,
+        columnNumber: 0,
+        locals: {
+          input: {
+            query: 'INSERT INTO widgets (id, name) VALUES ($1, $2)',
+            params: '42, dupe-s6-unique'
+          }
+        }
+      }
+    ];
+
+    const pkg = als.runWithContext(context, () => capturer.capture(error));
+
+    expectField(pkg?.localVariables?.[0]?.locals.err, 'meta');
+    expectField(pkg?.localVariables?.[0]?.locals.input, 'meta');
+
+    tracker.shutdown();
+    processMetadata.shutdown();
+  });
+
+  it('falls back to cause-chain locals when the captured wrapper error has none', async () => {
+    const config = resolveConfig();
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const als = new ALSManager();
+    const context = createContext(als, 'req-s6-cause');
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const processMetadata = new ProcessMetadata(config);
+    const packageBuilder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config
+    });
+    const inner = new Error('pg failed');
+    const wrapper = new Error('handler failed');
+    (wrapper as Error & { cause?: Error }).cause = inner;
+    const inspector = {
+      getLocalsWithDiagnostics: vi.fn((captured: Error) => {
+        if (captured === wrapper) {
+          return {
+            frames: null,
+            missReason: 'cache_miss (pauses=0)'
+          };
+        }
+
+        if (captured === inner) {
+          return {
+            frames: [
+              {
+                functionName: 'pgCallback',
+                filePath: '/app/node_modules/pg-pool/index.js',
+                lineNumber: 45,
+                columnNumber: 11,
+                locals: { input: 'dupe-s6-unique' }
+              }
+            ],
+            missReason: null,
+            captureLayer: 'identity',
+            degradation: 'dropped_hash'
+          };
+        }
+
+        return {
+          frames: null,
+          missReason: 'unexpected error'
+        };
+      })
+    };
+    const capturer = new ErrorCapturer({
+      buffer,
+      als,
+      inspector: inspector as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker: tracker,
+      processMetadata,
+      packageBuilder,
+      transport: { send: vi.fn() },
+      bodyCapture: noopBodyCapture,
+      config
+    });
+
+    const pkg = als.runWithContext(context, () => capturer.capture(wrapper));
+
+    expect(inspector.getLocalsWithDiagnostics).toHaveBeenNthCalledWith(1, wrapper);
+    expect(inspector.getLocalsWithDiagnostics).toHaveBeenNthCalledWith(2, inner);
+    expectField(pkg?.localVariables?.[0]?.locals.input, 'meta');
+    expect(pkg?.completeness.localVariablesCaptureLayer).toBe('identity');
+    expect(pkg?.completeness.localVariablesDegradation).toBe('dropped_hash');
+    expect(
+      pkg?.completeness.captureFailures.some((failure) => failure.startsWith('locals:'))
+    ).toBe(false);
+
+    tracker.shutdown();
+    processMetadata.shutdown();
+  });
+
+  it('dispatches spooled payload blobs after the error package', async () => {
+    const config = resolveConfig({
+      encryptionKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+    });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const als = new ALSManager();
+    const context = createContext(als, 'req-blob');
+    const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const processMetadata = new ProcessMetadata(config);
+    const transport = { send: vi.fn() };
+    const encryption = new Encryption(
+      'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+    );
+    const payloadSpool = new PayloadSpool({
+      globalMaxBytes: 1024,
+      perRequestMaxBytes: 1024,
+      perBlobMaxBytes: 512,
+      previewBytes: 4,
+      completedTtlMs: 1000,
+      now: () => 100
+    });
+    const stored = payloadSpool.store({
+      requestId: 'req-blob',
+      lineageId: 'req-blob',
+      mimeType: 'text/plain',
+      bytes: Buffer.from('spooled payload'),
+      originalSize: 15,
+      sha256: 'hash'
+    });
+    const packageBuilder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config
+    });
+    const capturer = new ErrorCapturer({
+      buffer,
+      als,
+      inspector: {
+        getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null }))
+      } as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker: tracker,
+      processMetadata,
+      packageBuilder,
+      transport,
+      encryption,
+      bodyCapture: noopBodyCapture,
+      config,
+      payloadSpool
+    });
+
+    tracker.add(context);
+    buffer.push(
+      createSlot({
+        requestId: 'req-blob',
+        requestBody: 'spoo',
+        requestPayloadRef: stored.ref,
+        requestBodyTruncated: true,
+        requestBodyOriginalSize: 15
+      })
+    );
+
+    const pkg = als.runWithContext(context, () => capturer.capture(new Error('blob')));
+    await flushMicrotasks(8);
+
+    expect(pkg?.ioTimeline[0]?.requestPayloadRef?.blobId).toBe(stored.ref.blobId);
+    expect(transport.send).toHaveBeenCalledTimes(2);
+    expect((transport.send.mock.calls[1]?.[0] as { kind?: string }).kind).toBe(
+      'payload_blob'
+    );
+    const blobPayload = transport.send.mock.calls[1]?.[0] as { serialized: string };
+    const blobEnvelope = JSON.parse(blobPayload.serialized) as import('../../src/types').EncryptedEnvelope;
+    const decryptedBlob = JSON.parse(encryption.decrypt(blobEnvelope));
+    expect(decryptedBlob).toMatchObject({
+      schemaVersion: '1.2.0',
+      kind: 'payload_blob',
+      eventId: pkg?.eventId,
+      blobId: stored.ref.blobId,
+      body: Buffer.from('spooled payload').toString('base64')
+    });
+
+    tracker.shutdown();
+    processMetadata.shutdown();
+  });
+
+  it('sanitizes debug capture messages before logging', () => {
+    const previousDebug = process.env.ERRORCORE_DEBUG;
+    process.env.ERRORCORE_DEBUG = '1';
+    const config = resolveConfig({});
+    const processMetadata = new ProcessMetadata(config);
+    const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    const capturer = new ErrorCapturer({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker,
+      processMetadata,
+      packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
+      transport: { send: vi.fn() },
+      encryption: null,
+      bodyCapture: noopBodyCapture,
+      config
+    });
+
+    try {
+      capturer.capture(new Error('password=hunter2 user@example.com'));
+
+      const debugOutput = debugSpy.mock.calls.flat().join(' ');
+      expect(debugOutput).not.toContain('hunter2');
+      expect(debugOutput).not.toContain('user@example.com');
+      expect(debugOutput).toContain('[REDACTED]');
+    } finally {
+      if (previousDebug === undefined) {
+        delete process.env.ERRORCORE_DEBUG;
+      } else {
+        process.env.ERRORCORE_DEBUG = previousDebug;
+      }
+      requestTracker.shutdown();
+      processMetadata.shutdown();
+    }
+  });
+
+  it('applies configured serialization limits to custom error properties before worker assembly', async () => {
+    const config = resolveConfig({
+      serialization: {
+        maxStringLength: 8,
+        maxArrayItems: 20,
+        maxObjectKeys: 50,
+        maxDepth: 8,
+        maxPayloadSize: 1024
+      }
+    });
+    const processMetadata = new ProcessMetadata(config);
+    const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const dispatcher = {
+      isAvailable: vi.fn(() => true),
+      assemble: vi.fn(async (parts: ErrorPackageParts) =>
+        buildPackageAssemblyResult({ parts, config })
+      ),
+      shutdown: vi.fn(async () => undefined)
+    };
+    const capturer = new ErrorCapturer({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker,
+      processMetadata,
+      packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
+      transport: { send: vi.fn() },
+      encryption: null,
+      bodyCapture: noopBodyCapture,
+      config,
+      packageAssemblyDispatcher: dispatcher
+    });
+    const error = new Error('custom props');
+    (error as Error & { detail?: string }).detail = 'abcdefghijklmnopqrstuvwxyz';
+
+    capturer.capture(error);
+    await flushMicrotasks();
+
+    const sentParts = dispatcher.assemble.mock.calls[0]?.[0] as ErrorPackageParts;
+    expect(sentParts.error.properties.detail).toBe('abcdefgh...[truncated, 26 chars]');
+
+    requestTracker.shutdown();
+    processMetadata.shutdown();
+  });
+
   it('dispatches to worker assembly when dispatcher is available and returns null', async () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-worker');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -895,7 +1785,7 @@ describe('ErrorCapturer', () => {
 
   it('falls back to inline assembly when worker assembly throws', async () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-fallback');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -948,7 +1838,7 @@ describe('ErrorCapturer', () => {
     const config = resolveConfig({
       piiScrubber: (_key, value) => value
     });
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-inline');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -1004,7 +1894,7 @@ describe('ErrorCapturer', () => {
       shutdown: vi.fn(async () => undefined)
     };
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 }),
+      buffer: makeBuffer({ capacity: 20, maxBytes: 1_000_000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1028,7 +1918,7 @@ describe('ErrorCapturer', () => {
 
   it('uses ambient events when ALS context is unavailable', () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const processMetadata = new ProcessMetadata(config);
@@ -1073,7 +1963,7 @@ describe('ErrorCapturer', () => {
   it('returns null when rate limited', () => {
     const config = resolveConfig({});
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 0, windowMs: 60_000 }),
@@ -1106,7 +1996,7 @@ describe('ErrorCapturer', () => {
     const processMetadata = new ProcessMetadata(config);
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1134,7 +2024,7 @@ describe('ErrorCapturer', () => {
     expect(fileContents).not.toContain('collector offline');
     expect(persisted.entries).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('collector offline');
 
@@ -1145,12 +2035,12 @@ describe('ErrorCapturer', () => {
 
   it('persists main-thread file transport fallback failures through signed dead-letter payload envelopes', async () => {
     const deadLetterPath = createTempDeadLetterPath();
-    const transportPath = pathModule.join(
+    const parentAsFile = pathModule.join(
       osModule.tmpdir(),
-      `errorcore-main-thread-file-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      'nested',
-      'out.ndjson'
+      `errorcore-main-thread-file-${Date.now()}-${Math.random().toString(36).slice(2)}`
     );
+    fsModule.writeFileSync(parentAsFile, 'not a directory');
+    const transportPath = pathModule.join(parentAsFile, 'nested', 'out.ndjson');
     const config = resolveConfig({
       encryptionKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
       transport: { type: 'file', path: transportPath }
@@ -1164,51 +2054,54 @@ describe('ErrorCapturer', () => {
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-    await withMissingWorkerThreads(async () => {
-      const transport = new TransportDispatcher({
-        config,
-        encryption: new Encryption(config.encryptionKey as string)
+    try {
+      await withMissingWorkerThreads(async () => {
+        const transport = new TransportDispatcher({
+          config,
+          encryption: new Encryption(config.encryptionKey as string)
+        });
+        const capturer = new ErrorCapturer({
+          buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+          als: new ALSManager(),
+          inspector: {
+            getLocals: vi.fn(() => null),
+            getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null }))
+          } as never,
+          rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+          requestTracker,
+          processMetadata,
+          packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
+          transport,
+          encryption: new Encryption(config.encryptionKey as string),
+          bodyCapture: noopBodyCapture,
+          config,
+          deadLetterStore: store
+        });
+
+        capturer.capture(new Error('boom'));
+        await flushMicrotasks(10);
+        await transport.flush();
+        await transport.shutdown();
       });
-      const capturer = new ErrorCapturer({
-        buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
-        als: new ALSManager(),
-        inspector: {
-          getLocals: vi.fn(() => null),
-          getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null }))
-        } as never,
-        rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
-        requestTracker,
-        processMetadata,
-        packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
-        transport,
-        encryption: new Encryption(config.encryptionKey as string),
-        bodyCapture: noopBodyCapture,
-        config,
-        deadLetterStore: store
-      });
 
-      capturer.capture(new Error('boom'));
-      await flushMicrotasks(10);
-      await transport.flush();
-      await transport.shutdown();
-    });
+      const fileContents = fsModule.readFileSync(deadLetterPath, 'utf8');
+      const persisted = store.drain();
 
-    const fileContents = fsModule.readFileSync(deadLetterPath, 'utf8');
-    const persisted = store.drain();
-
-    expect(fsModule.existsSync(transportPath)).toBe(false);
-    expect(persisted.entries).toHaveLength(1);
-    expect(fileContents).not.toContain('boom');
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[ErrorCore] File transport dropped payload:')
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
-    );
-
-    fsModule.rmSync(deadLetterPath, { force: true });
-    requestTracker.shutdown();
-    processMetadata.shutdown();
+      expect(fsModule.existsSync(transportPath)).toBe(false);
+      expect(persisted.entries).toHaveLength(1);
+      expect(fileContents).not.toContain('boom');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[ErrorCore] File transport dropped payload:')
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
+      );
+    } finally {
+      fsModule.rmSync(parentAsFile, { force: true });
+      fsModule.rmSync(deadLetterPath, { force: true });
+      requestTracker.shutdown();
+      processMetadata.shutdown();
+    }
   });
 
   it('does not dead-letter or duplicate delivery when worker-crash fallback succeeds', async () => {
@@ -1273,7 +2166,7 @@ describe('ErrorCapturer', () => {
           encryption: new Encryption(encryptionKey)
         });
         const capturer = new ErrorCapturer({
-          buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+          buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
           als: new ALSManager(),
           inspector: {
             getLocals: vi.fn(() => null),
@@ -1306,7 +2199,7 @@ describe('ErrorCapturer', () => {
     expect(stdout.writes).toHaveLength(1);
     expect(store.drain().entries).toEqual([]);
     expect(warnSpy).not.toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1376,7 +2269,7 @@ describe('ErrorCapturer', () => {
           encryption: new Encryption(encryptionKey)
         });
         const capturer = new ErrorCapturer({
-          buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+          buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
           als: new ALSManager(),
           inspector: {
             getLocals: vi.fn(() => null),
@@ -1410,7 +2303,7 @@ describe('ErrorCapturer', () => {
     expect(stdout.writes).toHaveLength(1);
     expect(store.drain().entries).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
 
     fsModule.rmSync(deadLetterPath, { force: true });
@@ -1432,7 +2325,7 @@ describe('ErrorCapturer', () => {
     const processMetadata = new ProcessMetadata(config);
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1460,9 +2353,9 @@ describe('ErrorCapturer', () => {
     expect(fileContents).not.toContain('stack with secret-token');
     expect(drained.entries).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Error capture failed [code=errorcore_capture_failed]'
+      expect.stringContaining('[code=EC_CAPTURE_FAILED]')
     );
-    expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
+    expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('user-visible secret-token');
 
     fsModule.rmSync(deadLetterPath, { force: true });
     requestTracker.shutdown();
@@ -1471,7 +2364,7 @@ describe('ErrorCapturer', () => {
 
   it('emits sanitized warning codes when worker fallback capture also fails', async () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const context = createContext(als, 'req-fallback-warning');
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
@@ -1511,7 +2404,7 @@ describe('ErrorCapturer', () => {
     await flushMicrotasks(10);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Error capture fallback failed [code=errorcore_capture_fallback_failed]'
+      expect.stringContaining('[code=EC_CAPTURE_FAILED]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
 
@@ -1520,12 +2413,17 @@ describe('ErrorCapturer', () => {
   });
 
   it('emits sanitized warning codes when dead-letter fallback storage fails', async () => {
-    const config = resolveConfig({});
+    const warnings: import('../../src/types').InternalWarning[] = [];
+    const config = resolveConfig({
+      onInternalWarning: (warning) => {
+        warnings.push(warning);
+      }
+    });
     const processMetadata = new ProcessMetadata(config);
     const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1554,12 +2452,16 @@ describe('ErrorCapturer', () => {
     await flushMicrotasks(10);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Transport dispatch failed [code=errorcore_transport_dispatch_failed]'
+      expect.stringContaining('[code=EC_TRANSPORT_FAILED]')
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      '[ErrorCore] Dead-letter store write failed [code=errorcore_dead_letter_write_failed]'
+      expect.stringContaining('[code=EC_DLQ_WRITE_FAILED]')
     );
     expect(warnSpy.mock.calls.flat().join(' ')).not.toContain('secret-token');
+    expect(JSON.stringify(warnings)).not.toContain('secret-token');
+    expect(warnings.map((warning) => warning.code)).toEqual(
+      expect.arrayContaining(['EC_TRANSPORT_FAILED', 'EC_DLQ_WRITE_FAILED'])
+    );
 
     requestTracker.shutdown();
     processMetadata.shutdown();
@@ -1578,7 +2480,7 @@ describe('ErrorCapturer', () => {
     }
 
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1607,7 +2509,7 @@ describe('ErrorCapturer', () => {
 
   it('includes ambientContext when ALS context is unavailable', () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 20, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 20, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const processMetadata = new ProcessMetadata(config);
@@ -1642,7 +2544,7 @@ describe('ErrorCapturer', () => {
 
   it('includes eviction log in the package', () => {
     const config = resolveConfig({});
-    const buffer = new IOEventBuffer({ capacity: 1, maxBytes: 1_000_000 });
+    const buffer = makeBuffer({ capacity: 1, maxBytes: 1_000_000 });
     const als = new ALSManager();
     const tracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
     const processMetadata = new ProcessMetadata(config);
@@ -1679,7 +2581,7 @@ describe('ErrorCapturer', () => {
   it('includes timeAnchor in every package', () => {
     const config = resolveConfig({});
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
@@ -1707,7 +2609,7 @@ describe('ErrorCapturer', () => {
 
     const rateLimiter = new RateLimiter({ maxCaptures: 1, windowMs: 1000 });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
       rateLimiter,
@@ -1740,7 +2642,7 @@ describe('ErrorCapturer', () => {
   it('records inspector miss reason in captureFailures when locals capture is enabled', () => {
     const config = resolveConfig({ captureLocalVariables: true });
     const capturer = new ErrorCapturer({
-      buffer: new IOEventBuffer({ capacity: 10, maxBytes: 100000 }),
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
       als: new ALSManager(),
       inspector: {
         getLocals: vi.fn(() => null),
@@ -1762,5 +2664,55 @@ describe('ErrorCapturer', () => {
     const pkg = capturer.capture(new Error('miss'));
 
     expect(pkg?.completeness.captureFailures).toContain('locals: cache_miss (pauses=0)');
+  });
+});
+
+describe('G3 — sourceMapResolution telemetry in completeness', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('includes sourceMapResolution counts after a capture', () => {
+    const config = resolveConfig({});
+    const processMetadata = new ProcessMetadata(config);
+    const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const sourceMapResolver = new SourceMapResolver();
+    const capturer = new ErrorCapturer({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als: new ALSManager(),
+      inspector: { getLocals: vi.fn(() => null), getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null })) } as never,
+      rateLimiter: new RateLimiter({ maxCaptures: 5, windowMs: 60_000 }),
+      requestTracker,
+      processMetadata,
+      packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
+      transport: { send: vi.fn() },
+      encryption: null,
+      bodyCapture: noopBodyCapture,
+      config,
+      sourceMapResolver
+    });
+
+    const error = new Error('src-map-telemetry-test');
+    // Stack referencing a path that won't have a source map — triggers
+    // a missing/not-found entry in the source map resolver.
+    error.stack = 'Error: src-map-telemetry-test\n    at foo (/nonexistent/telemetry.js:10:5)';
+
+    const pkg = capturer.capture(error);
+
+    expect(pkg?.completeness.sourceMapResolution).toBeDefined();
+    const sm = pkg!.completeness.sourceMapResolution!;
+    expect(typeof sm.framesResolved).toBe('number');
+    expect(typeof sm.framesUnresolved).toBe('number');
+    expect(typeof sm.cacheHits).toBe('number');
+    expect(typeof sm.cacheMisses).toBe('number');
+    expect(typeof sm.missing).toBe('number');
+    expect(typeof sm.corrupt).toBe('number');
+    expect(typeof sm.evictions).toBe('number');
+    // At least one field should be > 0 because the capture triggered resolution.
+    const totalActivity = sm.framesResolved + sm.framesUnresolved + sm.cacheHits + sm.cacheMisses + sm.missing + sm.corrupt;
+    expect(totalActivity).toBeGreaterThan(0);
+
+    requestTracker.shutdown();
+    processMetadata.shutdown();
   });
 });

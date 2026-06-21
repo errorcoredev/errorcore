@@ -1,62 +1,123 @@
 {
   "name": "errorcore",
   "version": "0.1.0",
+  "description": "Lightweight error monitoring SDK for Node.js. Captures errors with I/O context, optional local variables, and request metadata",
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "default": "./dist/index.js"
+    },
+    "./nextjs": {
+      "types": "./dist/integrations/nextjs/index.d.ts",
+      "edge-light": "./dist/integrations/nextjs/edge.mjs",
+      "workerd": "./dist/integrations/nextjs/edge.mjs",
+      "browser": "./dist/integrations/nextjs/edge.mjs",
+      "require": "./dist/integrations/nextjs/index.js",
+      "import": "./dist/integrations/nextjs/index.js",
+      "default": "./dist/integrations/nextjs/index.js"
+    },
+    "./hono": {
+      "types": "./dist/integrations/hono/index.d.ts",
+      "require": "./dist/integrations/hono/index.js",
+      "import": "./dist/integrations/hono/index.js",
+      "default": "./dist/integrations/hono/index.js"
+    },
+    "./ingest": {
+      "types": "./dist/ingest/index.d.ts",
+      "require": "./dist/ingest/index.js",
+      "import": "./dist/ingest/index.js",
+      "default": "./dist/ingest/index.js"
     }
   },
+  "keywords": [
+    "error",
+    "monitoring",
+    "error-tracking",
+    "debugging",
+    "observability",
+    "node"
+  ],
   "bin": {
-    "errorcore": "bin/errorcore.js"
+    "errorcore": "bin/errorcore.js",
+    "ecd": "bin/errorcore.js"
   },
   "files": [
-    "dist",
+    "dist/**/*.js",
+    "dist/**/*.mjs",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.mts",
+    "dist/**/*.d.ts.map",
+    "dist/**/*.d.mts.map",
     "bin",
     "config-template"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/errorcoredev/errorcore.git"
+  },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "lint": "node scripts/lint-release-markers.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "verify:edge-stub": "node scripts/verify-edge-stub.js",
+    "verify:package": "node scripts/verify-package.js",
+    "prepublishOnly": "npm run build && npm run verify:edge-stub && npm run test && npm run verify:package",
+    "prepare:nextjs-smoke": "node scripts/prepare-nextjs-smoke.js",
+    "smoke:nextjs": "npm run prepare:nextjs-smoke && node tmp-nextjs-smoke/run-smoke.mjs",
+    "smoke:nextjs:dev-memory": "npm run prepare:nextjs-smoke && node tmp-nextjs-smoke/run-dev-memory.mjs",
+    "smoke:nextjs:sourcemaps": "npm run prepare:nextjs-smoke && node tmp-nextjs-smoke/run-smoke.mjs"
   },
   "dependencies": {
-    "assertion-error": "^2.0.1",
-    "chai": "^6.2.2",
-    "es-module-lexer": "^1.7.0",
-    "esbuild": "^0.27.3",
-    "estree-walker": "^3.0.3",
-    "expect-type": "^1.3.0",
-    "fdir": "^6.5.0",
-    "magic-string": "^0.30.21",
-    "nanoid": "^3.3.11",
-    "obug": "^2.1.1",
-    "pathe": "^2.0.3",
-    "picocolors": "^1.1.1",
-    "picomatch": "^4.0.3",
-    "postcss": "^8.5.8",
-    "rollup": "^4.59.0",
-    "siginfo": "^2.0.0",
-    "source-map-js": "^1.2.1",
-    "stackback": "^0.0.2",
-    "std-env": "^3.10.0",
-    "tinybench": "^2.9.0",
-    "tinyexec": "^1.0.2",
-    "tinyglobby": "^0.2.15",
-    "tinyrainbow": "^3.0.3",
-    "undici-types": "^6.21.0",
-    "vite": "^7.3.1",
-    "why-is-node-running": "^2.3.0"
+    "source-map-js": "1.2.1"
   },
   "devDependencies": {
+    "@hono/node-server": "^2.0.0",
     "@types/node": "^20.19.37",
+    "@vitest/coverage-v8": "^4.0.18",
+    "cross-env": "^7.0.3",
+    "hono": "^4.12.18",
+    "ioredis": "^5.4.0",
+    "mongodb": "^6.10.0",
+    "mongodb-memory-server": "^10.1.2",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
   },
-  "license": "ISC"
+  "peerDependencies": {
+    "@hono/node-server": ">=1",
+    "hono": ">=4",
+    "ioredis": ">=4",
+    "mongodb": ">=5",
+    "mysql2": ">=2",
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "hono": {
+      "optional": true
+    },
+    "@hono/node-server": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    },
+    "mongodb": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    }
+  },
+  "license": "PolyForm-Small-Business-1.0.0"
 }

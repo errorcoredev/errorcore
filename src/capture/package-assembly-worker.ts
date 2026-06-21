@@ -2,11 +2,13 @@
 import { parentPort, workerData } from 'node:worker_threads';
 
 import { buildPackageAssemblyResult } from './package-builder';
-import { Encryption } from '../security/encryption';
+import { createEncryptionFromAssemblyConfig } from '../security/encryption-runtime';
+import { resolveScrubberPolicy } from '../scrubber/policy';
 import type {
   PackageAssemblyWorkerData,
   PackageAssemblyWorkerRequest,
-  PackageAssemblyWorkerResponse
+  PackageAssemblyWorkerResponse,
+  ResolvedConfig
 } from '../types';
 
 function startPackageAssemblyWorker(data: PackageAssemblyWorkerData): void {
@@ -16,9 +18,11 @@ function startPackageAssemblyWorker(data: PackageAssemblyWorkerData): void {
     return;
   }
 
-  const encryption = data.config.encryptionKey
-    ? new Encryption(data.config.encryptionKey)
-    : null;
+  const encryption = createEncryptionFromAssemblyConfig(data.encryption);
+  const config = {
+    ...data.config,
+    scrubberPolicy: resolveScrubberPolicy(data.config.scrubberPolicy)
+  } as ResolvedConfig;
 
   port.on('message', (message: PackageAssemblyWorkerRequest) => {
     try {
@@ -34,14 +38,22 @@ function startPackageAssemblyWorker(data: PackageAssemblyWorkerData): void {
         id: message.id,
         result: buildPackageAssemblyResult({
           parts: message.parts,
-          config: data.config,
+          config,
           encryption
         })
       } satisfies PackageAssemblyWorkerResponse);
     } catch (error) {
+      // Send only name+message across the port. The stack trace can
+      // contain file paths from the host process (and sometimes PII
+      // interpolated into error messages by host code). The parent
+      // logs this via emitSafeWarning which should not grow a PII
+      // surface.
       port.postMessage({
         id: message.id,
-        error: error instanceof Error ? error.message : String(error)
+        error:
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error)
       } satisfies PackageAssemblyWorkerResponse);
     }
   });

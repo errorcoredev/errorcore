@@ -1,13 +1,21 @@
 
 import { createHash } from 'node:crypto';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http';
 
-import type { IOEventSlot, RequestContext } from '../types';
+import {
+  getBodyEncoding,
+  isTextualContentType,
+  MULTIPART_REDACTED,
+  scrubKeyValueAssignments
+} from '../pii/scrubber';
+import type { IOEventSlot, PayloadBlobRef, RequestContext } from '../types';
 
 const METADATA_OVERHEAD = 256;
+const MAX_STATE_POOL_SIZE = 200;
 const BODY_CAPTURE_STATE = Symbol('errorcore.bodyCaptureState');
 const INBOUND_REQUEST_CAPTURE = Symbol('errorcore.inboundRequestCapture');
 const OUTBOUND_RESPONSE_CAPTURE = Symbol('errorcore.outboundResponseCapture');
+const CLIENT_REQUEST_CAPTURE = Symbol('errorcore.clientRequestCapture');
 
 interface BodyCaptureConfig {
   maxPayloadSize: number;
@@ -21,7 +29,21 @@ interface BodyCaptureConfig {
       headers: Record<string, string> | null | undefined
     ): Buffer;
   };
+  payloadSpool?: {
+    getMaxCaptureBytes(): number;
+    store(input: {
+      requestId: string | null;
+      lineageId: string | null;
+      mimeType: string | null;
+      bytes: Buffer;
+      originalSize: number;
+      sha256: string;
+      complete?: boolean;
+    }): { ref: PayloadBlobRef; preview: Buffer };
+  };
 }
+
+type BodyPayloadSpool = NonNullable<BodyCaptureConfig['payloadSpool']>;
 
 interface AccumulatorState {
   chunks: Buffer[];
@@ -40,6 +62,10 @@ interface SlotCaptureState {
   response?: AccumulatorState;
 }
 
+type SlotWithBodyCaptureState = IOEventSlot & {
+  [BODY_CAPTURE_STATE]?: SlotCaptureState;
+};
+
 interface InboundRequestCaptureHandler {
   capture: BodyCapture;
   slot: IOEventSlot;
@@ -57,6 +83,16 @@ interface OutboundResponseCaptureHandler {
   state: AccumulatorState;
   originalWrite: ServerResponse['write'];
   originalEnd: ServerResponse['end'];
+  onBytesChanged: (oldBytes: number, newBytes: number) => void;
+}
+
+interface ClientRequestCaptureHandler {
+  capture: BodyCapture;
+  slot: IOEventSlot;
+  seq: number;
+  state: AccumulatorState;
+  originalWrite: ClientRequest['write'];
+  originalEnd: ClientRequest['end'];
   onBytesChanged: (oldBytes: number, newBytes: number) => void;
 }
 
@@ -88,6 +124,50 @@ function toBufferView(chunk: unknown, encoding?: BufferEncoding): Buffer | null 
   return Buffer.from(String(chunk));
 }
 
+function isPlainTextContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) {
+    return false;
+  }
+
+  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'text/plain';
+}
+
+function isMultipartContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) {
+    return false;
+  }
+
+  return contentType.split(';', 1)[0]?.trim().toLowerCase() === 'multipart/form-data';
+}
+
+function scrubPlainTextKeyValues(buffer: Buffer, contentType: string | undefined): Buffer {
+  if (!isPlainTextContentType(contentType)) {
+    return buffer;
+  }
+
+  const encoding = getBodyEncoding(contentType);
+  const decoded = buffer.toString(encoding);
+  const scrubbed = scrubKeyValueAssignments(decoded);
+
+  if (scrubbed === decoded) {
+    return buffer;
+  }
+
+  return Buffer.from(scrubbed, encoding);
+}
+
+function cancelReadableStream(stream: ReadableStream<Uint8Array> | null): void {
+  if (stream === null) {
+    return;
+  }
+
+  try {
+    void stream.cancel().catch(() => undefined);
+  } catch {
+    // Best effort: capture cleanup must not interfere with application fetch.
+  }
+}
+
 export class BodyCapture {
   private readonly maxPayloadSize: number;
 
@@ -103,6 +183,8 @@ export class BodyCapture {
 
   private readonly scrubber?: BodyCaptureConfig['scrubber'];
 
+  private readonly payloadSpool?: BodyCaptureConfig['payloadSpool'];
+
   public constructor(config: BodyCaptureConfig) {
     this.maxPayloadSize = config.maxPayloadSize;
     this.captureRequestBodies = config.captureRequestBodies;
@@ -112,6 +194,7 @@ export class BodyCapture {
       value.trim().toLowerCase()
     );
     this.scrubber = config.scrubber;
+    this.payloadSpool = config.payloadSpool;
   }
 
   private static handleInboundRequestOn(
@@ -319,13 +402,118 @@ export class BodyCapture {
     );
   }
 
+  private static handleClientRequestWrite(
+    this: ClientRequest,
+    chunk: unknown,
+    encoding?: unknown,
+    callback?: unknown
+  ): boolean {
+    const request = this as ClientRequest & {
+      [CLIENT_REQUEST_CAPTURE]?: ClientRequestCaptureHandler;
+    };
+    const handler = request[CLIENT_REQUEST_CAPTURE];
+
+    if (handler === undefined) {
+      return true;
+    }
+
+    const normalizedEncoding =
+      typeof encoding === 'string' ? (encoding as BufferEncoding) : undefined;
+
+    handler.capture.captureChunk(
+      handler.state,
+      handler.slot,
+      'requestBody',
+      'requestBodyTruncated',
+      'requestBodyOriginalSize',
+      chunk,
+      normalizedEncoding
+    );
+
+    return handler.originalWrite.call(
+      this,
+      chunk as never,
+      encoding as never,
+      callback as never
+    );
+  }
+
+  private static handleClientRequestEnd(
+    this: ClientRequest,
+    chunk?: unknown,
+    encoding?: unknown,
+    callback?: unknown
+  ): ClientRequest {
+    const request = this as ClientRequest & {
+      [CLIENT_REQUEST_CAPTURE]?: ClientRequestCaptureHandler;
+    };
+    const handler = request[CLIENT_REQUEST_CAPTURE];
+
+    if (handler === undefined) {
+      return this;
+    }
+
+    const normalizedEncoding =
+      typeof encoding === 'string' ? (encoding as BufferEncoding) : undefined;
+
+    if (chunk !== undefined && chunk !== null) {
+      handler.capture.captureChunk(
+        handler.state,
+        handler.slot,
+        'requestBody',
+        'requestBodyTruncated',
+        'requestBodyOriginalSize',
+        chunk,
+        normalizedEncoding
+      );
+    }
+
+    handler.capture.finalizeCapture({
+      slot: handler.slot,
+      seq: handler.seq,
+      bodyKey: 'requestBody',
+      digestKey: 'requestBodyDigest',
+      truncatedKey: 'requestBodyTruncated',
+      originalSizeKey: 'requestBodyOriginalSize',
+      state: handler.state,
+      headers: handler.slot.requestHeaders,
+      onBytesChanged: handler.onBytesChanged
+    });
+
+    request.write = handler.originalWrite;
+    request.end = handler.originalEnd;
+    delete request[CLIENT_REQUEST_CAPTURE];
+
+    return handler.originalEnd.call(
+      this,
+      chunk as never,
+      encoding as never,
+      callback as never
+    );
+  }
+
   public captureInboundRequest(
     req: IncomingMessage,
     slot: IOEventSlot,
     seq: number,
     onBytesChanged: (oldBytes: number, newBytes: number) => void
   ): void {
-    if (!this.isRequestCaptureEnabled() || !this.shouldCaptureHeaders(slot.requestHeaders)) {
+    if (!this.isRequestCaptureEnabled()) {
+      return;
+    }
+
+    if (this.shouldRecordMultipartMarker(slot.requestHeaders)) {
+      this.recordMultipartMarker(
+        slot,
+        'requestBody',
+        'requestBodyDigest',
+        'requestBodyOriginalSize',
+        onBytesChanged
+      );
+      return;
+    }
+
+    if (!this.shouldCaptureHeaders(slot.requestHeaders)) {
       return;
     }
 
@@ -397,6 +585,328 @@ export class BodyCapture {
     res.end = BodyCapture.handleOutboundResponseEnd as ServerResponse['end'];
   }
 
+  public captureClientRequest(
+    req: ClientRequest,
+    slot: IOEventSlot,
+    seq: number,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void {
+    if (!this.isRequestCaptureEnabled()) {
+      return;
+    }
+
+    if (this.shouldRecordMultipartMarker(slot.requestHeaders)) {
+      this.recordMultipartMarker(
+        slot,
+        'requestBody',
+        'requestBodyDigest',
+        'requestBodyOriginalSize',
+        onBytesChanged
+      );
+      return;
+    }
+
+    if (!this.shouldCaptureHeaders(slot.requestHeaders)) {
+      return;
+    }
+
+    const state = this.createState(slot.requestHeaders);
+    this.setState(slot, 'request', state);
+    const request = req as ClientRequest & {
+      [CLIENT_REQUEST_CAPTURE]?: ClientRequestCaptureHandler;
+    };
+
+    request[CLIENT_REQUEST_CAPTURE] = {
+      capture: this,
+      slot,
+      seq,
+      state,
+      originalWrite: req.write,
+      originalEnd: req.end,
+      onBytesChanged
+    };
+
+    req.write = BodyCapture.handleClientRequestWrite as ClientRequest['write'];
+    req.end = BodyCapture.handleClientRequestEnd as ClientRequest['end'];
+  }
+
+  /**
+   * Capture a client request body. For sync bodies (Buffer/Uint8Array/string)
+   * the capture is finalized inline. For AsyncIterable bodies - undici wraps
+   * `fetch(url, { body })` payloads as an AsyncGenerator - returns a tee'd
+   * async generator that yields the source chunks unchanged while
+   * accumulating them into the slot's capture state. The caller MUST swap
+   * the request's body with the returned generator so undici sends the
+   * tee'd chunks instead of the original (otherwise the source iterator
+   * gets consumed twice). Returns `undefined` when no swap is needed.
+   */
+  public captureClientRequestBody(
+    slot: IOEventSlot,
+    seq: number,
+    body: unknown,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): AsyncGenerator<unknown> | undefined {
+    if (!this.isRequestCaptureEnabled()) {
+      return undefined;
+    }
+    if (this.shouldRecordMultipartMarker(slot.requestHeaders)) {
+      this.recordMultipartMarker(
+        slot,
+        'requestBody',
+        'requestBodyDigest',
+        'requestBodyOriginalSize',
+        onBytesChanged
+      );
+      return undefined;
+    }
+    if (!this.shouldCaptureHeaders(slot.requestHeaders)) {
+      return undefined;
+    }
+    if (body === null || body === undefined) {
+      return undefined;
+    }
+    // Streams (Readable) cannot be consumed here without breaking the
+    // outbound send. Surface that the request had a streaming body but
+    // we did not capture its content. This branch must come BEFORE the
+    // AsyncIterable branch - Readables also implement Symbol.asyncIterator
+    // but are not safely tee-able through a wrapping generator.
+    if (
+      typeof body === 'object' &&
+      body !== null &&
+      typeof (body as { pipe?: unknown }).pipe === 'function'
+    ) {
+      slot.requestBodyTruncated = true;
+      slot.requestBodyOriginalSize = null;
+      return undefined;
+    }
+
+    // AsyncIterable / AsyncGenerator: undici wraps fetch() bodies into one.
+    // Tee through a wrapping generator: each chunk lands in the capture
+    // state AND flows out to undici unchanged. The previous fallback
+    // (`Buffer.from(String(chunk))`) produced the literal "[object
+    // AsyncGenerator]" string in captures.
+    if (
+      typeof body === 'object' &&
+      body !== null &&
+      typeof (body as AsyncIterable<unknown>)[Symbol.asyncIterator] === 'function'
+    ) {
+      const state = this.createState(slot.requestHeaders);
+      this.setState(slot, 'request', state);
+      return this.teeAsyncIterableForCapture(
+        body as AsyncIterable<unknown>,
+        slot,
+        seq,
+        state,
+        onBytesChanged
+      );
+    }
+
+    const state = this.createState(slot.requestHeaders);
+    this.setState(slot, 'request', state);
+
+    this.captureChunk(
+      state,
+      slot,
+      'requestBody',
+      'requestBodyTruncated',
+      'requestBodyOriginalSize',
+      body
+    );
+
+    this.finalizeCapture({
+      slot,
+      seq,
+      bodyKey: 'requestBody',
+      digestKey: 'requestBodyDigest',
+      truncatedKey: 'requestBodyTruncated',
+      originalSizeKey: 'requestBodyOriginalSize',
+      state,
+      headers: slot.requestHeaders,
+      onBytesChanged
+    });
+
+    return undefined;
+  }
+
+  private async *teeAsyncIterableForCapture(
+    source: AsyncIterable<unknown>,
+    slot: IOEventSlot,
+    seq: number,
+    state: AccumulatorState,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): AsyncGenerator<unknown> {
+    let finalized = false;
+    const finalize = (): void => {
+      if (finalized) return;
+      finalized = true;
+      this.finalizeCapture({
+        slot,
+        seq,
+        bodyKey: 'requestBody',
+        digestKey: 'requestBodyDigest',
+        truncatedKey: 'requestBodyTruncated',
+        originalSizeKey: 'requestBodyOriginalSize',
+        state,
+        headers: slot.requestHeaders,
+        onBytesChanged
+      });
+    };
+
+    try {
+      for await (const chunk of source) {
+        try {
+          this.captureChunk(
+            state,
+            slot,
+            'requestBody',
+            'requestBodyTruncated',
+            'requestBodyOriginalSize',
+            chunk
+          );
+        } catch {
+          // Capture errors must never break the application's request.
+          // Skip this chunk's accumulation; keep yielding to undici.
+        }
+        yield chunk;
+      }
+    } finally {
+      // Runs on natural exhaustion, generator.return() (e.g., undici aborts
+      // mid-stream and breaks the for-await), or thrown errors. The slot.seq
+      // check inside finalizeCapture handles slot recycling between the
+      // request kicking off and the generator settling.
+      finalize();
+    }
+  }
+
+  /**
+   * Capture a cloned fetch response stream without materializing the entire
+   * response in memory. The clone branch is read only until the payload cap is
+   * exceeded unless digest capture requires continuing through the full stream.
+   */
+  public async captureUndiciResponseStream(
+    slot: IOEventSlot,
+    stream: ReadableStream<Uint8Array> | null,
+    headers: Record<string, string> | null,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): Promise<void> {
+    if (!this.isResponseCaptureEnabled()) {
+      cancelReadableStream(stream);
+      return;
+    }
+    if (!this.shouldCaptureHeaders(headers)) {
+      cancelReadableStream(stream);
+      return;
+    }
+
+    const state = this.createState(headers);
+    this.setState(slot, 'response', state);
+
+    if (stream !== null) {
+      const reader = stream.getReader();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          this.captureChunk(
+            state,
+            slot,
+            'responseBody',
+            'responseBodyTruncated',
+            'responseBodyOriginalSize',
+            value
+          );
+
+          if (state.truncated && !this.shouldTrackAfterTruncation(state)) {
+            try {
+              void reader.cancel().catch(() => undefined);
+            } catch {
+              // Best effort: do not let capture cancellation affect fetch().
+            }
+            break;
+          }
+        }
+      } catch (err) {
+        slot.responseBodyTruncated = true;
+        delete this.getState(slot).response;
+        this.releaseState(state);
+        throw err;
+      } finally {
+        reader.releaseLock();
+      }
+    }
+
+    this.finalizeCapture({
+      slot,
+      seq: slot.seq,
+      bodyKey: 'responseBody',
+      digestKey: 'responseBodyDigest',
+      truncatedKey: 'responseBodyTruncated',
+      originalSizeKey: 'responseBodyOriginalSize',
+      state,
+      headers,
+      onBytesChanged
+    });
+
+    this.materializeBody(slot, 'responseBody', 'responseBodyDigest', headers);
+  }
+
+  /**
+   * Capture an already-buffered outbound response body. Used by the fetch
+   * wrapper, which obtains the full body via `response.clone().arrayBuffer()`
+   * and hands it to BodyCapture in one shot - no incremental stream.
+   * Reuses the same materialize path as stream-based capture so the body
+   * lands in slot.responseBody with the same shape (decoded string for
+   * textual content, Buffer for binary, scrubbed via the configured PII
+   * scrubber).
+   */
+  public captureUndiciResponseBuffer(
+    slot: IOEventSlot,
+    body: Buffer,
+    headers: Record<string, string> | null,
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void {
+    if (!this.isResponseCaptureEnabled()) {
+      return;
+    }
+    if (!this.shouldCaptureHeaders(headers)) {
+      return;
+    }
+
+    const state = this.createState(headers);
+    this.setState(slot, 'response', state);
+
+    this.captureChunk(
+      state,
+      slot,
+      'responseBody',
+      'responseBodyTruncated',
+      'responseBodyOriginalSize',
+      body
+    );
+
+    this.finalizeCapture({
+      slot,
+      seq: slot.seq,
+      bodyKey: 'responseBody',
+      digestKey: 'responseBodyDigest',
+      truncatedKey: 'responseBodyTruncated',
+      originalSizeKey: 'responseBodyOriginalSize',
+      state,
+      headers,
+      onBytesChanged
+    });
+
+    // Materialize immediately so the body lands as a decoded string for
+    // textual content. The stream-based response path waits for the
+    // outer materializeSlotBodies call, but for the fetch wrapper there's
+    // no further capture activity on this slot - finalize fully here.
+    this.materializeBody(slot, 'responseBody', 'responseBodyDigest', headers);
+  }
+
   public captureClientResponse(
     res: IncomingMessage,
     slot: IOEventSlot,
@@ -451,6 +961,23 @@ export class BodyCapture {
     }
   }
 
+  public releaseSlotBodies(slot: IOEventSlot): void {
+    const trackedSlot = slot as SlotWithBodyCaptureState;
+    const state = trackedSlot[BODY_CAPTURE_STATE];
+    if (state === undefined) {
+      return;
+    }
+
+    if (state.request !== undefined) {
+      this.releaseState(state.request);
+    }
+    if (state.response !== undefined) {
+      this.releaseState(state.response);
+    }
+
+    delete trackedSlot[BODY_CAPTURE_STATE];
+  }
+
   public materializeContextBody(context: RequestContext): void {
     let slot: IOEventSlot | undefined;
     const { ioEvents } = context;
@@ -489,7 +1016,7 @@ export class BodyCapture {
       state.truncated = false;
       state.finalized = false;
       state.contentTypeChecked = false;
-      state.digest = this.captureDigest ? createHash('sha256') : null;
+      state.digest = this.shouldHashBodies() ? createHash('sha256') : null;
       state.digestHex = null;
       state.headers = headers;
       return state;
@@ -502,7 +1029,7 @@ export class BodyCapture {
       truncated: false,
       finalized: false,
       contentTypeChecked: false,
-      digest: this.captureDigest ? createHash('sha256') : null,
+      digest: this.shouldHashBodies() ? createHash('sha256') : null,
       digestHex: null,
       headers
     };
@@ -510,6 +1037,27 @@ export class BodyCapture {
 
   private shouldCaptureHeaders(headers: Record<string, string> | null | undefined): boolean {
     return this.shouldCaptureContentTypeHeader(headers?.['content-type']);
+  }
+
+  private shouldRecordMultipartMarker(
+    headers: Record<string, string> | null | undefined
+  ): boolean {
+    return isMultipartContentType(headers?.['content-type']);
+  }
+
+  private recordMultipartMarker(
+    slot: IOEventSlot,
+    bodyKey: 'requestBody' | 'responseBody',
+    digestKey: 'requestBodyDigest' | 'responseBodyDigest',
+    originalSizeKey: 'requestBodyOriginalSize' | 'responseBodyOriginalSize',
+    onBytesChanged: (oldBytes: number, newBytes: number) => void
+  ): void {
+    const oldBytes = slot.estimatedBytes;
+    slot[bodyKey] = MULTIPART_REDACTED;
+    slot[digestKey] = null;
+    slot[originalSizeKey] = null;
+    slot.estimatedBytes = estimateBytes(slot);
+    onBytesChanged(oldBytes, slot.estimatedBytes);
   }
 
   private shouldCaptureContentTypeHeader(contentType: unknown): boolean {
@@ -575,7 +1123,7 @@ export class BodyCapture {
     }
 
     state.totalBytesSeen += buffer.length;
-    const remaining = this.maxPayloadSize - state.capturedBytes;
+    const remaining = this.getCaptureByteLimit() - state.capturedBytes;
 
     if (remaining <= 0) {
       state.truncated = true;
@@ -611,6 +1159,16 @@ export class BodyCapture {
     res: ServerResponse,
     handler: OutboundResponseCaptureHandler
   ): boolean {
+    if (!this.shouldCaptureResponseStatus(res.statusCode)) {
+      this.restoreOutboundResponse(res, handler);
+      delete (res as ServerResponse & {
+        [OUTBOUND_RESPONSE_CAPTURE]?: OutboundResponseCaptureHandler;
+      })[OUTBOUND_RESPONSE_CAPTURE];
+      delete this.getState(handler.slot).response;
+      this.releaseState(handler.state);
+      return true;
+    }
+
     if (handler.state.contentTypeChecked) {
       return false;
     }
@@ -633,7 +1191,11 @@ export class BodyCapture {
   }
 
   private shouldTrackAfterTruncation(state: AccumulatorState): boolean {
-    return state.digest !== null;
+    return state.digest !== null || this.getPayloadSpool() !== undefined;
+  }
+
+  private shouldCaptureResponseStatus(statusCode: unknown): boolean {
+    return typeof statusCode !== 'number' || statusCode >= 400;
   }
 
   private releaseState(state: AccumulatorState): void {
@@ -646,7 +1208,11 @@ export class BodyCapture {
     state.digest = null;
     state.digestHex = null;
     state.headers = null;
-    this.statePool.push(state);
+    // Cap the pool size to avoid unbounded memory growth from pooled objects
+    // when many concurrent streams were active. Let excess states be GC'd.
+    if (this.statePool.length < MAX_STATE_POOL_SIZE) {
+      this.statePool.push(state);
+    }
   }
 
   private finalizeCapture(input: {
@@ -685,7 +1251,7 @@ export class BodyCapture {
 
     slot[bodyKey] = null;
     slot[digestKey] = state.digestHex;
-    slot.estimatedBytes = oldBytes + state.capturedBytes;
+    slot.estimatedBytes = oldBytes + Math.min(state.capturedBytes, this.maxPayloadSize);
 
     onBytesChanged(oldBytes, slot.estimatedBytes);
 
@@ -696,7 +1262,7 @@ export class BodyCapture {
   }
 
   private getState(slot: IOEventSlot): SlotCaptureState {
-    const trackedSlot = slot as IOEventSlot & { [BODY_CAPTURE_STATE]?: SlotCaptureState };
+    const trackedSlot = slot as SlotWithBodyCaptureState;
     trackedSlot[BODY_CAPTURE_STATE] ??= {};
     return trackedSlot[BODY_CAPTURE_STATE] as SlotCaptureState;
   }
@@ -707,6 +1273,30 @@ export class BodyCapture {
     state: AccumulatorState
   ): void {
     this.getState(slot)[bodyType] = state;
+  }
+
+  private shouldHashBodies(): boolean {
+    return this.captureDigest || this.getPayloadSpool() !== undefined;
+  }
+
+  private getCaptureByteLimit(): number {
+    const payloadSpool = this.getPayloadSpool();
+    return payloadSpool !== undefined
+      ? payloadSpool.getMaxCaptureBytes()
+      : this.maxPayloadSize;
+  }
+
+  private shouldSpoolPayload(state: AccumulatorState): boolean {
+    return this.getPayloadSpool() !== undefined && state.totalBytesSeen > this.maxPayloadSize;
+  }
+
+  private getPayloadSpool(): BodyPayloadSpool | undefined {
+    return (
+      typeof this.payloadSpool?.getMaxCaptureBytes === 'function' &&
+      typeof this.payloadSpool.store === 'function'
+    )
+      ? this.payloadSpool
+      : undefined;
   }
 
   private materializeBody(
@@ -742,9 +1332,58 @@ export class BodyCapture {
     }
 
     const body = Buffer.concat(state.chunks, state.capturedBytes);
-    const scrubbed = this.scrubber?.scrubBodyBuffer(body, headers ?? state.headers) ?? body;
+    const bodyHeaders = headers ?? state.headers;
+    const contentType = bodyHeaders?.['content-type'];
+    const scrubberScrubbed = this.scrubber?.scrubBodyBuffer(body, bodyHeaders) ?? body;
+    const scrubbed = scrubPlainTextKeyValues(scrubberScrubbed, contentType);
+    const refKey = bodyKey === 'requestBody' ? 'requestPayloadRef' : 'responsePayloadRef';
 
-    slot[bodyKey] = scrubbed;
+    if (this.shouldSpoolPayload(state)) {
+      const payloadSpool = this.getPayloadSpool();
+      if (payloadSpool === undefined) {
+        return;
+      }
+      const digest = state.digestHex ?? createHash('sha256').update(scrubbed).digest('hex');
+      const result = payloadSpool.store({
+        requestId: slot.requestId,
+        lineageId: slot.requestId,
+        mimeType: contentType ?? null,
+        bytes: scrubbed,
+        originalSize: state.totalBytesSeen,
+        sha256: digest,
+        complete: state.capturedBytes >= state.totalBytesSeen
+      });
+      slot[refKey] = result.ref;
+      const preview = result.preview;
+
+      if (isTextualContentType(contentType)) {
+        slot[bodyKey] = preview.toString(getBodyEncoding(contentType));
+      } else {
+        slot[bodyKey] = preview;
+      }
+      slot[digestKey] = digest;
+      if (bodyKey === 'requestBody') {
+        slot.requestBodyTruncated = result.ref.previewTruncated;
+        slot.requestBodyOriginalSize = state.totalBytesSeen;
+      } else {
+        slot.responseBodyTruncated = result.ref.previewTruncated;
+        slot.responseBodyOriginalSize = state.totalBytesSeen;
+      }
+      slot.estimatedBytes = estimateBytes(slot);
+      delete this.getState(slot)[bodyKey === 'requestBody' ? 'request' : 'response'];
+      this.releaseState(state);
+      return;
+    }
+
+    // For textual content-types, decode UTF-8 (or charset-declared encoding)
+    // so the body lands in the package as a readable string, not as a typed-
+    // array byte sample that the JSON serializer would clamp to maxArrayItems.
+    // Binary content stays as a Buffer.
+    if (isTextualContentType(contentType)) {
+      slot[bodyKey] = scrubbed.toString(getBodyEncoding(contentType));
+    } else {
+      slot[bodyKey] = scrubbed;
+    }
     slot[digestKey] = state.digestHex;
     delete this.getState(slot)[bodyKey === 'requestBody' ? 'request' : 'response'];
     this.releaseState(state);

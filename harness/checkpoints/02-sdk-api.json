@@ -1,0 +1,520 @@
+{
+    "phase":  "02-sdk-api",
+    "timestamp":  "2026-06-01T21:23:48.5063212+05:30",
+    "source":  "installed package README.md and dist/**/*.d.ts only",
+    "inspectDir":  "C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\tmp\\sdk-inspect",
+    "installedPackage":  "C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\tmp\\sdk-inspect\\node_modules\\errorcore",
+    "readmeSha256":  "6f378bf99d96f30261366b31ca3df9f6d0db477d52b7da794d1fbcf9486538b9",
+    "declarationFileCount":  99,
+    "declarationHashes":  [
+                              {
+                                  "path":  "dist\\buffer\\io-event-buffer.d.ts",
+                                  "sha256":  "98824554179aabf60fa41f9c0d51ffb61a1cd9eff005202b75c10f3d36d1a2a5",
+                                  "bytes":  2170
+                              },
+                              {
+                                  "path":  "dist\\capture\\error-capturer.d.ts",
+                                  "sha256":  "6c48759ad68eeeb0071439228fe187bbe4aca1312f9977dcec9370295ad9530a",
+                                  "bytes":  4691
+                              },
+                              {
+                                  "path":  "dist\\capture\\fingerprint.d.ts",
+                                  "sha256":  "d7af2aed58e62dea06ef907f36069c918ed08bf216f939663b59a8eecfbea41b",
+                                  "bytes":  184
+                              },
+                              {
+                                  "path":  "dist\\capture\\inspector-manager.d.ts",
+                                  "sha256":  "a4fd435d7f72949e32bf4ed330c980f819b89a213413a42b80691269c4b343e7",
+                                  "bytes":  5794
+                              },
+                              {
+                                  "path":  "dist\\capture\\normalize-thrown.d.ts",
+                                  "sha256":  "7405de4003d315dbe613c7426c5e761871fe5ad62df41cbcc061b15ca069c9a1",
+                                  "bytes":  789
+                              },
+                              {
+                                  "path":  "dist\\capture\\package-assembly-dispatcher.d.ts",
+                                  "sha256":  "f38e70dd082d94e33340561dc3544ee1ed6d3a404cb734ec2d180bfa3fd5d2b2",
+                                  "bytes":  1478
+                              },
+                              {
+                                  "path":  "dist\\capture\\package-assembly-worker.d.ts",
+                                  "sha256":  "e4d64aae563619886fa8c93765421b659c4e3b2aaf2afb16fac41ee8852c3dba",
+                                  "bytes":  64
+                              },
+                              {
+                                  "path":  "dist\\capture\\package-builder.d.ts",
+                                  "sha256":  "96cc13cd9e41f571cadc6fa6f5e67a84c881e2c4eab15e879a17685e545366a6",
+                                  "bytes":  2116
+                              },
+                              {
+                                  "path":  "dist\\capture\\process-metadata.d.ts",
+                                  "sha256":  "65e11d604299cff7c77740ade92faafc1b149c35e2fd77f4631647d54feccc73",
+                                  "bytes":  2059
+                              },
+                              {
+                                  "path":  "dist\\capture\\source-map-resolver.d.ts",
+                                  "sha256":  "41ec914de12603e2e0156c0dea9b75d5197050e0f5bcfd53bd8cf5f034ced71e",
+                                  "bytes":  2810
+                              },
+                              {
+                                  "path":  "dist\\capture\\stack-ownership.d.ts",
+                                  "sha256":  "15501e9202acfbd7aea9c9a0f191548bcbefadc6b62c18c6d5cd43aed0d58ecf",
+                                  "bytes":  741
+                              },
+                              {
+                                  "path":  "dist\\capture\\supplemental-locals.d.ts",
+                                  "sha256":  "53f57caee75b6e52a62dee8ccb4e59320f7f3979efd65fd001471ee322f69eaa",
+                                  "bytes":  498
+                              },
+                              {
+                                  "path":  "dist\\config.d.ts",
+                                  "sha256":  "d7f57cae0f2101aca73d52649fca133b99d1eda64062c24ca90fff36b3e3e409",
+                                  "bytes":  317
+                              },
+                              {
+                                  "path":  "dist\\context\\als-manager.d.ts",
+                                  "sha256":  "435d5889491d5846f42ba8bf598e035890d7b81ceeb2b35b986a41548c8c3ecf",
+                                  "bytes":  1487
+                              },
+                              {
+                                  "path":  "dist\\context\\event-clock.d.ts",
+                                  "sha256":  "418e60da20a4081aa03acfb256a4817eeb970cba069f6677a4a81cca5d5805c5",
+                                  "bytes":  465
+                              },
+                              {
+                                  "path":  "dist\\context\\request-context-carrier.d.ts",
+                                  "sha256":  "9752709c75d278a06445fc885b09c0a4d76f3cd2490474e92efcc96fe8221d90",
+                                  "bytes":  509
+                              },
+                              {
+                                  "path":  "dist\\context\\request-tracker.d.ts",
+                                  "sha256":  "da7d913df77672b01eae0150ae5da61ea399001b30cd974402d82dd76e6279a9",
+                                  "bytes":  1116
+                              },
+                              {
+                                  "path":  "dist\\context\\tracestate.d.ts",
+                                  "sha256":  "d2e20edda7be52d5f2676adb4bb8019de14087b5e9f7f3f792c185229fb111a5",
+                                  "bytes":  1358
+                              },
+                              {
+                                  "path":  "dist\\debug.d.ts",
+                                  "sha256":  "fea803f86618748a4d6c7b026c155c91ed61c025e3f92778a102abd29f936dcb",
+                                  "bytes":  118
+                              },
+                              {
+                                  "path":  "dist\\debug-log.d.ts",
+                                  "sha256":  "d8c4458e4b98217092ae491a2c7fbc6d4cb0367c1c42baed6dd1c1a1bc3531e2",
+                                  "bytes":  557
+                              },
+                              {
+                                  "path":  "dist\\health\\health-metrics.d.ts",
+                                  "sha256":  "719a15ffb1eecbfb2384e657a6e8f8edf07822a35ca4c5dcff8305fa11cb801d",
+                                  "bytes":  1767
+                              },
+                              {
+                                  "path":  "dist\\health\\types.d.ts",
+                                  "sha256":  "af745033e6b19e67a3d3b0e473c568e044fc082b96bf9f530a7bff6d795497db",
+                                  "bytes":  1771
+                              },
+                              {
+                                  "path":  "dist\\index.d.ts",
+                                  "sha256":  "1bd94f116e9cae6176f6a24a13573652142b1ddc726ae5832d0055e59c793134",
+                                  "bytes":  2774
+                              },
+                              {
+                                  "path":  "dist\\ingest\\index.d.ts",
+                                  "sha256":  "ad330680938f3e05c74111a2d33a2e48620f90d37154340b38b2a07d0ce99dc6",
+                                  "bytes":  2535
+                              },
+                              {
+                                  "path":  "dist\\integrations\\hono\\index.d.ts",
+                                  "sha256":  "64e332f78220e8fb17b60c2aa1713eb31867547ca90faa9ba088fda9657e9c33",
+                                  "bytes":  137
+                              },
+                              {
+                                  "path":  "dist\\integrations\\nextjs\\index.d.ts",
+                                  "sha256":  "b7522faf6a382fcc2bf771cd444e3f2ab0531c4f8fae4d64f5784ac813b7f890",
+                                  "bytes":  1098
+                              },
+                              {
+                                  "path":  "dist\\integrations\\nextjs\\middleware.d.ts",
+                                  "sha256":  "b0759f45f9ccec997adf2318bbcde458ab42affe9ff0434e352918d547b8575b",
+                                  "bytes":  942
+                              },
+                              {
+                                  "path":  "dist\\integrations\\nextjs\\server-action.d.ts",
+                                  "sha256":  "79dc4b23420868050941bfc005bd384452072c9682f26cd01a663aa136dc034e",
+                                  "bytes":  930
+                              },
+                              {
+                                  "path":  "dist\\integrations\\nextjs\\types.d.ts",
+                                  "sha256":  "95e7f51eda1d9f9e7c4f4ef5109135f919a3a8b1ee47b39fb25ce4d9be4f416d",
+                                  "bytes":  952
+                              },
+                              {
+                                  "path":  "dist\\middleware\\common.d.ts",
+                                  "sha256":  "f7ed58051165e99b3878b954bb3a44eb548dd7492abac24f676b1202b057f843",
+                                  "bytes":  2731
+                              },
+                              {
+                                  "path":  "dist\\middleware\\express.d.ts",
+                                  "sha256":  "26f50b62cea675a943dffe8de6a25466d7ad5f7cc0ec609c0177acc35893e0a3",
+                                  "bytes":  377
+                              },
+                              {
+                                  "path":  "dist\\middleware\\fastify.d.ts",
+                                  "sha256":  "b338dff6e33e426dc8399f9ae5a99c3e4e3517b23beccade2399eb3949a34158",
+                                  "bytes":  595
+                              },
+                              {
+                                  "path":  "dist\\middleware\\hapi.d.ts",
+                                  "sha256":  "4a63135fd1fe22fae8fda001a06fec97db4ccb44e0ef57484d1d827ae659b213",
+                                  "bytes":  751
+                              },
+                              {
+                                  "path":  "dist\\middleware\\hono.d.ts",
+                                  "sha256":  "df020b5e4a06e8fb018db490784920edfe7281a71ac63ab494a43bb2e04d1a91",
+                                  "bytes":  515
+                              },
+                              {
+                                  "path":  "dist\\middleware\\koa.d.ts",
+                                  "sha256":  "cd520c1f035a86aafe7d0e44953ab598e56cb812bff3ec56c59414351c200506",
+                                  "bytes":  466
+                              },
+                              {
+                                  "path":  "dist\\middleware\\lambda.d.ts",
+                                  "sha256":  "7302a617dfec5df2abda2a63b6a08f0f148eeed05fdc036bee1981db05def704",
+                                  "bytes":  935
+                              },
+                              {
+                                  "path":  "dist\\middleware\\nextjs.d.ts",
+                                  "sha256":  "2bf349fa391caf1e724358f0edb7ff5c4f739601764a8c46eaf391c7a2b1f54a",
+                                  "bytes":  504
+                              },
+                              {
+                                  "path":  "dist\\middleware\\raw-http.d.ts",
+                                  "sha256":  "e4855841dbcc4c297178c29625ada9c81d1f90109e8929e3518f44ec28c519d2",
+                                  "bytes":  381
+                              },
+                              {
+                                  "path":  "dist\\middleware\\watchdog.d.ts",
+                                  "sha256":  "40fdaae865465fefd0fce8099a9d88949d0b794cf600b882df01454b896e3679",
+                                  "bytes":  628
+                              },
+                              {
+                                  "path":  "dist\\next-dev-cleanup.d.ts",
+                                  "sha256":  "b6e44a3a5205393326ea12b13f2150f512d174194786dae4993be36b9099513c",
+                                  "bytes":  900
+                              },
+                              {
+                                  "path":  "dist\\pii\\header-filter.d.ts",
+                                  "sha256":  "38b4955b60cdc916e47f39264319e08ceeadee11d63f7db6b64d8e2f21a87f34",
+                                  "bytes":  556
+                              },
+                              {
+                                  "path":  "dist\\pii\\patterns.d.ts",
+                                  "sha256":  "6305d0df4ccca6e2ca17ed529a985292092964f7ddfe22d9d94e03c8545ea739",
+                                  "bytes":  1126
+                              },
+                              {
+                                  "path":  "dist\\pii\\scrubber.d.ts",
+                                  "sha256":  "be996a88eaab0bce997b0aca493391dbb9c6f92a470f9fe376fd75a71c1ba8a5",
+                                  "bytes":  1281
+                              },
+                              {
+                                  "path":  "dist\\recording\\body-capture.d.ts",
+                                  "sha256":  "65683a6645b711bf92c076171924489127473436ae9242b472f0d3e855c08849",
+                                  "bytes":  5213
+                              },
+                              {
+                                  "path":  "dist\\recording\\channel-subscriber.d.ts",
+                                  "sha256":  "da9f76a521c8535c02168e0774f05983734fafa47b6ac10d029a294440da5d6d",
+                                  "bytes":  1045
+                              },
+                              {
+                                  "path":  "dist\\recording\\fetch-wrapper.d.ts",
+                                  "sha256":  "2a2e06d3f4cc976fe7cfd3ccac2827d464c71f50bd91f65280d38af8e153522a",
+                                  "bytes":  2391
+                              },
+                              {
+                                  "path":  "dist\\recording\\http-client.d.ts",
+                                  "sha256":  "22c027a7a1d0bd9c135a7a4775d213341968512dd11bcb6267967c066651e9e2",
+                                  "bytes":  1765
+                              },
+                              {
+                                  "path":  "dist\\recording\\http-server.d.ts",
+                                  "sha256":  "64b4651f63f1293e1871356e4eb1dd879624399daf91008285ac6cad34e226dd",
+                                  "bytes":  3965
+                              },
+                              {
+                                  "path":  "dist\\recording\\internal.d.ts",
+                                  "sha256":  "5d96439ec62ec502bfec42e6020153d5458fc44ed1ce3ac2501c9167818d8866",
+                                  "bytes":  423
+                              },
+                              {
+                                  "path":  "dist\\recording\\net-dns.d.ts",
+                                  "sha256":  "eaebea22e375e6c162092bec725bce028ec5af2fb2ab601429740f02da5f1965",
+                                  "bytes":  1305
+                              },
+                              {
+                                  "path":  "dist\\recording\\patches\\ioredis.d.ts",
+                                  "sha256":  "451995ecea75664da69bad97805f7acdb801c7c01e8e59a0afe6c05c4d1226c9",
+                                  "bytes":  269
+                              },
+                              {
+                                  "path":  "dist\\recording\\patches\\mongodb.d.ts",
+                                  "sha256":  "ed7b0a81e095d5e76f6776ee6c782f921d11f8b8f4e209811b44f8c56b81ab06",
+                                  "bytes":  269
+                              },
+                              {
+                                  "path":  "dist\\recording\\patches\\mysql2.d.ts",
+                                  "sha256":  "65a5ec7d83eba4e61f12163540b0b5ba7954c27c5cf9d985b2e4cbf636c7cbf6",
+                                  "bytes":  268
+                              },
+                              {
+                                  "path":  "dist\\recording\\patches\\patch-manager.d.ts",
+                                  "sha256":  "296e456b71445e23f87a784a0bbf7be727a71b703d5ccce81687383bfa5bc996",
+                                  "bytes":  1709
+                              },
+                              {
+                                  "path":  "dist\\recording\\patches\\pg.d.ts",
+                                  "sha256":  "0a1859d742a0875571110d41a98cbea9ca471301c778b3a4113a75590ff6e67a",
+                                  "bytes":  264
+                              },
+                              {
+                                  "path":  "dist\\recording\\undici.d.ts",
+                                  "sha256":  "c58dda2191fa1808eb86b6e35b47ce955a057e8292d76b14e4bde028d40956c4",
+                                  "bytes":  2020
+                              },
+                              {
+                                  "path":  "dist\\recording\\utils.d.ts",
+                                  "sha256":  "75177ba0633509813b4a3a5e2cacfd9ef9304437a605b1c25d74c8bbf37b4bbf",
+                                  "bytes":  491
+                              },
+                              {
+                                  "path":  "dist\\scrubber\\encoder.d.ts",
+                                  "sha256":  "08ecd3f052875287382120a529c7bd3eeb82de271460951ca0efd385f1be799d",
+                                  "bytes":  716
+                              },
+                              {
+                                  "path":  "dist\\scrubber\\policy.d.ts",
+                                  "sha256":  "7253a03170a5ef6d8638d6ff55afcbc66bb95d66238f2817e535b77b121f1ca6",
+                                  "bytes":  378
+                              },
+                              {
+                                  "path":  "dist\\scrubber\\scrubber.d.ts",
+                                  "sha256":  "8ea072bd09bb9d6208282bb1ca9040987a5ca82b61a937409aa7309a4421a0f3",
+                                  "bytes":  775
+                              },
+                              {
+                                  "path":  "dist\\scrubber\\types.d.ts",
+                                  "sha256":  "5d064884f9060847b4426a662c1b024c7b6441185223e969aaad29773b3b99d6",
+                                  "bytes":  1141
+                              },
+                              {
+                                  "path":  "dist\\sdk.d.ts",
+                                  "sha256":  "4eebcd2c416735a7eadfed559baa2c4bfb00f6f262bd526c1a23bfdde1332ebc",
+                                  "bytes":  5273
+                              },
+                              {
+                                  "path":  "dist\\sdk-diagnostics.d.ts",
+                                  "sha256":  "fd716f6b32d7006b4914d1147151ae6cf57f1853f65e117028959669509788b7",
+                                  "bytes":  751
+                              },
+                              {
+                                  "path":  "dist\\security\\compression.d.ts",
+                                  "sha256":  "e9961b534b19a0670053e0afd87fbd314d48bec418385f33ae31663209abb541",
+                                  "bytes":  999
+                              },
+                              {
+                                  "path":  "dist\\security\\encryption.d.ts",
+                                  "sha256":  "e86e8004ebad3132c2d6c80fd3e4be83c1d2e1bbe60c0ff4b591a957d61fd05b",
+                                  "bytes":  3663
+                              },
+                              {
+                                  "path":  "dist\\security\\encryption-runtime.d.ts",
+                                  "sha256":  "e93d8952fddece37831882593bf73169f0b6b94bced931f9d1e6749c7349db8e",
+                                  "bytes":  497
+                              },
+                              {
+                                  "path":  "dist\\security\\rate-limiter.d.ts",
+                                  "sha256":  "b568b48e79b90a02b6baa13b048b737cedc87474512e98edaa95cd5cc421ce13",
+                                  "bytes":  622
+                              },
+                              {
+                                  "path":  "dist\\serialization\\clone-and-limit.d.ts",
+                                  "sha256":  "28b658c772b201b3cce4aaa59e7b8a117a20898edcffdf8269c93a482e1b59dc",
+                                  "bytes":  352
+                              },
+                              {
+                                  "path":  "dist\\spool\\payload-spool.d.ts",
+                                  "sha256":  "a82757bafaa21cde4322f82c8ac7503a23ed9c2beb4f7f8f57f85be0427f5e24",
+                                  "bytes":  2248
+                              },
+                              {
+                                  "path":  "dist\\state\\state-tracker.d.ts",
+                                  "sha256":  "d4f9372b823ab0c06707dc1948fdefac364b129e0b679f96cc57a07d200dbfb5",
+                                  "bytes":  1519
+                              },
+                              {
+                                  "path":  "dist\\transport\\dead-letter-store.d.ts",
+                                  "sha256":  "89a237794a06b3d50649a145f93569358b4f2e9e05ef68d36528bd84e109565e",
+                                  "bytes":  3405
+                              },
+                              {
+                                  "path":  "dist\\transport\\file-lock.d.ts",
+                                  "sha256":  "22369c224800683115349e166a32f5f3d1cdb8d71ffe42cede9664ec71562abd",
+                                  "bytes":  275
+                              },
+                              {
+                                  "path":  "dist\\transport\\file-transport.d.ts",
+                                  "sha256":  "ca0ec95078770132150177fe6cf0b771cb06f3f65789d754c4e8e66b82c96d0e",
+                                  "bytes":  739
+                              },
+                              {
+                                  "path":  "dist\\transport\\http-transport.d.ts",
+                                  "sha256":  "bdc07129ea2ceabba37bd5473dc684c1a2d980d4d4c24288792aac2598ecf068",
+                                  "bytes":  1126
+                              },
+                              {
+                                  "path":  "dist\\transport\\local-event-store.d.ts",
+                                  "sha256":  "06eaed8e7cbe6ae5df9a0637a4ff45e2b47ff790abcc0acab72397dacd9b325b",
+                                  "bytes":  1056
+                              },
+                              {
+                                  "path":  "dist\\transport\\payload.d.ts",
+                                  "sha256":  "2fcf17a2e547f6334b761ac900e7933e071b6b26b6c4c396ace899080dd25eee",
+                                  "bytes":  438
+                              },
+                              {
+                                  "path":  "dist\\transport\\stdout-transport.d.ts",
+                                  "sha256":  "95e187834e500373c79c16558ff17df7e485f3b64a57f68a604fd47f8bc232a3",
+                                  "bytes":  288
+                              },
+                              {
+                                  "path":  "dist\\transport\\transport.d.ts",
+                                  "sha256":  "928c3c715c5b163d22b57f823baac76c1f754365d6146c259cbedc7ed9c077da",
+                                  "bytes":  2443
+                              },
+                              {
+                                  "path":  "dist\\transport\\webhook-transport.d.ts",
+                                  "sha256":  "2a17aec87b1f94e46a7f620d471525b1f2a4613d02b1eb2ede0e489a52fb7226",
+                                  "bytes":  1358
+                              },
+                              {
+                                  "path":  "dist\\types.d.ts",
+                                  "sha256":  "9ffc708272735c22e135dfbe24d45ed38bde9c582dc012ffd2590236de43289e",
+                                  "bytes":  29627
+                              },
+                              {
+                                  "path":  "dist\\ui\\frontend.d.ts",
+                                  "sha256":  "f374fbcc8ca8a4178ca93c674a11642d43fe869a58b09a6767893550f913e536",
+                                  "bytes":  101
+                              },
+                              {
+                                  "path":  "dist\\ui\\index.d.ts",
+                                  "sha256":  "4388df02c4606074b7c1d64a48ce17a1a034001e599bf058fe217aace935ab39",
+                                  "bytes":  330
+                              },
+                              {
+                                  "path":  "dist\\ui\\ndjson-reader.d.ts",
+                                  "sha256":  "69cff6ca054387bf6eb58f5f4021fe7a070ab3304a07d33ab04f63b8c8711207",
+                                  "bytes":  1472
+                              },
+                              {
+                                  "path":  "dist\\ui\\server.d.ts",
+                                  "sha256":  "15e4e406e35bc9c607ef87324d319b50e116d4e033b017830fe2448b4a88a449",
+                                  "bytes":  366
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\box.d.ts",
+                                  "sha256":  "eb4ac95d35a14b057d3f9af0c381c622f39cd557c5ecaa54a90c941508398182",
+                                  "bytes":  257
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\format.d.ts",
+                                  "sha256":  "6520aeafcfc0cabffb088ba9fccae8f1729ad804220b92dfbd5bb005fb812559",
+                                  "bytes":  289
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\index.d.ts",
+                                  "sha256":  "31f067d9a6c2560d339aed6ef463ac66e4801f13bdd21d004c2c79595f3831e1",
+                                  "bytes":  154
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\async-context.d.ts",
+                                  "sha256":  "1b67ff7b3ba3fdf09a2a40600c366e2b651f245125c1740abe52a35b9a57d82b",
+                                  "bytes":  173
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\db-queries.d.ts",
+                                  "sha256":  "fea744af9ceb082605ce82b1dc6c8cd72cdb7d8c41f5a9799a255c4011a52984",
+                                  "bytes":  167
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\header.d.ts",
+                                  "sha256":  "ad4910ad3f67c85ff3ac7d90d096eb9695eb123d0ee27cb486871cd4fd995f2e",
+                                  "bytes":  153
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\io-timeline.d.ts",
+                                  "sha256":  "00de49cb15eb458ff8233edfb59da10e4d2ea98aca9ab44369b72b2193d0aec4",
+                                  "bytes":  169
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\locals.d.ts",
+                                  "sha256":  "a8facb8b09bda33096ab2d2eb7f65bb1bcbbbed423f03e3af268093f7ba44fe5",
+                                  "bytes":  160
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\origin.d.ts",
+                                  "sha256":  "2932d01ae918649807b31b1c13d5b8e1aa00d4974ae8e4978d01b4c170d029cd",
+                                  "bytes":  160
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\request.d.ts",
+                                  "sha256":  "50df749ab9a39eef30cd4111f25477f74aeafe99fd46224a34694c88fd3e41d2",
+                                  "bytes":  162
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\stack-trace.d.ts",
+                                  "sha256":  "a708ee757e1a1c42079f3d77fb49e533cd8a6ff7d3e63ec86af8439a8b6408ea",
+                                  "bytes":  162
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\sections\\system.d.ts",
+                                  "sha256":  "85de29b916dffda3db192e93e548a527511ed6890801d48f155b5f59fe77891f",
+                                  "bytes":  153
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\stack-parser.d.ts",
+                                  "sha256":  "215cbc7916abf741de43bfe64d89b1b76b0d57f822301cb884fee956e31e20e9",
+                                  "bytes":  560
+                              },
+                              {
+                                  "path":  "dist\\ui\\terminal\\theme.d.ts",
+                                  "sha256":  "280e47e4d092c89a6733055b8ebbe4d67f110ccc9d4b4721b763fc9fd7680c41",
+                                  "bytes":  1433
+                              },
+                              {
+                                  "path":  "dist\\version.d.ts",
+                                  "sha256":  "88dc0eef83e221270e3b319f9e3475f53129b6eaefa5363669ea08a5a4d5dc5f",
+                                  "bytes":  86
+                              }
+                          ],
+    "discoveredApi":  {
+                          "init":  "require(\"errorcore\").init(config?: Partial\u003cSDKConfig\u003e): SDKInstance",
+                          "express":  "expressMiddleware(sdk?) mounted with app.use(expressMiddleware())",
+                          "fastify":  "fastifyPlugin(sdk?) registered with fastify.register(fastifyPlugin)",
+                          "transportFile":  "transport: { type: \u0027file\u0027, path: string, maxSizeBytes?: number, maxBackups?: number }",
+                          "requiredConfig":  "SDKConfig requires transport; production plaintext file transport can use allowUnencrypted:true; service/deploymentEnv are supported attribution keys.",
+                          "trace":  "getTraceHeaders(): { traceparent, tracestate? } and tracestate vendor clock format \u003cvendorKey\u003e=clk:\u003cn\u003e; config traceContext.vendorKey supported.",
+                          "drivers":  "drivers.pg and drivers.ioredis optional driver specifiers are supported; package also ships pg and ioredis patch declarations.",
+                          "captureFlags":  "captureLocalVariables, captureDbBindParams, captureRequestBodies, captureResponseBodies, captureBody/captureBodyDigest, resolveSourceMaps supported."
+                      },
+    "notes":  [
+                  "README quickstart documents explicit init(require(\"./errorcore.config.js\")), middleware exports, and file transport path .errorcore/events.ndjson.",
+                  "No SDK src/ files were read."
+              ]
+}

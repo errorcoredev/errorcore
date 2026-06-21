@@ -1,0 +1,9 @@
+{
+  "id": "nextjs",
+  "framework": "nextjs",
+  "repo": "vercel/next.js",
+  "tag": "v15.3.4",
+  "pin": "fb5a153bf0389719139d9e820afd170191b026ae",
+  "sourceDir": "source",
+  "overlay": "../benchmark-app"
+}

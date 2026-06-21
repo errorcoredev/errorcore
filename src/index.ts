@@ -1,48 +1,151 @@
+// Copyright 2026 ErrorCore Dev - PolyForm Small Business 1.0.0 - see LICENSE.md
 
-import type { SDKConfig } from './types';
+import type { SDKConfig, TraceContextInput, TraceHeaders } from './types';
+import type { HealthSnapshot } from './health/types';
 import { SDKInstance, createSDK } from './sdk';
+import { resetMiddlewareWarning } from './middleware/common';
+import { safeConsole } from './debug-log';
+import { registerNextDevHmrCleanup } from './next-dev-cleanup';
 
-let instance: SDKInstance | null = null;
+/**
+ * Global singleton storage using Symbol.for() to survive webpack chunk boundaries.
+ *
+ * Problem: webpack/Next.js bundles errorcore into separate chunks (instrumentation.js
+ * and each route.js), each with its own module scope. A module-scope `let instance`
+ * would be null in route chunks even after init() is called in instrumentation.
+ *
+ * Solution: Symbol.for() uses the global symbol registry, which is shared across all
+ * webpack chunks in the same process. This is the same pattern used by OpenTelemetry,
+ * Prisma, and other SDKs that need cross-chunk singleton identity.
+ */
+const INSTANCE_KEY = Symbol.for('errorcore.sdk.instance');
+const CAPTURE_WARNING_KEY = Symbol.for('errorcore.capture.warned');
+const INITIALIZING_KEY = Symbol.for('errorcore.sdk.initializing');
 
+function getInitializing(): boolean {
+  return (globalThis as Record<symbol, boolean>)[INITIALIZING_KEY] === true;
+}
+
+function setInitializing(value: boolean): void {
+  (globalThis as Record<symbol, boolean>)[INITIALIZING_KEY] = value;
+}
+
+function getGlobalInstance(): SDKInstance | null {
+  return (globalThis as Record<symbol, SDKInstance | null>)[INSTANCE_KEY] ?? null;
+}
+
+function setGlobalInstance(instance: SDKInstance | null): void {
+  (globalThis as Record<symbol, SDKInstance | null>)[INSTANCE_KEY] = instance;
+}
+
+function getCaptureWarningEmitted(): boolean {
+  return (globalThis as Record<symbol, boolean>)[CAPTURE_WARNING_KEY] === true;
+}
+
+function setCaptureWarningEmitted(value: boolean): void {
+  (globalThis as Record<symbol, boolean>)[CAPTURE_WARNING_KEY] = value;
+}
+
+/**
+ * Initialize the errorcore SDK.
+ *
+ * The SDK no longer auto-loads `errorcore.config.js` from the current working
+ * directory. Pass config explicitly, for example:
+ *
+ * @example
+ * // With an explicit config object
+ * require('errorcore').init({
+ *   transport: { type: 'http', url: 'https://collector.example.com/v1/errors' },
+ *   encryptionKey: process.env.ERRORCORE_DEK,
+ * });
+ *
+ * @example
+ * // Loading a user-controlled config file
+ * const errorcore = require('errorcore');
+ * errorcore.init(require('./errorcore.config.js'));
+ */
 export function init(config?: Partial<SDKConfig>): SDKInstance {
-  if (instance !== null) {
-    if (!instance.isActive()) {
-      instance = null;
+  if (getInitializing()) {
+    throw new Error('SDK initialization already in progress');
+  }
+
+  const existing = getGlobalInstance();
+
+  if (existing !== null) {
+    if (!existing.isActive()) {
+      setGlobalInstance(null);
     } else {
-      throw new Error('SDK already initialized. Call shutdown() first.');
+      safeConsole.warn(
+        '[errorcore] init() called while SDK is already active. Returning existing instance.'
+      );
+      return existing;
     }
   }
 
-  const nextInstance = createSDK(config ?? {});
-  instance = nextInstance;
+  setInitializing(true);
 
   try {
-    nextInstance.activate();
-  } catch (error) {
-    instance = null;
-    void nextInstance.shutdown().catch(() => undefined);
-    throw error;
-  }
+    const resolvedConfig = config ?? {};
+    const nextInstance = createSDK(resolvedConfig);
+    setGlobalInstance(nextInstance);
 
-  return nextInstance;
+    try {
+      nextInstance.activate();
+    } catch (error) {
+      setGlobalInstance(null);
+      void nextInstance.shutdown().catch(() => undefined);
+      throw error;
+    }
+
+    registerNextDevHmrCleanup({
+      instance: nextInstance,
+      getGlobalInstance,
+      setGlobalInstance,
+      onInternalWarning: nextInstance.config.onInternalWarning
+    });
+
+    return nextInstance;
+  } finally {
+    setInitializing(false);
+  }
 }
 
-export function captureError(error: Error): void {
-  instance?.captureError(error);
+export function captureError(error: unknown): void {
+  const instance = getGlobalInstance();
+
+  if (instance === null) {
+    if (!getCaptureWarningEmitted()) {
+      setCaptureWarningEmitted(true);
+      safeConsole.warn(
+        '[errorcore] captureError() called before init(). Errors are not being captured. ' +
+        'Call errorcore.init() at the top of your application entry point.'
+      );
+    }
+    return;
+  }
+
+  instance.captureError(error);
 }
 
 export function trackState<T extends Map<unknown, unknown> | Record<string, unknown>>(
   name: string,
   container: T
 ): T {
+  const instance = getGlobalInstance();
+
   if (instance === null) {
-    throw new Error('SDK is not initialized');
+    safeConsole.warn(
+      '[errorcore] trackState() called before init(). Returning unproxied container.'
+    );
+    return container;
   }
 
   return instance.trackState(name, container);
 }
 
 export function withContext<T>(fn: () => T): T {
+  const instance = getGlobalInstance();
+
   if (instance === null) {
     return fn();
   }
@@ -50,13 +153,58 @@ export function withContext<T>(fn: () => T): T {
   return instance.withContext(fn);
 }
 
+export function withTraceContext<T>(
+  input: TraceContextInput,
+  fn: () => T
+): T {
+  const instance = getGlobalInstance();
+
+  if (instance === null) {
+    return fn();
+  }
+
+  return instance.withTraceContext(input, fn);
+}
+
+export async function flush(): Promise<void> {
+  const instance = getGlobalInstance();
+
+  if (instance === null) {
+    return;
+  }
+
+  await instance.flush();
+}
+
 export async function shutdown(): Promise<void> {
+  const instance = getGlobalInstance();
+
   if (instance === null) {
     return;
   }
 
   await instance.shutdown();
-  instance = null;
+  if (getGlobalInstance() === instance) {
+    setGlobalInstance(null);
+    setCaptureWarningEmitted(false);
+    setInitializing(false);
+    resetMiddlewareWarning();
+  }
+}
+
+/**
+ * Returns a point-in-time snapshot of SDK self-observability state, or
+ * `null` when the SDK has not been initialized. Intended for /healthz
+ * endpoints.
+ *
+ * @example
+ * app.get('/healthz', (_, res) => {
+ *   res.json(errorcore.getHealth() ?? { initialized: false });
+ * });
+ */
+export function getHealth(): HealthSnapshot | null {
+  const instance = getGlobalInstance();
+  return instance === null ? null : instance.getHealth();
 }
 
 export { createSDK };
@@ -64,17 +212,37 @@ export { expressMiddleware } from './middleware/express';
 export { fastifyPlugin } from './middleware/fastify';
 export { koaMiddleware } from './middleware/koa';
 export { hapiPlugin } from './middleware/hapi';
+export { honoMiddleware } from './middleware/hono';
 export { wrapHandler } from './middleware/raw-http';
+export { withErrorcore } from './middleware/nextjs';
+export { wrapLambda, wrapServerless } from './middleware/lambda';
 
-export type { SDKConfig, ErrorPackage, Completeness, ResolvedConfig } from './types';
+export type {
+  SDKConfig,
+  ErrorPackage,
+  Completeness,
+  ResolvedConfig,
+  TraceContextInput,
+  TraceHeaders
+} from './types';
 export type { SDKInstance } from './sdk';
+export type { LambdaContext } from './middleware/lambda';
+export type { HealthSnapshot } from './health/types';
 
 /**
  * @internal
  * Intended for internal middleware use only. Do not call `.shutdown()` on the
- * returned instance — use the module-level `shutdown()` export instead, which
+ * returned instance - use the module-level `shutdown()` export instead, which
  * correctly resets the singleton so that `init()` can be called again.
  */
 export function getModuleInstance(): SDKInstance | null {
-  return instance;
+  return getGlobalInstance();
+}
+
+export function getTraceparent(): string | null {
+  return getGlobalInstance()?.als.formatTraceparent() ?? null;
+}
+
+export function getTraceHeaders(): TraceHeaders | null {
+  return getGlobalInstance()?.getTraceHeaders() ?? null;
 }

@@ -1,8 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { resolveConfig } from '../../src/config';
+import {
+  resolveConfig,
+  detectServerlessEnvironment,
+  __resetLegacyInsecureTransportWarning
+} from '../../src/config';
+import { defaultPolicy } from '../../src/scrubber/policy';
 import type {
   ErrorInfo,
   ErrorPackage,
@@ -31,14 +36,30 @@ describe('resolveConfig', () => {
         'content-type',
         'content-length',
         'accept',
+        'accept-encoding',
         'user-agent',
         'x-request-id',
         'x-correlation-id',
-        'host'
+        'host',
+        'traceparent',
+        'tracestate',
+        'idempotency-key',
+        'x-idempotency-key',
+        'etag',
+        'if-match',
+        'if-none-match',
+        'if-modified-since',
+        'if-unmodified-since',
+        'range',
+        'content-range',
+        'vary',
+        'retry-after',
+        'cache-control'
       ],
       headerBlocklist: [
-        /authorization|cookie|set-cookie|x-api-key|x-auth-token/i,
-        /auth|token|key|secret|password|credential/i
+        /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key|x-auth-token|x-access-token|x-refresh-token|x-csrf-token|x-secret-token)$/i,
+        /\b(api|auth|access|secret|session|bearer|private|client|refresh)[-_]?(key|token|secret|password)\b/i,
+        /\b(passwords?|passwd|credentials?)\b/i
       ],
       envAllowlist: [
         'NODE_ENV',
@@ -67,9 +88,15 @@ describe('resolveConfig', () => {
         'IMAGE_TAG',
         'REPLICA_SET'
       ],
-      envBlocklist: [/key|secret|token|password|credential|auth|private/i],
+      envBlocklist: [/key|secret|token|password|passcode|passphrase|passwd|credential|auth|private/i],
       encryptionKey: undefined,
-      allowUnencrypted: false,
+      macKey: undefined,
+      encryptionKeyCallback: undefined,
+      previousEncryptionKeys: [],
+      previousTransportAuthorizations: [],
+      allowUnencrypted: true, // set explicitly by resolveTestConfig
+      allowProductionPlaintext: false,
+      hardCapBytes: 1_048_576,
       transport: { type: 'stdout' },
       captureLocalVariables: false,
       captureDbBindParams: false,
@@ -85,6 +112,7 @@ describe('resolveConfig', () => {
       ],
       piiScrubber: undefined,
       replaceDefaultScrubber: false,
+      scrubberPolicy: defaultPolicy,
       serialization: {
         maxDepth: 8,
         maxArrayItems: 20,
@@ -99,10 +127,118 @@ describe('resolveConfig', () => {
       uncaughtExceptionExitDelayMs: 1500,
       allowPlainHttpTransport: false,
       allowInvalidCollectorCertificates: false,
-      allowInsecureTransport: false,
+      deadLetterPath: undefined,
+      deadLetterMaxBytes: 50 * 1024 * 1024,
+      deadLetterMaxBackups: 5,
       maxDrainOnStartup: 100,
-      useWorkerAssembly: false
+      useWorkerAssembly: true,
+      flushIntervalMs: 5000,
+      resolveSourceMaps: true,
+      serverless: false,
+      payloadSpool: {
+        enabled: true,
+        globalMaxBytes: 64 * 1024 * 1024,
+        perRequestMaxBytes: 2 * 1024 * 1024,
+        perBlobMaxBytes: 512 * 1024,
+        previewBytes: 8 * 1024,
+        completedTtlMs: 60000
+      },
+      onInternalWarning: undefined,
+      drivers: {},
+      silent: false,
+      logLevel: 'warn',
+      sourceMapSyncThresholdBytes: 2 * 1024 * 1024,
+      captureMiddlewareStatusCodes: 'none',
+      traceContext: { vendorKey: 'ec' },
+      stateTracking: { captureWrites: true, maxWritesPerContext: 50 },
+      service: 'errorcore',
+      deploymentEnv: undefined
     });
+  });
+
+  it('accepts user overrides for traceContext.vendorKey and stateTracking', () => {
+    const resolved = resolveTestConfig({
+      traceContext: { vendorKey: 'errorcore' },
+      stateTracking: { captureWrites: false, maxWritesPerContext: 100 }
+    });
+    expect(resolved.traceContext).toEqual({ vendorKey: 'errorcore' });
+    expect(resolved.stateTracking).toEqual({
+      captureWrites: false,
+      maxWritesPerContext: 100
+    });
+  });
+
+  it('accepts scrubberPolicy overrides', () => {
+    const detector = (value: unknown) => value === 'pii';
+    const credentialNames = /private/i;
+    const resolved = resolveTestConfig({
+      scrubberPolicy: {
+        credentialNames,
+        piiDetectors: [detector],
+        maxKeys: 4,
+        spoolBytes: 16,
+        maxField: 128
+      }
+    });
+
+    expect(resolved.scrubberPolicy).toEqual({
+      credentialNames,
+      piiDetectors: [detector],
+      maxKeys: 4,
+      spoolBytes: 16,
+      maxField: 128
+    });
+  });
+
+  it('rejects invalid scrubberPolicy values', () => {
+    expect(() =>
+      resolveTestConfig({ scrubberPolicy: { credentialNames: 'private' as never } })
+    ).toThrow('scrubberPolicy.credentialNames must be a RegExp');
+    expect(() =>
+      resolveTestConfig({ scrubberPolicy: { piiDetectors: [true as never] } })
+    ).toThrow('scrubberPolicy.piiDetectors must be an array of functions');
+    expect(() =>
+      resolveTestConfig({ scrubberPolicy: { maxKeys: 0 } })
+    ).toThrow('scrubberPolicy.maxKeys must be a positive integer');
+  });
+
+  it('rejects invalid traceContext.vendorKey', () => {
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'EC' } })
+    ).toThrow('traceContext.vendorKey must match');
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: '' } })
+    ).toThrow('traceContext.vendorKey must match');
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'has space' } })
+    ).toThrow('traceContext.vendorKey must match');
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'a'.repeat(257) } })
+    ).toThrow('traceContext.vendorKey must match');
+    // Valid: lowercase, digits, hyphen, underscore, asterisk, slash
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'errorcore' } })
+    ).not.toThrow();
+    expect(() =>
+      resolveTestConfig({ traceContext: { vendorKey: 'a-b_c*d/e' } })
+    ).not.toThrow();
+  });
+
+  it('rejects invalid stateTracking config', () => {
+    expect(() =>
+      // @ts-expect-error runtime validation
+      resolveTestConfig({ stateTracking: { captureWrites: 'yes' } })
+    ).toThrow('stateTracking.captureWrites must be a boolean');
+    expect(() =>
+      resolveTestConfig({ stateTracking: { maxWritesPerContext: -1 } })
+    ).toThrow('stateTracking.maxWritesPerContext');
+    expect(() =>
+      resolveTestConfig({ stateTracking: { maxWritesPerContext: 1.5 } })
+    ).toThrow('stateTracking.maxWritesPerContext');
+    // 0 is valid (caps writes off entirely while keeping captureWrites=true)
+    expect(() =>
+      resolveTestConfig({ stateTracking: { maxWritesPerContext: 0 } })
+    ).not.toThrow();
   });
 
   it('merges user config over defaults', () => {
@@ -160,9 +296,24 @@ describe('resolveConfig', () => {
     expect(() => resolveTestConfig({ encryptionKey: 'zz' + 'a'.repeat(62) })).toThrow(
       'encryptionKey must be a 64-character hex string'
     );
+    const validKey = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2';
     expect(() =>
-      resolveTestConfig({ encryptionKey: 'ab'.repeat(32) })
+      resolveTestConfig({ encryptionKey: validKey })
     ).not.toThrow();
+  });
+
+  it('rejects low-diversity encryptionKey', () => {
+    expect(() => resolveTestConfig({ encryptionKey: '0'.repeat(64) })).toThrow(
+      'insufficient character diversity'
+    );
+    expect(() => resolveTestConfig({ encryptionKey: 'a'.repeat(64) })).toThrow(
+      'insufficient character diversity'
+    );
+    expect(() => resolveTestConfig({ encryptionKey: 'ab'.repeat(32) })).toThrow(
+      'insufficient character diversity'
+    );
+    const randomKey = require('node:crypto').randomBytes(32).toString('hex');
+    expect(() => resolveTestConfig({ encryptionKey: randomKey })).not.toThrow();
   });
 
   it('rejects non-function piiScrubber', () => {
@@ -214,6 +365,16 @@ describe('resolveConfig', () => {
     ).toBe(true);
   });
 
+  it('blocks PASS-style environment names by default', () => {
+    const resolved = resolveTestConfig();
+
+    for (const name of ['PASSWORD', 'PASSCODE', 'PASSPHRASE', 'PASSWD']) {
+      expect(
+        resolved.envBlocklist.some((pattern) => pattern.test(name))
+      ).toBe(true);
+    }
+  });
+
   it('ignores unknown keys', () => {
     const resolved = resolveTestConfig({
       bufferSize: 250,
@@ -233,12 +394,74 @@ describe('resolveConfig', () => {
         authorization: 'Bearer secret-token'
       }
     });
-    expect(resolved.transport).toEqual({ type: 'http', url: 'https://example.com/collect' });
+    expect(resolved.transport).toEqual({
+      type: 'http',
+      url: 'https://example.com/collect',
+      protocol: 'auto'
+    });
     expect(JSON.stringify(resolved)).not.toContain('secret-token');
   });
 
-  it('requires transport to be configured explicitly in all environments', () => {
-    expect(() => resolveConfig({})).toThrow('transport must be configured explicitly');
+  it('accepts webhook transport and resolves batching defaults', () => {
+    const resolved = resolveTestConfig({
+      transport: {
+        type: 'webhook',
+        url: 'https://example.com/errorcore',
+        secret: 'webhook-secret'
+      }
+    });
+
+    expect(resolved.transport).toEqual({
+      type: 'webhook',
+      url: 'https://example.com/errorcore',
+      batchSize: 100,
+      maxDelayMs: 10_000,
+      retries: 5,
+      timeoutMs: 5_000,
+      maxBufferEvents: 1_000,
+      storePath: path.join(process.cwd(), '.errorcore', 'events.ndjson'),
+      retainOnAck: true
+    });
+    expect(JSON.stringify(resolved)).not.toContain('webhook-secret');
+  });
+
+  it('validates webhook URL and numeric knobs', () => {
+    expect(() =>
+      resolveTestConfig({
+        transport: { type: 'webhook', url: 'http://example.com/hook' }
+      })
+    ).toThrow('Webhook transport requires an https:// URL');
+
+    expect(() =>
+      resolveTestConfig({
+        transport: {
+          type: 'webhook',
+          url: 'https://example.com/hook',
+          batchSize: 0
+        }
+      })
+    ).toThrow('transport.batchSize must be a positive integer');
+  });
+
+  it('requires transport to be configured explicitly in production', () => {
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      expect(() => resolveConfig({})).toThrow('transport must be configured explicitly');
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
+  });
+
+  it('defaults to stdout transport in non-production', () => {
+    const prev = process.env.NODE_ENV;
+    delete process.env.NODE_ENV;
+    try {
+      const resolved = resolveConfig({});
+      expect(resolved.transport).toEqual({ type: 'stdout' });
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
   });
 
   it('uses the split HTTP transport flags', () => {
@@ -256,9 +479,45 @@ describe('resolveConfig', () => {
       })
     ).toMatchObject({
       allowPlainHttpTransport: true,
-      allowInvalidCollectorCertificates: true,
-      allowInsecureTransport: true
+      allowInvalidCollectorCertificates: true
     });
+  });
+
+  it('defaults allowUnencrypted to !isProduction() so zero-config dev works', () => {
+    // Mirrors the transport default on the same code path: NODE_ENV !==
+    // 'production' gets stdout + plaintext, NODE_ENV === 'production'
+    // requires an explicit encryptionKey. Any divergence from the transport
+    // default breaks the README's documented zero-config dev contract.
+    const cases: Array<[string | undefined, boolean]> = [
+      ['production', false],
+      ['prod', true],
+      ['PRODUCTION', true],
+      ['development', true],
+      [undefined, true],
+    ];
+    for (const [value, expected] of cases) {
+      const prev = process.env.NODE_ENV;
+      if (value === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = value;
+      }
+      try {
+        const resolved = resolveConfig({ transport: { type: 'stdout' } });
+        expect(resolved.allowUnencrypted).toBe(expected);
+      } finally {
+        process.env.NODE_ENV = prev;
+      }
+    }
+  });
+
+  it('rejects low-diversity encryption keys that previously scraped by with entropy >= 2', () => {
+    // Four distinct hex chars equally distributed scores entropy 2.0, which
+    // passed the old threshold but is clearly not a random key.
+    const weakFourChar = '0123'.repeat(16);
+    expect(() => resolveTestConfig({ encryptionKey: weakFourChar })).toThrow(
+      'insufficient character diversity'
+    );
   });
 
   it('ships a production-oriented config template', () => {
@@ -267,13 +526,17 @@ describe('resolveConfig', () => {
       'utf8'
     );
 
-    expect(template).toContain('allowUnencrypted: false');
+    expect(template).toContain('allowUnencrypted: true');
     expect(template).toContain('allowPlainHttpTransport: false');
     expect(template).toContain('allowInvalidCollectorCertificates: false');
     expect(template).not.toContain("'multipart/form-data'");
     expect(template).not.toMatch(/^\s*transport:\s*\{\s*type:\s*'stdout'/m);
     expect(template).toContain('captureRequestBodies: false');
     expect(template).toContain('captureResponseBodies: false');
+    expect(template).not.toMatch(/^\s*headerAllowlist:\s*\[/m);
+    expect(template).not.toMatch(/^\s*headerBlocklist:\s*\[/m);
+    expect(template).toContain('deadLetterMaxBytes: 50 * 1024 * 1024');
+    expect(template).toContain('previousTransportAuthorizations: []');
   });
 
   it('maps legacy captureBody to both request and response capture for compatibility', () => {
@@ -296,6 +559,50 @@ describe('resolveConfig', () => {
     expect(resolved.captureBody).toBe(false);
     expect(resolved.captureRequestBodies).toBe(true);
     expect(resolved.captureResponseBodies).toBe(false);
+  });
+
+  it('does not treat generic AWS execution environments as Lambda serverless', () => {
+    const previousAwsExecutionEnv = process.env.AWS_EXECUTION_ENV;
+    const previousAwsLambdaFunctionName = process.env.AWS_LAMBDA_FUNCTION_NAME;
+    try {
+      process.env.AWS_EXECUTION_ENV = 'AWS_ECS_FARGATE';
+      delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+
+      expect(detectServerlessEnvironment()).toBe(false);
+    } finally {
+      if (previousAwsExecutionEnv === undefined) {
+        delete process.env.AWS_EXECUTION_ENV;
+      } else {
+        process.env.AWS_EXECUTION_ENV = previousAwsExecutionEnv;
+      }
+      if (previousAwsLambdaFunctionName === undefined) {
+        delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+      } else {
+        process.env.AWS_LAMBDA_FUNCTION_NAME = previousAwsLambdaFunctionName;
+      }
+    }
+  });
+
+  it('treats Lambda-shaped AWS execution environments as serverless', () => {
+    const previousAwsExecutionEnv = process.env.AWS_EXECUTION_ENV;
+    const previousAwsLambdaFunctionName = process.env.AWS_LAMBDA_FUNCTION_NAME;
+    try {
+      process.env.AWS_EXECUTION_ENV = 'AWS_Lambda_nodejs20.x';
+      delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+
+      expect(detectServerlessEnvironment()).toBe(true);
+    } finally {
+      if (previousAwsExecutionEnv === undefined) {
+        delete process.env.AWS_EXECUTION_ENV;
+      } else {
+        process.env.AWS_EXECUTION_ENV = previousAwsExecutionEnv;
+      }
+      if (previousAwsLambdaFunctionName === undefined) {
+        delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+      } else {
+        process.env.AWS_LAMBDA_FUNCTION_NAME = previousAwsLambdaFunctionName;
+      }
+    }
   });
 });
 
@@ -375,7 +682,7 @@ describe('type exports', () => {
     };
     const resolved: ResolvedConfig = resolveTestConfig();
     const errorPackage: ErrorPackage = {
-      schemaVersion: '1.0.0',
+      schemaVersion: '1.1.0',
       capturedAt: '2026-01-01T00:00:00.000Z',
       error: {
         type: errorInfo.type,
@@ -410,8 +717,298 @@ describe('type exports', () => {
     expect(transportConfig.type).toBe('stdout');
     expect(requestSummary.requestId).toBe('req-1');
     expect(processMetadata.pid).toBe(1);
-    expect(errorPackage.schemaVersion).toBe('1.0.0');
+    expect(errorPackage.schemaVersion).toBe('1.1.0');
     expect(limits.maxPayloadSize).toBe(1024);
     expect(resolved.transport.type).toBe('stdout');
+  });
+});
+
+describe('0.2.0 config surface', () => {
+  it('accepts drivers with per-driver references', () => {
+    const fakePg = { Client: { prototype: {} } };
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      drivers: { pg: fakePg }
+    });
+    expect(resolved.drivers.pg).toBe(fakePg);
+    expect(resolved.drivers.mongodb).toBeUndefined();
+  });
+
+  it('defaults drivers to empty object when omitted', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(resolved.drivers).toEqual({});
+  });
+
+  it('defaults silent=false, sourceMapSyncThresholdBytes=2MB, captureMiddlewareStatusCodes=none', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(resolved.silent).toBe(false);
+    expect(resolved.sourceMapSyncThresholdBytes).toBe(2 * 1024 * 1024);
+    expect(resolved.captureMiddlewareStatusCodes).toBe('none');
+  });
+
+  it('accepts captureMiddlewareStatusCodes as all, none, or integer array', () => {
+    const all = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: 'all' });
+    const none = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: 'none' });
+    const arr = resolveConfig({ transport: { type: 'stdout' }, allowUnencrypted: true, captureMiddlewareStatusCodes: [401, 500] });
+    expect(all.captureMiddlewareStatusCodes).toBe('all');
+    expect(none.captureMiddlewareStatusCodes).toBe('none');
+    expect(arr.captureMiddlewareStatusCodes).toEqual([401, 500]);
+  });
+
+  it('rejects non-integer or out-of-range captureMiddlewareStatusCodes entries', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: [401, 99]
+    })).toThrow(/captureMiddlewareStatusCodes/);
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: [401, 600]
+    })).toThrow(/captureMiddlewareStatusCodes/);
+  });
+
+  it('rejects captureMiddlewareStatusCodes when not string-union or array', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMiddlewareStatusCodes: 401 as never
+    })).toThrow(/captureMiddlewareStatusCodes/);
+  });
+
+  it('accepts DLQ size/backups and previous transport authorization config', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      deadLetterMaxBytes: 12 * 1024 * 1024,
+      deadLetterMaxBackups: 7,
+      previousTransportAuthorizations: ['Bearer old-token', 'Bearer older-token']
+    });
+
+    expect(resolved.deadLetterMaxBytes).toBe(12 * 1024 * 1024);
+    expect(resolved.deadLetterMaxBackups).toBe(7);
+    expect(resolved.previousTransportAuthorizations).toEqual([
+      'Bearer old-token',
+      'Bearer older-token'
+    ]);
+  });
+
+  it('rejects invalid DLQ and previous transport authorization config', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        deadLetterMaxBytes: 0
+      })
+    ).toThrow(/deadLetterMaxBytes/);
+
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        deadLetterMaxBackups: -1
+      })
+    ).toThrow(/deadLetterMaxBackups/);
+
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        previousTransportAuthorizations: [42]
+      } as never)
+    ).toThrow(/previousTransportAuthorizations/);
+  });
+});
+
+describe('G4 — allowInsecureTransport semantics', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    __resetLegacyInsecureTransportWarning();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('accepts allowInsecureTransport: false as a no-op with a one-shot warn', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: false
+    } as never)).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/allowInsecureTransport.*deprecated/i);
+
+    resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: false
+    } as never);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects allowInsecureTransport: true with actionable error', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: true
+    } as never)).toThrow(/allowPlainHttpTransport/);
+  });
+
+  it('rejects allowInsecureTransport: true + allowPlainHttpTransport: false as contradiction', () => {
+    expect(() => resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      allowInsecureTransport: true,
+      allowPlainHttpTransport: false
+    } as never)).toThrow(/contradiction/i);
+  });
+
+  it('absence of allowInsecureTransport does not warn', () => {
+    resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Completeness schema — 0.2.0 additions', () => {
+  it('Completeness accepts new optional fields without breaking existing consumers', () => {
+    const c: import('../../src/types').Completeness = {
+      requestCaptured: true,
+      requestBodyTruncated: false,
+      ioTimelineCaptured: true,
+      usedAmbientEvents: false,
+      ioEventsDropped: 0,
+      ioPayloadsTruncated: 0,
+      alsContextAvailable: true,
+      localVariablesCaptured: true,
+      localVariablesTruncated: false,
+      stateTrackingEnabled: false,
+      stateReadsCaptured: false,
+      concurrentRequestsCaptured: true,
+      piiScrubbed: true,
+      encrypted: false,
+      captureFailures: [],
+      localVariablesCaptureLayer: 'tag',
+      localVariablesDegradation: 'exact',
+      localVariablesFrameAlignment: 'full',
+      sourceMapResolution: {
+        framesResolved: 3,
+        framesUnresolved: 0,
+        cacheHits: 3,
+        cacheMisses: 0,
+        missing: 0,
+        corrupt: 0,
+        evictions: 0
+      }
+    };
+    expect(c.localVariablesCaptureLayer).toBe('tag');
+    expect(c.sourceMapResolution?.framesResolved).toBe(3);
+  });
+});
+
+describe('logLevel resolution', () => {
+  it("defaults to 'warn'", () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+    });
+    expect(resolved.logLevel).toBe('warn');
+  });
+
+  it('accepts every documented value', () => {
+    for (const level of ['silent', 'error', 'warn', 'info', 'debug'] as const) {
+      const resolved = resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        logLevel: level,
+      });
+      expect(resolved.logLevel).toBe(level);
+    }
+  });
+
+  it('rejects unknown values', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        // @ts-expect-error testing runtime validation
+        logLevel: 'verbose',
+      })
+    ).toThrow(/logLevel/);
+  });
+});
+
+describe('previousEncryptionKeys resolution', () => {
+  const PRIMARY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const PREV1   = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
+  const PREV2   = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0';
+
+  it('defaults to empty array when not provided', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+    });
+    expect(resolved.previousEncryptionKeys).toEqual([]);
+  });
+
+  it('accepts a list of hex keys and preserves order', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      encryptionKey: PRIMARY,
+      previousEncryptionKeys: [PREV1, PREV2],
+    });
+    expect(resolved.previousEncryptionKeys).toEqual([PREV1, PREV2]);
+  });
+
+  it('rejects entries that are not 64-hex', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: ['not-hex'],
+      })
+    ).toThrow(/previousEncryptionKeys/);
+  });
+
+  it('rejects low-entropy entries', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: ['0'.repeat(64)],
+      })
+    ).toThrow(/insufficient character diversity/);
+  });
+
+  it('rejects an entry equal to the primary key', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: [PRIMARY],
+      })
+    ).toThrow(/must not include the primary key/);
+  });
+
+  it('rejects more than 5 entries', () => {
+    expect(() =>
+      resolveConfig({
+        transport: { type: 'stdout' },
+        encryptionKey: PRIMARY,
+        previousEncryptionKeys: [PREV1, PREV2, PREV1.replace('f', 'e'), PREV2.replace('0', '1'), PRIMARY.replace('0', '2'), PRIMARY.replace('0', '3')],
+      })
+    ).toThrow(/at most 5/);
   });
 });

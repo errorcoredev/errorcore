@@ -1,9 +1,10 @@
 # Module 13: Error Capture Pipeline
 
 > **Spec status:** LOCKED
-> **Source files:** `src/capture/error-capturer.ts`, `src/capture/process-metadata.ts`, `src/capture/package-builder.ts`
-> **Dependencies:** Modules 01, 02, 03, 04, 05, 06, 12
+> **Source files:** `src/capture/error-capturer.ts`, `src/capture/process-metadata.ts`, `src/capture/package-builder.ts`, `src/capture/source-map-resolver.ts`
+> **Dependencies:** Modules 01, 02, 03, 04, 05, 06, 12, 19 (EventClock), 20 (universal stamping)
 > **Build order position:** 13
+> **Schema version contributed to:** 1.1.0
 
 ---
 
@@ -121,6 +122,12 @@ class PackageBuilder {
 ### ErrorCapturer.capture() sequence — 500ms budget
 
 ```
+0. Stamp at entry (module 20)
+   errorEventSeq = eventClock.tick()
+   errorEventHrtimeNs = process.hrtime.bigint()
+   These are taken BEFORE rate-limit / serialization so all later events
+   stamp with strictly greater seq values.
+
 1. Rate limit check
    rateLimiter.tryAcquire() -> if false: return null
 
@@ -202,15 +209,18 @@ function serializeError(error: Error, depth: number = 0): ErrorInfo {
 ### PackageBuilder.build
 
 1. Assemble all parts into `ErrorPackage` schema
-2. Run PII scrubber on the entire package: `scrubber.scrubObject(package)`
-3. Compute completeness flags based on what data is present/absent
-4. Final size check: `JSON.stringify(package).length` vs `maxTotalPackageSize`
-5. If too large, progressively shed data:
+2. Compute `eventClockRange = { min, max }` over the union of `errorEventSeq` plus all stamped seqs in `ioTimeline`, `stateReads`, `stateWrites` (module 20). Use a loop, not `Math.min(...arr)` — large arrays may stack-overflow.
+3. Set `schemaVersion: '1.1.0'`. `capturedAt` remains a per-package ISO timestamp.
+4. Surface `parts.completenessOverflow.stateWritesDropped` (if present) into `Completeness.stateWritesDropped` (module 22).
+5. Run PII scrubber on the entire package: `scrubber.scrubObject(package)`
+6. Compute completeness flags based on what data is present/absent
+7. Final size check: `JSON.stringify(package).length` vs `maxTotalPackageSize`
+8. If too large, progressively shed data:
    a. Truncate I/O event bodies (largest first)
    b. Drop ambient I/O events (keep only failing request's timeline)
-   c. Drop state reads
+   c. Drop state reads (and state writes — same priority)
    d. Update completeness flags
-6. Return the final package
+9. Return the final package
 
 ---
 
@@ -271,3 +281,91 @@ function serializeError(error: Error, depth: number = 0): ErrorInfo {
 - PII scrubbing applied to entire package.
 - Progressive shedding keeps package under size limit.
 - All unit tests pass.
+
+---
+
+## 0.2.0 Additions
+
+### Source-map resolve-path sync-on-miss contract (G3)
+
+**Root cause.** `SourceMapResolver.warmCache()` walks `require.cache` at init. In Next.js, app routes don't enter `require.cache` until their first request (lazy-load), so warm-at-init misses them entirely. On first-error, `resolveStack` hits a cache miss and schedules async warm via `setImmediate` — the stack returned by the *current* resolve call is still unresolved. Second error in same file: cache populated, resolved. This produced the observed behavior: first trace in `.next/server/…/route.js:1:2486`, later trace in `webpack://blubeez/app/…/route.ts:79:21`.
+
+**Fix — sync-on-miss with size gate.** In `resolveStack`, on cache miss, check the candidate map's file size first (a `stat` call):
+
+- If size ≤ `sourceMapSyncThresholdBytes` (default 2 MB) → synchronous `getConsumer(filePath)`. One-time disk read + `JSON.parse` + `new SourceMapConsumer` per new file.
+- If size > threshold (or size unknown) → do NOT block. Call `scheduleWarm(filePath)` as before, flag the frame with `locals: source_map_async_pending`, leave the frame in bundled form for this capture. Subsequent captures pick up the resolved consumer.
+
+`resolveStackCacheOnly` stays cache-only and is used on the three paths that genuinely cannot afford blocking:
+- `uncaughtException` (Node is about to terminate)
+- `SIGTERM` shutdown capture
+- `unhandledRejection`-at-exit
+
+The `MAX_CACHE_SIZE` constant is raised from 50 to 128. Rationale: a medium Next.js app has 100–300 compiled server chunks; 50 churns aggressively and undoes resolution gains. 256 is too generous because `SourceMapConsumer` holds 5–20 MB of parsed mappings per entry in the pathological case. 128 is the count-based proxy pending a byte-size budget.
+
+### Three-state cache (G3)
+
+Replace `Map<string, CachedConsumer | null>` with an explicit three-state type:
+
+```ts
+type CacheEntry =
+  | { type: 'consumer'; consumer: SourceMapConsumer; usedAt: number }
+  | { type: 'missing'; cachedAt: number }
+  | { type: 'corrupt'; reason: string; cachedAt: number };
+```
+
+Semantics:
+- `consumer` — happy path
+- `missing` — no map file exists (adjacent `.map`, `sourceMappingURL`, nothing found). Prevents re-reading filesystem on every subsequent error for the same miss.
+- `corrupt` — map existed but `JSON.parse` or `new SourceMapConsumer` threw. Reason preserved for telemetry. Prevents per-error parse storm on the same broken map.
+
+**TTL for negative entries.** `missing` and `corrupt` entries expire after **1 hour** to survive re-deploys where the user pushed a fixed build without restarting the observer process. `consumer` entries do not expire by TTL; they are evicted by LRU when the cache reaches `MAX_CACHE_SIZE = 128`.
+
+### Source-map telemetry (G3)
+
+New field on `Completeness`:
+
+```ts
+sourceMapResolution?: {
+  framesResolved: number;       // count of frames that got source-mapped
+  framesUnresolved: number;     // count that stayed as bundled positions
+  cacheHits: number;
+  cacheMisses: number;          // misses that triggered a sync load
+  missing: number;              // entries where no map exists
+  corrupt: number;              // entries where parse failed
+  evictions: number;            // entries LRU-evicted during this capture
+};
+```
+
+### Sync-on-miss safety invariant
+
+`getConsumer(filePath)` on the sync path MUST NOT yield the event loop between read, parse, and cache-set. No `await`, no `.then()`, no Promise creation. Under single-threaded JS execution, a second caller with the same `filePath` during the sync call is impossible — there is no concurrency to dedup against. If a future refactor introduces any microtask boundary, replace with an in-flight `Map<string, Promise<CacheEntry>>` dedup table.
+
+### New config field
+
+`sourceMapSyncThresholdBytes: number` (default `2_097_152`, i.e., 2 MB). Setting to `0` forces fully async behavior (matches pre-0.2.0 semantics, for users who prefer the cascade-safe option unconditionally). Available as `config.sourceMapSyncThresholdBytes`; plumbed through `sdk.ts` to the resolver constructor.
+
+---
+
+## 1.1.0 Additions
+
+### Stamping at capture entry (module 20)
+
+Before any work in `ErrorCapturer.capture()`, stamp `errorEventSeq = eventClock.tick()` and `errorEventHrtimeNs = process.hrtime.bigint()`. These flow through `ErrorPackageParts` into the shipped package and become the authoritative ordering anchor for the error itself.
+
+`PackageBuilder.build()` adds three new top-level fields to `ErrorPackage`:
+
+- `errorEventSeq: number`
+- `errorEventHrtimeNs: string` (bigint serialized)
+- `eventClockRange: { min: number; max: number }` — computed over the union of `errorEventSeq`, all `ioTimeline[].seq`, all `stateReads[].seq`, all `stateWrites[].seq`.
+
+If the package has no events beyond the error itself, `eventClockRange = { min: errorEventSeq, max: errorEventSeq }`.
+
+The package also gains `stateWrites: StateWriteSerialized[]` (module 22) and `trace.tracestate?: string` (module 21 — the inbound header verbatim at capture time, NOT the egress version).
+
+Wall-clock policy: `capturedAt` (per-package ISO) stays. `LocalsCacheEntry.createdAt` (per-pause `Date.now()`) is internal and not shipped. No NEW per-event `Date.now()` call sites are introduced.
+
+### Sourcemap fast-path
+
+When `process.execArgv` includes `--enable-source-maps` or `process.env.NODE_OPTIONS` contains it, V8 already resolves source maps; `SourceMapResolver.resolveStack` short-circuits to a no-op (telemetry zeros). The detection runs once at resolver construction.
+
+The `warmCache` extension filter is extended to include `.cjs` alongside `.js` and `.mjs`. `resolveStackCacheOnly` is unchanged.

@@ -1,0 +1,44 @@
+{
+    "phase":  "03-app-a",
+    "timestamp":  "2026-06-01T21:40:04.2907023+05:30",
+    "repo":  "https://github.com/cirosantilli/node-express-sequelize-realworld-example-app",
+    "repoSha":  "5a7dd08ca8333f0a34357df9f86d7b506f610ed9",
+    "dependencyVerification":  {
+                                   "express":  "4.13.4",
+                                   "sequelize":  "6.5.1",
+                                   "pg":  "8.5.1 present via npm ls pg",
+                                   "prisma":  "absent; npm ls prisma @prisma/client returned empty with exit 1"
+                               },
+    "sdkTarball":  "C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\errorcore-0.2.0.tgz",
+    "sdkTarballSha256":  "2d007649ec7bca66e2e6373b7a897ce4c2efcbc8391ce100334fe1c649db1908",
+    "productionBuild":  {
+                            "entry":  "server.instrumented.js",
+                            "bundle":  "harness/apps/conduit-api/dist/server.js",
+                            "sourceMap":  "harness/apps/conduit-api/dist/server.js.map",
+                            "dockerBundle":  "/app/dist/server.js",
+                            "esbuild":  "0.25.12",
+                            "minifiedCheck":  "at least one line \u003e500 chars; single-letter identifier grep matched"
+                        },
+    "instrumentation":  {
+                            "init":  "errorcore.init in errorcore-bootstrap.js before app modules load through server.instrumented.js",
+                            "middleware":  "app.use(expressMiddleware()) mounted before app routes/body parser",
+                            "transport":  "/captures/conduit-api/events.ndjson file transport",
+                            "routeAround":  "/api/tags async handler intentionally leaves DB/enrich rejections unhandled; no synthetic throw or capture API call"
+                        },
+    "firstNaturalFault":  {
+                              "fault":  "postgres-proxy disabled via toxiproxy-cli toggle; GET /api/tags issued",
+                              "observedRequestResult":  "connection closed unexpectedly; container exited with unhandled rejection",
+                              "captureFile":  "C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\captures\\conduit-api\\events.ndjson",
+                              "captureCount":  1,
+                              "firstCapturedService":  "conduit-api",
+                              "firstCapturedErrorType":  "eT",
+                              "firstCapturedErrorMessage":  "connect ECONNREFUSED 172.19.0.3:15432",
+                              "firstCapturedHasRequest":  true,
+                              "firstCapturedIoEvents":  2
+                          },
+    "rawCaptures":  {
+                        "path":  "C:\\Users\\harin\\Downloads\\errorcore\\ec-master\\harness\\captures\\conduit-api\\events.ndjson",
+                        "bytes":  7886,
+                        "sha256":  "6092d42ada112609eb4f7106a90a25c03fcc4f42bf6edcbb5d5de0139f2c162c"
+                    }
+}
