@@ -1,0 +1,134 @@
+{
+  "name": "errorcore",
+  "version": "0.3.0",
+  "description": "Lightweight error monitoring SDK for Node.js. Captures errors with I/O context, optional local variables, and request metadata",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./nextjs": {
+      "types": "./dist/integrations/nextjs/index.d.ts",
+      "edge-light": "./dist/integrations/nextjs/edge.mjs",
+      "workerd": "./dist/integrations/nextjs/edge.mjs",
+      "browser": "./dist/integrations/nextjs/edge.mjs",
+      "require": "./dist/integrations/nextjs/index.js",
+      "import": "./dist/integrations/nextjs/index.js",
+      "default": "./dist/integrations/nextjs/index.js"
+    },
+    "./hono": {
+      "types": "./dist/integrations/hono/index.d.ts",
+      "require": "./dist/integrations/hono/index.js",
+      "import": "./dist/integrations/hono/index.js",
+      "default": "./dist/integrations/hono/index.js"
+    },
+    "./ingest": {
+      "types": "./dist/ingest/index.d.ts",
+      "require": "./dist/ingest/index.js",
+      "import": "./dist/ingest/index.js",
+      "default": "./dist/ingest/index.js"
+    },
+    "./pii/scrubber": {
+      "types": "./dist/pii/scrubber.d.ts",
+      "require": "./dist/pii/scrubber.js",
+      "import": "./dist/pii/scrubber.js",
+      "default": "./dist/pii/scrubber.js"
+    }
+  },
+  "keywords": [
+    "error",
+    "monitoring",
+    "error-tracking",
+    "debugging",
+    "observability",
+    "node"
+  ],
+  "bin": {
+    "errorcore": "bin/errorcore.js",
+    "ecd": "bin/errorcore.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.mjs",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.mts",
+    "dist/**/*.d.ts.map",
+    "dist/**/*.d.mts.map",
+    "bin",
+    "config-template"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/errorcoredev/errorcore.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "node scripts/lint-release-markers.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "test:benchmark": "node scripts/run-benchmark-tests.js",
+    "audit:release": "npm audit --audit-level=high",
+    "verify:edge-stub": "node scripts/verify-edge-stub.js",
+    "verify:package": "node scripts/verify-package.js",
+    "verify:release": "npm run lint && npm run typecheck && npm run build && npm run test && npm run coverage && npm run verify:edge-stub && npm run verify:package && npm run test:benchmark && npm run audit:release",
+    "prepublishOnly": "npm run verify:release",
+    "prepare:nextjs-smoke": "node scripts/prepare-nextjs-smoke.js",
+    "smoke:nextjs": "npm run prepare:nextjs-smoke && node test/integration/fixtures/nextjs-smoke/run-smoke.mjs",
+    "smoke:nextjs:dev-memory": "npm run prepare:nextjs-smoke && node test/integration/fixtures/nextjs-smoke/run-dev-memory.mjs",
+    "smoke:nextjs:sourcemaps": "npm run prepare:nextjs-smoke && node test/integration/fixtures/nextjs-smoke/run-smoke.mjs"
+  },
+  "dependencies": {
+    "source-map-js": "1.2.1"
+  },
+  "devDependencies": {
+    "@hono/node-server": "^2.0.0",
+    "@types/node": "^20.19.37",
+    "@vitest/coverage-v8": "4.1.10",
+    "cross-env": "^7.0.3",
+    "hono": "4.12.28",
+    "ioredis": "^5.4.0",
+    "mongodb": "^6.10.0",
+    "mongodb-memory-server": "^10.1.2",
+    "mysql2": "3.22.6",
+    "pg": "8.22.0",
+    "typescript": "^5.9.3",
+    "vitest": "4.1.10"
+  },
+  "peerDependencies": {
+    "@hono/node-server": ">=1",
+    "hono": ">=4",
+    "ioredis": ">=4",
+    "mongodb": ">=5",
+    "mysql2": ">=2",
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "hono": {
+      "optional": true
+    },
+    "@hono/node-server": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    },
+    "mongodb": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    }
+  },
+  "license": "PolyForm-Small-Business-1.0.0"
+}

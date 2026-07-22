@@ -1,0 +1,132 @@
+name: errorcore-validation
+
+services:
+  postgres:
+    image: postgres:16.4-bookworm
+    restart: "no"
+    environment:
+      POSTGRES_DB: conduit
+      POSTGRES_USER: conduit
+      POSTGRES_PASSWORD: conduit
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conduit -d conduit"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.2.5-bookworm
+    restart: "no"
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    restart: "no"
+    command: ["-host=0.0.0.0"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  toxiproxy-init:
+    image: curlimages/curl:8.10.1
+    restart: "no"
+    depends_on:
+      toxiproxy:
+        condition: service_healthy
+    command:
+      [
+        "sh",
+        "-c",
+        "until curl -sf http://toxiproxy:8474/version >/dev/null; do sleep 1; done; for proxy in postgres-proxy redis-proxy enrich-proxy; do curl -sf -X DELETE http://toxiproxy:8474/proxies/$$proxy >/dev/null 2>&1 || true; done; curl -sf -X POST http://toxiproxy:8474/proxies -H 'Content-Type: application/json' -d '{\"name\":\"postgres-proxy\",\"listen\":\"0.0.0.0:15432\",\"upstream\":\"postgres:5432\"}'; curl -sf -X POST http://toxiproxy:8474/proxies -H 'Content-Type: application/json' -d '{\"name\":\"redis-proxy\",\"listen\":\"0.0.0.0:16379\",\"upstream\":\"redis:6379\"}'; curl -sf -X POST http://toxiproxy:8474/proxies -H 'Content-Type: application/json' -d '{\"name\":\"enrich-proxy\",\"listen\":\"0.0.0.0:18080\",\"upstream\":\"enrich-svc:3001\"}'; curl -sf http://toxiproxy:8474/proxies/postgres-proxy >/dev/null; curl -sf http://toxiproxy:8474/proxies/redis-proxy >/dev/null; curl -sf http://toxiproxy:8474/proxies/enrich-proxy >/dev/null"
+      ]
+
+  enrich-svc:
+    build:
+      context: ..
+      dockerfile: infra/enrich-svc.Dockerfile
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+      toxiproxy-init:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      REDIS_URL: redis://toxiproxy:16379/0
+      OTEL_SERVICE_NAME: enrich-svc
+      ERRORCORE_ENVIRONMENT: production-validation
+      ERRORCORE_CAPTURE_PATH: /captures/enrich-svc/events.ndjson
+      ERRORCORE_TRACE_VENDOR_KEY: ec
+      ERRORCORE_DISABLED: ${ERRORCORE_DISABLED:-false}
+      FAKETIME: "-45s"
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1
+    volumes:
+      - ../captures:/captures
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  conduit-api:
+    build:
+      context: ..
+      dockerfile: infra/conduit-api.Dockerfile
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      toxiproxy-init:
+        condition: service_completed_successfully
+      enrich-svc:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: postgres://conduit:conduit@toxiproxy:15432/conduit
+      DB_SSL: "false"
+      DB_POOL_MAX: ${DB_POOL_MAX:-1}
+      DB_POOL_ACQUIRE: ${DB_POOL_ACQUIRE:-500}
+      SECRET: validation-secret
+      OTEL_SERVICE_NAME: conduit-api
+      ERRORCORE_ENVIRONMENT: production-validation
+      ERRORCORE_CAPTURE_PATH: /captures/conduit-api/events.ndjson
+      ERRORCORE_TRACE_VENDOR_KEY: ec
+      ERRORCORE_DISABLED: ${ERRORCORE_DISABLED:-false}
+      ENRICH_URL: http://toxiproxy:18080
+    volumes:
+      - ../captures:/captures
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 30

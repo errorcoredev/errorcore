@@ -1,0 +1,295 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-action:
+        description: Validate only, publish to next, or promote the identical package to latest
+        required: true
+        default: validate
+        type: choice
+        options:
+          - validate
+          - publish-next
+          - promote-latest
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Candidate gates twice from npm ci
+    runs-on: ubuntu-latest
+    env:
+      EC_FORCE_NEXTJS_SMOKE_CI: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Restrict npm mutations to main
+        if: inputs['release-action'] != 'validate' && github.ref != 'refs/heads/main'
+        run: |
+          echo "Publishing and promotion must be dispatched from main." >&2
+          exit 1
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run verify:release
+      - run: npm run smoke:nextjs
+      - run: npm run smoke:nextjs:dev-memory
+      - name: Fresh install for the second pass
+        run: npm ci
+      - run: npm run verify:release
+      - run: npm run smoke:nextjs
+      - run: npm run smoke:nextjs:dev-memory
+      - name: Require a reproducible clean checkout
+        run: test -z "$(git status --porcelain --untracked-files=all)"
+      - id: candidate
+        name: Pack and hash the candidate
+        run: node scripts/release-candidate.js pack release-artifact
+      - name: Verify fresh release consumers from the candidate tarball
+        run: node scripts/verify-published-consumers.js
+      - uses: actions/upload-artifact@v6
+        with:
+          name: errorcore-candidate
+          path: release-artifact/
+          if-no-files-found: error
+          retention-days: 30
+
+  candidate-consumers:
+    name: Exact candidate (${{ matrix.os }}, Node ${{ matrix.node-version }}, ${{ matrix.smoke }})
+    needs: candidate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node-version: 20
+            smoke: next-production
+          - os: ubuntu-latest
+            node-version: 22
+            smoke: next-production
+          - os: ubuntu-latest
+            node-version: 22
+            smoke: next-dev-memory
+          - os: windows-latest
+            node-version: 22
+            smoke: package-consumers
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v6
+        with:
+          name: errorcore-candidate
+          path: release-artifact
+      - run: node scripts/release-candidate.js verify release-artifact
+      - run: node scripts/verify-published-consumers.js
+      - name: Next.js production smoke from exact candidate
+        if: matrix.smoke == 'next-production'
+        run: npm run smoke:nextjs
+      - name: Next.js development-memory smoke from exact candidate
+        if: matrix.smoke == 'next-dev-memory'
+        run: npm run smoke:nextjs:dev-memory
+
+  database-integrations:
+    name: Release database integrations (Linux, Node 22)
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: errorcore
+          MYSQL_DATABASE: errorcore
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -perrorcore"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run every database-driver integration
+        run: npx vitest run test/integration/db-drivers
+        env:
+          EC_MONGODB_URI: mongodb://127.0.0.1:27017
+          EC_INTEGRATION_PG: "1"
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+          EC_INTEGRATION_MYSQL: "1"
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "3306"
+          MYSQL_USER: root
+          MYSQL_PASSWORD: errorcore
+          MYSQL_DATABASE: errorcore
+          EC_INTEGRATION_REDIS: "1"
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: "6379"
+
+  benchmark:
+    name: Benchmark exact candidate (${{ matrix['capture-mode'] }})
+    needs: [candidate, candidate-consumers, database-integrations]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        capture-mode: [safe, balanced, forensic, fast]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v6
+        with:
+          name: errorcore-candidate
+          path: release-artifact
+      - name: Verify the exact candidate
+        run: node scripts/release-candidate.js verify release-artifact
+      - name: Extract the exact candidate
+        run: |
+          mkdir -p .release-candidate/package
+          tar -xzf "$ERRORCORE_CANDIDATE_TARBALL" --strip-components=1 -C .release-candidate/package
+      - name: Record host preflight against the candidate
+        run: node bench/harness/preflight.mjs
+        env:
+          ERRORCORE_PACKAGE_ROOT: ${{ github.workspace }}/.release-candidate/package
+          BENCH_RESULTS_DIR: ${{ github.workspace }}/bench/results-${{ matrix['capture-mode'] }}
+      - name: Run the full benchmark
+        run: >-
+          docker compose
+          -f bench/docker-compose.yml
+          -f bench/docker-compose.capture-mode.yml
+          up --abort-on-container-exit --exit-code-from runner
+        env:
+          BENCH_CANDIDATE_ROOT: /workspace/.release-candidate/package
+          BENCH_ERRORCORE_CAPTURE_MODE: ${{ matrix['capture-mode'] }}
+          BENCH_RESULTS_HOST_DIR: ./results-${{ matrix['capture-mode'] }}
+          BENCH_STRICT_RELEASE: "1"
+      - name: Stop benchmark fixtures
+        if: always()
+        run: >-
+          docker compose
+          -f bench/docker-compose.yml
+          -f bench/docker-compose.capture-mode.yml
+          down --volumes --remove-orphans
+        env:
+          BENCH_ERRORCORE_CAPTURE_MODE: ${{ matrix['capture-mode'] }}
+          BENCH_RESULTS_HOST_DIR: ./results-${{ matrix['capture-mode'] }}
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: benchmark-${{ matrix['capture-mode'] }}
+          path: bench/results-${{ matrix['capture-mode'] }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-next:
+    name: Publish identical candidate to next
+    if: inputs['release-action'] == 'publish-next'
+    needs: [candidate, benchmark]
+    runs-on: ubuntu-latest
+    environment: npm-next
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v6
+        with:
+          name: errorcore-candidate
+          path: release-artifact
+      - run: node scripts/release-candidate.js verify release-artifact
+      - run: npm publish "$ERRORCORE_CANDIDATE_TARBALL" --tag next --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Wait for the next tag to expose the identical package
+        run: |
+          for attempt in $(seq 1 30); do
+            published_integrity="$(npm view errorcore@next dist.integrity 2>/dev/null || true)"
+            if [ "$published_integrity" = "$ERRORCORE_CANDIDATE_INTEGRITY" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "errorcore@next did not expose the candidate integrity in time" >&2
+          exit 1
+      - run: node scripts/verify-published-consumers.js errorcore@next
+
+  promote-latest:
+    name: Promote the integrity-matched package to latest
+    if: inputs['release-action'] == 'promote-latest'
+    needs: [candidate, benchmark]
+    runs-on: ubuntu-latest
+    environment: npm-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v6
+        with:
+          name: errorcore-candidate
+          path: release-artifact
+      - run: node scripts/release-candidate.js verify release-artifact
+      - name: Match the published package integrity before promotion
+        run: |
+          published_integrity="$(npm view "errorcore@$ERRORCORE_CANDIDATE_VERSION" dist.integrity)"
+          next_integrity="$(npm view errorcore@next dist.integrity)"
+          next_version="$(npm view errorcore@next version)"
+          test "$published_integrity" = "$ERRORCORE_CANDIDATE_INTEGRITY"
+          test "$next_integrity" = "$ERRORCORE_CANDIDATE_INTEGRITY"
+          test "$next_version" = "$ERRORCORE_CANDIDATE_VERSION"
+      - name: Revalidate fresh consumers from the next tag
+        run: node scripts/verify-published-consumers.js errorcore@next
+      - run: npm dist-tag add "errorcore@$ERRORCORE_CANDIDATE_VERSION" latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

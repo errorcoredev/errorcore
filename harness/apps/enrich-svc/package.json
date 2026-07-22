@@ -1,0 +1,16 @@
+{
+  "name": "errorcore-enrich-svc",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "build": "esbuild server.js --bundle --platform=node --target=node20 --minify --sourcemap=external --outfile=dist/server.js",
+    "start": "node --enable-source-maps --unhandled-rejections=strict dist/server.js"
+  },
+  "dependencies": {
+    "errorcore": "file:../../../errorcore-0.2.0.tgz",
+    "fastify": "4.29.1",
+    "ioredis": "5.4.1"
+  }
+}

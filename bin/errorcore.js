@@ -1,0 +1,936 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const distDir = path.join(__dirname, '..', 'dist');
+const templatePath = path.join(__dirname, '..', 'config-template', 'errorcore.config.js');
+const minimalTemplatePath = path.join(__dirname, '..', 'config-template', 'errorcore.config.minimal.js');
+
+const isTTY = process.stdout.isTTY === true;
+
+function ansi(code, text) {
+  return isTTY ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+
+const bold  = (t) => ansi('1', t);
+const dim   = (t) => ansi('2', t);
+const red   = (t) => ansi('31', t);
+const green = (t) => ansi('32', t);
+const yellow = (t) => ansi('33', t);
+const cyan  = (t) => ansi('36', t);
+
+function die(message) {
+  process.stderr.write(red('Error: ') + message + '\n');
+  process.exit(1);
+}
+
+function isDeadLetterLockError(error) {
+  const message = error && error.message ? String(error.message) : String(error);
+  return message.includes('Failed to acquire lock') && message.includes('.lock');
+}
+
+function requireDist(modulePath) {
+  const full = path.join(distDir, modulePath);
+  try {
+    return require(full);
+  } catch (err) {
+    if (err && err.code === 'MODULE_NOT_FOUND') {
+      die('Run npm run build first');
+    }
+    throw err;
+  }
+}
+
+function resolveConfigPath(configPath, { allowExternal }) {
+  const abs = path.resolve(configPath);
+
+  // Reject paths outside the current working directory unless explicitly
+  // allowed. This blocks accidental or hostile CLI invocations from
+  // executing arbitrary JS (via require) located outside the project tree.
+  const cwd = path.resolve(process.cwd());
+  const rel = path.relative(cwd, abs);
+  const isOutsideCwd =
+    rel.length === 0 ? false : rel.startsWith('..') || path.isAbsolute(rel);
+
+  if (isOutsideCwd && !allowExternal) {
+    die(
+      `Refusing to load config outside the current directory: ${abs}\n` +
+      `Pass ${cyan('--allow-external-config')} to override.`
+    );
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(abs);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      die(
+        `Config file not found: ${abs}\n` +
+        `Run ${cyan('npx errorcore init')} to create one.`
+      );
+    }
+    throw err;
+  }
+  if (!stat.isFile()) {
+    die(`Config path is not a regular file: ${abs}`);
+  }
+
+  return abs;
+}
+
+function loadConfigFile(configPath, options = {}) {
+  const abs = resolveConfigPath(configPath, {
+    allowExternal: options.allowExternal === true,
+  });
+  try {
+    return require(abs);
+  } catch (err) {
+    if (err && err.code === 'MODULE_NOT_FOUND') {
+      die(
+        `Config file not found: ${abs}\n` +
+        `Run ${cyan('npx errorcore init')} to create one.`
+      );
+    }
+    throw err;
+  }
+}
+
+function quickstartConfigContents() {
+  return [
+    "module.exports = {",
+    "  service: 'errorcore-quickstart',",
+    "  transport: { type: 'file', path: '.errorcore/events.ndjson' },",
+    "  allowUnencrypted: true,",
+    "  captureLocalVariables: true,",
+    "  captureRequestBodies: true,",
+    "  captureResponseBodies: true,",
+    "  captureBodyDigest: true,",
+    "  resolveSourceMaps: false,",
+    "  logLevel: 'error',",
+    "  silent: true",
+    "};",
+    ""
+  ].join('\n');
+}
+
+function quickstartDemoContents() {
+  return [
+    "const http = require('node:http');",
+    "const errorcore = require('errorcore');",
+    "",
+    "function listen(server) {",
+    "  return new Promise((resolve) => {",
+    "    server.listen(0, '127.0.0.1', () => resolve(server.address()));",
+    "  });",
+    "}",
+    "",
+    "function close(server) {",
+    "  return new Promise((resolve, reject) => {",
+    "    server.close((error) => error ? reject(error) : resolve());",
+    "  });",
+    "}",
+    "",
+    "async function handleCheckout(req, res, upstreamBaseUrl) {",
+    "  const cart = errorcore.trackState('quickstart-cart', new Map([['stage', 'created']]));",
+    "  const orderId = 'ec-demo-order-42';",
+    "  const customerEmail = 'quickstart@example.com';",
+    "  const cartTotal = 42.5;",
+    "",
+    "  cart.set('orderId', orderId);",
+    "  cart.set('stage', 'checking-inventory');",
+    "  await Promise.resolve();",
+    "",
+    "  const traceHeaders = errorcore.getTraceHeaders() || {};",
+    "  const upstreamResponse = await fetch(`${upstreamBaseUrl}/inventory?sku=demo-widget`, {",
+    "    headers: traceHeaders",
+    "  });",
+    "  const inventory = await upstreamResponse.json();",
+    "  cart.set('inventoryStatus', inventory.status);",
+    "",
+    "  try {",
+    "    const localSnapshot = { orderId, customerEmail, cartTotal, inventory };",
+    "    throw new Error(`Checkout failed after ${localSnapshot.inventory.status}`);",
+    "  } catch (error) {",
+    "    res.statusCode = 500;",
+    "    errorcore.captureError(error);",
+    "    res.setHeader('content-type', 'application/json');",
+    "    res.end(JSON.stringify({ ok: false, captured: true }));",
+    "  }",
+    "}",
+    "",
+    "async function main() {",
+    "  errorcore.init(require('./errorcore.config.js'));",
+    "",
+    "  const upstream = http.createServer((req, res) => {",
+    "    res.setHeader('content-type', 'application/json');",
+    "    res.end(JSON.stringify({ sku: 'demo-widget', status: 'reserved' }));",
+    "  });",
+    "",
+    "  await listen(upstream);",
+    "  const upstreamBaseUrl = `http://127.0.0.1:${upstream.address().port}`;",
+    "",
+    "  const app = http.createServer(errorcore.wrapHandler((req, res) => {",
+    "    if (req.url && req.url.startsWith('/checkout')) {",
+    "      void handleCheckout(req, res, upstreamBaseUrl).catch((error) => {",
+    "        res.statusCode = 500;",
+    "        errorcore.captureError(error);",
+    "        res.end('captured');",
+    "      });",
+    "      return;",
+    "    }",
+    "",
+    "    res.statusCode = 404;",
+    "    res.end('not found');",
+    "  }));",
+    "",
+    "  await listen(app);",
+    "  const appUrl = `http://127.0.0.1:${app.address().port}`;",
+    "",
+    "  try {",
+    "    const response = await fetch(`${appUrl}/checkout?plan=design-partner`, {",
+    "      method: 'POST',",
+    "      headers: {",
+    "        'content-type': 'application/json',",
+    "        traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',",
+    "        tracestate: 'partner=quickstart'",
+    "      },",
+    "      body: JSON.stringify({ email: 'quickstart@example.com', api_key: 'demo-key-should-redact' })",
+    "    });",
+    "",
+    "    await response.text();",
+    "    await errorcore.flush();",
+    "    process.stdout.write(`Demo request returned HTTP ${response.status}. ErrorCore captured it locally.\\n`);",
+    "  } finally {",
+    "    await close(app);",
+    "    await close(upstream);",
+    "    await errorcore.shutdown();",
+    "  }",
+    "",
+    "  process.stdout.write('Inspect the captured event:\\n');",
+    "  process.stdout.write('  npx errorcore show --latest\\n');",
+    "  process.stdout.write('Open the local dashboard:\\n');",
+    "  process.stdout.write('  npx errorcore dashboard\\n');",
+    "}",
+    "",
+    "main().catch((error) => {",
+    "  console.error(error);",
+    "  process.exitCode = 1;",
+    "});",
+    ""
+  ].join('\n');
+}
+
+function parseArgs(argv) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--config' && i + 1 < argv.length) {
+      flags.config = argv[++i];
+    } else if (arg === '--dry-run') {
+      flags.dryRun = true;
+    } else if (arg === '--force') {
+      flags.force = true;
+    } else if (arg === '--full') {
+      flags.full = true;
+    } else if (arg === '--quickstart') {
+      flags.quickstart = true;
+    } else if (arg === '--latest') {
+      flags.latest = true;
+    } else if (arg === '--file' && i + 1 < argv.length) {
+      flags.file = argv[++i];
+    } else if (arg === '--rotate') {
+      flags.rotate = true;
+    } else if (arg === '--allow-external-config') {
+      flags.allowExternalConfig = true;
+    } else if (arg === '--port' && i + 1 < argv.length) {
+      flags.port = parseInt(argv[++i], 10);
+    } else if (!arg.startsWith('--')) {
+      positional.push(arg);
+    }
+  }
+  return { flags, positional };
+}
+
+function formatValue(val) {
+  if (val === undefined) return dim('not set');
+  if (val === null) return dim('null');
+  if (typeof val === 'function') return dim('(custom function)');
+  if (val instanceof RegExp) return val.toString();
+  if (Array.isArray(val)) {
+    if (val.length === 0) return '[]';
+    if (val.every((v) => typeof v === 'string')) {
+      if (val.length <= 4) return val.join(', ');
+      return `[${val.length} items]`;
+    }
+    if (val.every((v) => v instanceof RegExp)) {
+      return val.map((v) => v.toString()).join(', ');
+    }
+    return `[${val.length} items]`;
+  }
+  if (typeof val === 'object') {
+    try { return JSON.stringify(val); } catch { return String(val); }
+  }
+  return String(val);
+}
+
+function cmdHelp() {
+  const text = `
+${bold('errorcore')} - ErrorCore command-line tool
+
+${bold('Usage:')}
+  errorcore <command> [options]
+
+${bold('Commands:')}
+  ${cyan('init')}       [--full] [--quickstart]  Create errorcore.config.js
+  ${cyan('validate')} [--config <path>]    Validate config and print resolved values
+  ${cyan('status')}   [--config <path>]    Show dead-letter store status
+  ${cyan('show')}     --latest             Render the latest captured error
+             [--file <path>] [--config <path>]
+  ${cyan('drain')}    [--config <path>]    Re-send dead-letter payloads
+  ${cyan('replay')}   [--config <path>]    Alias for drain
+             [--dry-run] [--force] [--rotate]
+  ${cyan('dashboard')} [--config <path>]   Open the error dashboard
+  ${cyan('ui')}       [--config <path>]    Alias for dashboard
+             [--port <number>]
+  ${cyan('help')}                          Show this help message
+
+${bold('Global flags:')}
+  --config <path>             Path to errorcore.config.js (default: ./errorcore.config.js)
+  --allow-external-config     Permit config paths outside the current directory
+
+${bold('Examples:')}
+  errorcore init
+  errorcore validate
+  errorcore validate --config ./my-errorcore.config.js
+  errorcore status
+  errorcore show --latest
+  errorcore drain --dry-run
+  errorcore drain --force
+  errorcore drain
+  errorcore drain --rotate           # one-shot: re-sign all entries with the new key
+  errorcore dashboard
+  errorcore init --quickstart
+  errorcore init --full
+`.trimStart();
+
+  process.stdout.write(text);
+}
+
+function cmdInit(flags) {
+  const dest = path.join(process.cwd(), 'errorcore.config.js');
+  if (fs.existsSync(dest)) {
+    die('errorcore.config.js already exists in the current directory');
+  }
+
+  if (flags.quickstart) {
+    fs.writeFileSync(dest, quickstartConfigContents(), 'utf8');
+    fs.mkdirSync(path.join(process.cwd(), '.errorcore'), { recursive: true });
+  } else {
+    const source = flags.full ? templatePath : minimalTemplatePath;
+    const fallback = flags.full ? null : templatePath;
+
+    if (!fs.existsSync(source)) {
+      if (fallback && fs.existsSync(fallback)) {
+        fs.copyFileSync(fallback, dest);
+      } else {
+        die(
+          'Config template not found at ' + source + '.\n' +
+          'This usually means the package was not installed correctly.\n' +
+          'Try: npm install errorcore'
+        );
+      }
+    } else {
+      fs.copyFileSync(source, dest);
+    }
+  }
+
+  process.stdout.write(
+    green('Created errorcore.config.js') +
+    (flags.quickstart ? ' (quickstart)' : flags.full ? ' (full template)' : '') +
+    '\n\n'
+  );
+
+  if (flags.quickstart) {
+    const testDest = path.join(process.cwd(), 'errorcore-test.js');
+    if (!fs.existsSync(testDest)) {
+      fs.writeFileSync(testDest, quickstartDemoContents(), 'utf8');
+      process.stdout.write(green('Created errorcore-test.js') + '\n\n');
+    }
+    process.stdout.write(bold('Run it:') + '\n');
+    process.stdout.write(`  ${cyan('node errorcore-test.js')}\n\n`);
+    process.stdout.write(bold('Then inspect the captured event:') + '\n');
+    process.stdout.write(`  ${cyan('npx errorcore show --latest')}\n\n`);
+    process.stdout.write(bold('Or open the local dashboard:') + '\n');
+    process.stdout.write(`  ${cyan('npx errorcore dashboard')}\n\n`);
+  } else {
+    process.stdout.write(bold('Next steps:') + '\n');
+    process.stdout.write('  1. Add to your application entry point:\n\n');
+    process.stdout.write(`     ${cyan("const errorcore = require('errorcore');")}\n`);
+    process.stdout.write(`     ${cyan("errorcore.init(require('./errorcore.config.js'));")}\n\n`);
+    process.stdout.write('  2. Start your app and trigger an error - the captured payload prints to stdout.\n');
+    process.stdout.write('  3. Run ' + cyan('errorcore validate') + ' to check your config\n\n');
+  }
+
+  if (!flags.full) {
+    process.stdout.write(dim('Tip: Run ') + cyan('errorcore init --full') + dim(' for all config options.') + '\n\n');
+  }
+
+  process.stdout.write(yellow('Before production: ') + 'set encryptionKey and switch to http transport.\n');
+  process.stdout.write('Generate a key: ' + dim('node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"') + '\n');
+}
+
+function resolveCaptureFilePath(resolved, configDir) {
+  if (resolved.transport.type === 'file') {
+    return path.resolve(configDir, resolved.transport.path);
+  }
+
+  if (resolved.transport.type === 'webhook') {
+    return path.resolve(configDir, resolved.transport.storePath);
+  }
+
+  if (resolved.deadLetterPath) {
+    return path.resolve(configDir, resolved.deadLetterPath);
+  }
+
+  return null;
+}
+
+function createEncryptionFromResolvedConfig(resolved) {
+  if (!resolved.encryptionKey) {
+    return null;
+  }
+
+  const { Encryption } = requireDist(path.join('security', 'encryption.js'));
+  return new Encryption(resolved.encryptionKey, {
+    previousEncryptionKeys: resolved.previousEncryptionKeys || [],
+    macKey: resolved.macKey
+  });
+}
+
+function cmdShow(flags) {
+  if (!flags.latest) {
+    die('Only --latest is supported today. Try: errorcore show --latest');
+  }
+
+  const configPath = path.resolve(flags.config || path.join(process.cwd(), 'errorcore.config.js'));
+  let resolved = null;
+  let configDir = process.cwd();
+
+  if (!flags.file || flags.config || fs.existsSync(configPath)) {
+    const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
+    const { resolveConfig } = requireDist('config.js');
+    try {
+      resolved = resolveConfig(userConfig);
+    } catch (err) {
+      die(err.message || String(err));
+    }
+    configDir = path.dirname(configPath);
+  }
+
+  const filePath = flags.file
+    ? path.resolve(process.cwd(), flags.file)
+    : resolved === null
+      ? null
+      : resolveCaptureFilePath(resolved, configDir);
+
+  if (filePath === null) {
+    die(
+      'Cannot determine NDJSON file path. Pass --file <path>, or configure ' +
+      'a file transport, webhook storePath, or deadLetterPath.'
+    );
+  }
+
+  if (!fs.existsSync(filePath)) {
+    process.stdout.write(yellow('No captured events found.') + '\n');
+    process.stdout.write(`Expected file: ${filePath}\n\n`);
+    process.stdout.write(`Run ${cyan('node errorcore-test.js')} first, or pass ${cyan('--file <path>')}.\n`);
+    return;
+  }
+
+  const encryption = resolved === null ? null : createEncryptionFromResolvedConfig(resolved);
+  const { NdjsonReader, renderErrorRecord } = requireDist(path.join('ui', 'index.js'));
+  const reader = new NdjsonReader(filePath, encryption);
+  const latest = reader.getAll({ sort: 'newest', page: 1, limit: 1 }).entries[0];
+
+  if (latest === undefined) {
+    process.stdout.write(yellow('No readable captured events found.') + '\n');
+    process.stdout.write(`Checked file: ${filePath}\n\n`);
+    process.stdout.write(
+      'If the file is encrypted, pass a config with encryptionKey: ' +
+      cyan('errorcore show --latest --config ./errorcore.config.js') + '\n'
+    );
+    return;
+  }
+
+  const record = reader.getById(latest.id);
+  if (record === null || typeof record !== 'object') {
+    die(`Could not read latest event ${latest.id} from ${filePath}`);
+  }
+
+  process.stdout.write(renderErrorRecord(record));
+}
+
+function cmdValidate(flags) {
+  const configPath = flags.config || path.join(process.cwd(), 'errorcore.config.js');
+  const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
+  const { resolveConfig } = requireDist('config.js');
+
+  let resolved;
+  try {
+    resolved = resolveConfig(userConfig);
+  } catch (err) {
+    die(err.message || String(err));
+  }
+
+  if (resolved.allowUnencrypted === true && resolved.encryptionKey === undefined) {
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd) {
+      process.stdout.write(
+        red('WARNING: ') +
+        'Running in production with allowUnencrypted=true and no encryptionKey. ' +
+        'Error packages are stored in plaintext.\n' +
+        'Generate a key: ' +
+        cyan('node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"') + '\n\n'
+      );
+    } else {
+      process.stdout.write(
+        dim('Note: allowUnencrypted is true (default for development). ') +
+        dim('Set encryptionKey before deploying to production.') + '\n\n'
+      );
+    }
+  }
+
+  if (resolved.resolveSourceMaps === true && userConfig.resolveSourceMaps === true) {
+    process.stdout.write(
+      dim('Source maps: enabled. Ensure your bundler emits .map files for server-side code.') + '\n\n'
+    );
+  }
+
+  process.stdout.write(green('Config is valid.') + '\n\n');
+
+  const captureFlags = new Set([
+    'captureLocalVariables',
+    'captureBody',
+    'captureDbBindParams',
+  ]);
+
+  const secretFields = new Set([
+    'encryptionKey',
+    'apiKey',
+    'token',
+    'dsn',
+    'password',
+  ]);
+
+  const keys = Object.keys(resolved);
+  const maxKeyLen = Math.max(...keys.map((k) => k.length));
+
+  for (const key of keys) {
+    const val = resolved[key];
+    const label = key.padEnd(maxKeyLen + 2);
+
+    if (captureFlags.has(key)) {
+      const flag = val ? green(bold('ON')) : dim('OFF');
+      process.stdout.write(`  ${label}${flag}\n`);
+    } else if (secretFields.has(key)) {
+      const sentinel = val === undefined || val === null
+        ? dim('not set')
+        : dim('(set, hidden)');
+      process.stdout.write(`  ${label}${sentinel}\n`);
+    } else {
+      process.stdout.write(`  ${label}${formatValue(val)}\n`);
+    }
+  }
+
+  process.stdout.write('\n');
+}
+
+function cmdStatus(flags) {
+  const configPath = flags.config || path.join(process.cwd(), 'errorcore.config.js');
+  let deadLetterPath;
+
+  try {
+    const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
+    const { resolveConfig } = requireDist('config.js');
+    const resolved = resolveConfig(userConfig);
+    deadLetterPath = resolved.deadLetterPath;
+  } catch (err) {
+    die(err.message || String(err));
+  }
+
+  if (!deadLetterPath) {
+    process.stdout.write(yellow('No dead-letter store configured.') + '\n\n');
+    process.stdout.write(
+      'The dead-letter store is an NDJSON file where error packages are saved\n' +
+      'when transport delivery fails. It is created automatically for file and\n' +
+      'HTTP transports, or you can set deadLetterPath explicitly in your config.\n'
+    );
+    return;
+  }
+
+  process.stdout.write(bold('Dead-letter store: ') + deadLetterPath + '\n');
+
+  if (!fs.existsSync(deadLetterPath)) {
+    process.stdout.write(green('  File does not exist - no pending payloads.') + '\n');
+    return;
+  }
+
+  const stat = fs.statSync(deadLetterPath);
+  const sizeKB = (stat.size / 1024).toFixed(1);
+  const content = fs.readFileSync(deadLetterPath, 'utf8');
+  const lines = content.split('\n').filter((l) => l.length > 0);
+
+  const timestamps = [];
+  for (const line of lines) {
+    try {
+      const payload = JSON.parse(line);
+      const inner = typeof payload === 'string' ? JSON.parse(payload) : payload;
+      const ts = inner.capturedAt || inner.timestamp;
+      if (ts) timestamps.push(new Date(ts));
+    } catch { }
+  }
+
+  timestamps.sort((a, b) => a.getTime() - b.getTime());
+
+  process.stdout.write(`  Size:     ${sizeKB} KB\n`);
+  process.stdout.write(`  Payloads: ${lines.length}\n`);
+
+  if (timestamps.length > 0) {
+    process.stdout.write(`  Oldest:   ${timestamps[0].toISOString()}\n`);
+    process.stdout.write(`  Newest:   ${timestamps[timestamps.length - 1].toISOString()}\n`);
+  }
+}
+
+async function cmdDrain(flags) {
+  const configPath = flags.config || path.join(process.cwd(), 'errorcore.config.js');
+  const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
+  const { resolveConfig } = requireDist('config.js');
+
+  let resolved;
+  try {
+    resolved = resolveConfig(userConfig);
+  } catch (err) {
+    die(err.message || String(err));
+  }
+
+  const deadLetterPath = resolved.deadLetterPath;
+  if (!deadLetterPath) {
+    die('No dead-letter store configured.');
+  }
+
+  if (!fs.existsSync(deadLetterPath)) {
+    if (flags.rotate) {
+      process.stdout.write(green('Dead-letter store is empty - nothing to re-sign.') + '\n');
+    } else {
+      process.stdout.write(green('Dead-letter store is empty - nothing to drain.') + '\n');
+    }
+    return;
+  }
+
+  const transportAuthorization =
+    userConfig.transport?.type === 'http' ? userConfig.transport.authorization : undefined;
+  const webhookSecret =
+    userConfig.transport?.type === 'webhook' ? userConfig.transport.secret : undefined;
+  const integrityKey = resolved.encryptionKey ?? transportAuthorization ?? webhookSecret ?? null;
+
+  if (integrityKey === null) {
+    die('Cannot drain: no encryptionKey or transport authorization configured (needed for HMAC verification).');
+  }
+
+  const { DeadLetterStore, createHmacVerifier } = requireDist(path.join('transport', 'dead-letter-store.js'));
+  const { withLockSync } = requireDist(path.join('transport', 'file-lock.js'));
+  const lockPath = deadLetterPath + '.lock';
+
+  // Build the verifier with multi-key support if previousEncryptionKeys
+  // is configured. Required for --rotate to verify entries written
+  // under prior keys.
+  let verifier;
+  if (resolved.encryptionKey !== undefined) {
+    const { Encryption } = requireDist(path.join('security', 'encryption.js'));
+    const enc = new Encryption(resolved.encryptionKey, {
+      previousEncryptionKeys: resolved.previousEncryptionKeys || [],
+      macKey: resolved.macKey
+    });
+    verifier = {
+      sign: (p) => enc.sign(p),
+      verifyKeyIndex: (p, m) => {
+        const r = enc.verify(p, m);
+        return r.ok ? r.keyIndex : null;
+      }
+    };
+  } else {
+    verifier = createHmacVerifier([
+      integrityKey,
+      ...(resolved.previousTransportAuthorizations || [])
+    ]);
+  }
+
+  const store = new DeadLetterStore(deadLetterPath, {
+    verifier,
+    maxSizeBytes: resolved.deadLetterMaxBytes,
+    maxBackups: resolved.deadLetterMaxBackups
+  });
+
+  if (flags.rotate) {
+    let result;
+    try {
+      result = store.reSignAll();
+    } catch (err) {
+      if (isDeadLetterLockError(err)) {
+        die(`EC_DLQ_LOCKED: ${(err && err.message) || String(err)}`);
+      }
+      throw err;
+    }
+    process.stdout.write(
+      green('Rotated dead-letter signatures: ') +
+      `${result.resigned} payload(s) re-signed, ` +
+      `${result.markersKept} marker(s) kept, ` +
+      `${result.dropped} unverifiable entry(ies) dropped.\n`
+    );
+    return;
+  }
+
+  const { entries, lineCount: snapshotLineCount } = store.drain({
+    allowLargeFile: true
+  });
+
+  const payloads = entries.map((e) => e.payload);
+  const payloadLineIndices = entries.map((e) => e.lineNumber - 1);
+
+  if (payloads.length === 0) {
+    process.stdout.write(green('No valid payloads in dead-letter store.') + '\n');
+    return;
+  }
+
+  if (flags.dryRun) {
+    process.stdout.write(bold(`${payloads.length} payload(s) pending`) + '\n\n');
+    process.stdout.write(bold('First payload:') + '\n');
+    try {
+      const pretty = JSON.stringify(JSON.parse(payloads[0]), null, 2);
+      process.stdout.write(pretty + '\n');
+    } catch {
+      process.stdout.write(payloads[0] + '\n');
+    }
+    return;
+  }
+
+  const transportType = resolved.transport.type;
+  process.stdout.write(`Draining ${payloads.length} payload(s) via ${transportType} transport...\n`);
+
+  if (transportType === 'stdout') {
+    process.stdout.write(
+      yellow('WARNING: ') +
+      'Transport is stdout. Payloads will be printed to terminal, not re-delivered to a collector. ' +
+      'Switch to file or http transport to re-send to your collector.\n'
+    );
+  }
+
+  if (!flags.force) {
+    const readline = require('node:readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise((resolve) => {
+      rl.question('Proceed? [y/N] ', resolve);
+    });
+    rl.close();
+    if (answer.toLowerCase() !== 'y') {
+      process.exit(0);
+    }
+  }
+
+  const transport = createTransportFromConfig(resolved, transportAuthorization, webhookSecret);
+  const { parseEnvelopeMetadata } = requireDist(path.join('transport', 'payload.js'));
+
+  const failedLineIndices = new Set();
+  let failures = 0;
+  for (let i = 0; i < payloads.length; i++) {
+    const label = `[${i + 1}/${payloads.length}]`;
+    try {
+      await transport.send({
+        serialized: payloads[i],
+        envelope: parseEnvelopeMetadata(payloads[i])
+      });
+      process.stdout.write(`  ${label} ${green('sent')}\n`);
+    } catch (err) {
+      failures++;
+      failedLineIndices.add(payloadLineIndices[i]);
+      process.stdout.write(`  ${label} ${red('FAILED')} ${err.message || err}\n`);
+    }
+  }
+
+  withLockSync(lockPath, () => {
+    if (failures === 0) {
+      const currentContent = fs.readFileSync(deadLetterPath, 'utf8');
+      const currentLines = currentContent.split('\n').filter((l) => l.length > 0);
+      if (currentLines.length <= snapshotLineCount) {
+        fs.unlinkSync(deadLetterPath);
+      } else {
+        const remaining = currentLines.slice(snapshotLineCount).join('\n') + '\n';
+        fs.writeFileSync(deadLetterPath, remaining, { encoding: 'utf8', mode: 0o600 });
+      }
+    } else {
+      const currentContent = fs.readFileSync(deadLetterPath, 'utf8');
+      const currentLines = currentContent.split('\n').filter((l) => l.length > 0);
+      const kept = [];
+      for (let i = 0; i < snapshotLineCount && i < currentLines.length; i++) {
+        if (failedLineIndices.has(i)) {
+          kept.push(currentLines[i]);
+        }
+      }
+      for (let i = snapshotLineCount; i < currentLines.length; i++) {
+        kept.push(currentLines[i]);
+      }
+      if (kept.length === 0) {
+        if (fs.existsSync(deadLetterPath)) fs.unlinkSync(deadLetterPath);
+      } else {
+        fs.writeFileSync(deadLetterPath, kept.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+      }
+    }
+  });
+
+  if (failures === 0) {
+    process.stdout.write('\n' + green(`All ${payloads.length} payload(s) sent. Dead-letter store cleared.`) + '\n');
+  } else {
+    // process.exit() skips finally blocks; emit message and exit AFTER the
+    // lock has been released by withLockSync above.
+    process.stdout.write('\n' + red(`${failures} payload(s) failed. Sent payloads removed from store; failed entries retained.`) + '\n');
+    process.exit(1);
+  }
+
+  await transport.shutdown();
+}
+
+function createTransportFromConfig(config, authorization, webhookSecret) {
+  const t = config.transport;
+
+  if (t.type === 'stdout') {
+    const { StdoutTransport } = requireDist(path.join('transport', 'stdout-transport.js'));
+    return new StdoutTransport();
+  }
+
+  if (t.type === 'file') {
+    const { FileTransport } = requireDist(path.join('transport', 'file-transport.js'));
+    return new FileTransport(t);
+  }
+
+  if (t.type === 'http') {
+    const { HttpTransport } = requireDist(path.join('transport', 'http-transport.js'));
+    return new HttpTransport({
+      url: t.url,
+      authorization: authorization,
+      timeoutMs: t.timeoutMs,
+      protocol: t.protocol,
+      allowPlainHttpTransport: config.allowPlainHttpTransport,
+      allowInvalidCollectorCertificates: config.allowInvalidCollectorCertificates,
+    });
+  }
+
+  if (t.type === 'webhook') {
+    const { WebhookTransport } = requireDist(path.join('transport', 'webhook-transport.js'));
+    return new WebhookTransport({
+      url: t.url,
+      secret: webhookSecret,
+      batchSize: t.batchSize,
+      maxDelayMs: t.maxDelayMs,
+      retries: t.retries,
+      timeoutMs: t.timeoutMs,
+      maxBufferEvents: t.maxBufferEvents,
+      storePath: t.storePath,
+      retainOnAck: t.retainOnAck,
+      allowPlainHttpTransport: config.allowPlainHttpTransport,
+    });
+  }
+
+  die(`Unsupported transport type: ${t.type}`);
+}
+
+function cmdUI(flags) {
+  const configPath = path.resolve(flags.config || path.join(process.cwd(), 'errorcore.config.js'));
+  const configDir = path.dirname(configPath);
+  const userConfig = loadConfigFile(configPath, { allowExternal: flags.allowExternalConfig });
+  const { resolveConfig } = requireDist('config.js');
+
+  let resolved;
+  try {
+    resolved = resolveConfig(userConfig);
+  } catch (err) {
+    die(err.message || String(err));
+  }
+
+  let filePath;
+  if (resolved.transport.type === 'file') {
+    // Resolve relative paths against the config file's directory, not CWD
+    filePath = path.resolve(configDir, resolved.transport.path);
+  } else if (resolved.transport.type === 'webhook') {
+    filePath = path.resolve(configDir, resolved.transport.storePath);
+  } else if (resolved.deadLetterPath) {
+    filePath = path.resolve(configDir, resolved.deadLetterPath);
+  } else {
+    die(
+      'Cannot determine NDJSON file path. The UI requires a file transport or deadLetterPath.\n' +
+      'Set transport.type to "file" or configure deadLetterPath in your config.'
+    );
+  }
+
+  const port = flags.port || 4400;
+
+  let encryption = null;
+  if (resolved.encryptionKey) {
+    const { Encryption } = requireDist(path.join('security', 'encryption.js'));
+    encryption = new Encryption(resolved.encryptionKey, {
+      previousEncryptionKeys: resolved.previousEncryptionKeys || [],
+      macKey: resolved.macKey
+    });
+  }
+
+  const token = process.env.EC_DASHBOARD_TOKEN || undefined;
+
+  const { startDashboard } = requireDist(path.join('ui', 'server.js'));
+  startDashboard({ filePath, port, encryption, token });
+}
+
+const { flags, positional } = parseArgs(process.argv.slice(2));
+const command = positional[0] || 'help';
+
+switch (command) {
+  case 'help':
+  case '--help':
+  case '-h':
+    cmdHelp();
+    break;
+
+  case 'init':
+    cmdInit(flags);
+    break;
+
+  case 'validate':
+    cmdValidate(flags);
+    break;
+
+  case 'status':
+    cmdStatus(flags);
+    break;
+
+  case 'show':
+    cmdShow(flags);
+    break;
+
+  case 'drain':
+  case 'replay':
+    cmdDrain(flags).catch((err) => {
+      die(err.message || String(err));
+    });
+    break;
+
+  case 'dashboard':
+  case 'ui':
+    cmdUI(flags);
+    break;
+
+  default:
+    process.stderr.write(red(`Unknown command: ${command}`) + '\n\n');
+    cmdHelp();
+    process.exit(1);
+}

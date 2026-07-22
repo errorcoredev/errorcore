@@ -1,0 +1,8 @@
+.next/
+.errorcore-package/
+.npm-cache/
+node_modules/
+smoke-errors.ndjson
+next-env.d.ts
+tsconfig.tsbuildinfo
+app/api/hmr-memory/

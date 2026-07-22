@@ -1,0 +1,841 @@
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import fs = require('node:fs');
+import path = require('node:path');
+
+import { withLockSync } from './file-lock';
+import { safeConsole } from '../debug-log';
+import { scrubInternalWarningValue, serializeCause } from '../capture/error-capturer';
+import type { InternalWarning, InternalWarningCode } from '../types';
+
+// Append `data` to `filePath` and fsync the file descriptor before
+// returning. Without the fsync a SIGTERM or OS-level crash between
+// write() and the kernel's deferred flush loses payloads that the
+// caller already considered persisted.
+function appendFileSyncDurable(
+  filePath: string,
+  data: string,
+  mode: number
+): void {
+  const fd = fs.openSync(filePath, 'a', mode);
+  try {
+    fs.writeSync(fd, data, null, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Same durability contract for full-file replacement (used by the
+// rotation path that re-signs every entry under the new primary key).
+function writeFileSyncDurable(
+  filePath: string,
+  data: string,
+  mode: number
+): void {
+  const fd = fs.openSync(filePath, 'w', mode);
+  try {
+    fs.writeSync(fd, data, null, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Pluggable signer/verifier. The default implementation
+ * (createHmacVerifier) is a single-key HMAC-SHA256, identical to the
+ * pre-rotation behavior. Multi-key verification (for rotation) is
+ * supplied by a caller that knows about the key chain - see
+ * deriveDeadLetterVerifier in src/sdk.ts.
+ */
+export interface IntegrityVerifier {
+  /** Returns base64 HMAC over the input using the primary key. */
+  sign(payload: string): string;
+  /**
+   * Returns the index of the matching key in the chain (0 = primary,
+   * 1+ = previous keys), or null if no key matched.
+   */
+  verifyKeyIndex(payload: string, mac: string): number | null;
+}
+
+export function createHmacVerifier(integrityKey: string | string[]): IntegrityVerifier {
+  const keys = Array.isArray(integrityKey) ? integrityKey : [integrityKey];
+  const primaryKey = keys[0];
+  if (primaryKey === undefined) {
+    throw new Error('createHmacVerifier requires at least one integrity key');
+  }
+
+  return {
+    sign(payload) {
+      return createHmac('sha256', primaryKey).update(payload).digest('base64');
+    },
+    verifyKeyIndex(payload, mac) {
+      try {
+        const actual = Buffer.from(mac, 'base64');
+        for (let index = 0; index < keys.length; index += 1) {
+          const expected = createHmac('sha256', keys[index]!)
+            .update(payload)
+            .digest();
+          if (
+            expected.length === actual.length &&
+            timingSafeEqual(expected, actual)
+          ) {
+            return index;
+          }
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }
+  };
+}
+
+const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
+
+function classifyDlqWriteErrno(
+  err: unknown
+): 'EC_DISK_FULL' | 'EC_DLQ_WRITE_FAILED' {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code !== undefined && DISK_FULL_ERRNO_CODES.has(code)
+    ? 'EC_DISK_FULL'
+    : 'EC_DLQ_WRITE_FAILED';
+}
+
+export interface DeadLetterDrainEntry {
+  lineNumber: number;
+  id: string;
+  payload: string;
+}
+
+export interface DrainResult {
+  entries: DeadLetterDrainEntry[];
+  lineCount: number;
+}
+
+export interface DeadLetterDrainOptions {
+  allowLargeFile?: boolean;
+}
+
+interface DeadLetterEnvelopeBase {
+  version: 1;
+  kind: 'payload' | 'marker';
+  storedAt: string;
+}
+
+interface DeadLetterPayloadEnvelope extends DeadLetterEnvelopeBase {
+  kind: 'payload';
+  id?: string;
+  payload: string;
+  mac: string;
+}
+
+interface DeadLetterMarkerEnvelope extends DeadLetterEnvelopeBase {
+  kind: 'marker';
+  code: string;
+  mac: string;
+}
+
+type DeadLetterEnvelope = DeadLetterPayloadEnvelope | DeadLetterMarkerEnvelope;
+
+interface DeadLetterStoreOptions {
+  /**
+   * Single-key HMAC integrity secret. Either this or `verifier` must
+   * be provided. When both are provided, `verifier` wins.
+   */
+  integrityKey?: string;
+  /**
+   * Pre-built signer/verifier. Required for multi-key rotation; the
+   * caller (sdk.ts or the CLI) wraps an `Encryption` instance with
+   * primary + previous keys.
+   */
+  verifier?: IntegrityVerifier;
+  maxSizeBytes?: number;
+  maxBackups?: number;
+  maxPayloadBytes?: number;
+  requireEncryptedPayload?: boolean;
+  // Optional callback invoked when the store hits a documented
+  // backpressure condition (size cap, oversized payload, disk-full,
+  // other write errno). Shape matches config.onInternalWarning so the
+  // SDK can forward directly without translation - see
+  // BACKPRESSURE.md for the emission matrix.
+  onInternalWarning?: (warning: InternalWarning) => void;
+}
+
+const DEFAULT_MAX_SIZE_BYTES = 50 * 1024 * 1024;
+const DEFAULT_MAX_PAYLOAD_BYTES = 6 * 1024 * 1024;
+
+function getUtf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isIsoTimestamp(value: string): boolean {
+  return !Number.isNaN(Date.parse(value));
+}
+
+function isEncryptedPayloadFormat(payload: string): boolean {
+  try {
+    const parsed = JSON.parse(payload) as Record<string, unknown>;
+
+    // v=1 EncryptedEnvelope shape (Phase 1 hard cutover). No support for
+    // pre-0.3 payloads - those are documented as needing manual upgrade.
+    return (
+      parsed.v === 1 &&
+      typeof parsed.eventId === 'string' &&
+      typeof parsed.iv === 'string' &&
+      typeof parsed.ciphertext === 'string' &&
+      typeof parsed.authTag === 'string' &&
+      typeof parsed.hmac === 'string'
+    );
+  } catch {
+    return false;
+  }
+}
+
+export class DeadLetterStore {
+  private readonly filePath: string;
+
+  private readonly lockPath: string;
+
+  private readonly verifier: IntegrityVerifier;
+
+  private readonly maxSizeBytes: number;
+
+  private readonly maxBackups: number;
+
+  private readonly maxPayloadBytes: number;
+
+  private readonly requireEncryptedPayload: boolean;
+
+  private readonly onInternalWarning?: (warning: InternalWarning) => void;
+
+  private rotateCounter = 0;
+
+  // Serialize concurrent clearSent calls inside the same process. Each
+  // call takes the latest promise and chains its work. Cross-process
+  // serialization is handled by the sidecar lockfile (see file-lock.ts).
+  private clearChain: Promise<void> = Promise.resolve();
+
+  // In-memory pending-payload count. null means "not yet initialized" -
+  // the first getPendingCount() / hasPending() call after construction
+  // lazily scans the backing file. Writers then maintain it in-place.
+  // Markers are not counted here: they're diagnostics, not payloads to
+  // retry.
+  private pendingPayloadCount: number | null = null;
+
+  private readonly ackedPayloadIds = new Set<string>();
+
+  public constructor(filePath: string, options: DeadLetterStoreOptions) {
+    this.filePath = filePath;
+    this.lockPath = filePath + '.lock';
+    if (options.verifier !== undefined) {
+      this.verifier = options.verifier;
+    } else if (options.integrityKey !== undefined) {
+      this.verifier = createHmacVerifier(options.integrityKey);
+    } else {
+      throw new Error(
+        'DeadLetterStore requires either integrityKey (string) or verifier (object)'
+      );
+    }
+    this.maxSizeBytes = options.maxSizeBytes ?? DEFAULT_MAX_SIZE_BYTES;
+    this.maxBackups = options.maxBackups ?? 5;
+    this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+    this.requireEncryptedPayload = options.requireEncryptedPayload ?? false;
+    this.onInternalWarning = options.onInternalWarning;
+  }
+
+  private reportWarning(
+    warning: InternalWarning & { code: InternalWarningCode | string }
+  ): void {
+    if (this.onInternalWarning !== undefined) {
+      const enriched: InternalWarning = {
+        code: warning.code as InternalWarningCode,
+        message: warning.message,
+        ...(warning.cause !== undefined
+          ? { cause: scrubInternalWarningValue(serializeCause(warning.cause)) }
+          : {}),
+        ...(warning.context !== undefined
+          ? { context: scrubInternalWarningValue(warning.context) as Record<string, unknown> }
+          : {}),
+      };
+      try {
+        this.onInternalWarning(enriched);
+      } catch { /* never break on telemetry */ }
+    }
+  }
+
+  // Legacy shape kept for non-backpressure diagnostic logs (clearSent
+  // recovery, restore failures). These are not in the backpressure
+  // matrix - they're ops-level hints.
+  private reportError(code: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    safeConsole.warn(`[ErrorCore] Dead-letter store ${code}: ${message}`);
+  }
+
+  public appendPayloadSync(payload: string): boolean {
+    const payloadBytes = getUtf8ByteLength(payload);
+    if (payloadBytes > this.maxPayloadBytes) {
+      safeConsole.warn('[ErrorCore] Dead-letter payload exceeds maximum size; dropping payload');
+      this.reportWarning({
+        code: 'EC_DLQ_FULL',
+        message: `Dead-letter payload exceeds maximum size (${payloadBytes} > ${this.maxPayloadBytes} bytes); dropping payload.`,
+        context: { payloadBytes, maxPayloadBytes: this.maxPayloadBytes, reason: 'oversized_payload' }
+      });
+      return false;
+    }
+
+    // Initialize the in-memory count before writing so the lazy scan
+    // doesn't read the newly-appended line as if it were pre-existing
+    // state. Order matters: init, then append, then increment.
+    this.ensurePendingCountInitialized();
+    const id = this.computePayloadId(payload);
+
+    if (this.ackedPayloadIds.has(id)) {
+      return true;
+    }
+
+    const ok = this.appendEnvelopeSync({
+      version: 1,
+      kind: 'payload',
+      storedAt: new Date().toISOString(),
+      id,
+      payload
+    });
+
+    if (ok) {
+      this.pendingPayloadCount = (this.pendingPayloadCount ?? 0) + 1;
+    }
+
+    return ok;
+  }
+
+  public appendFailureMarkerSync(code: string): boolean {
+    return this.appendEnvelopeSync({
+      version: 1,
+      kind: 'marker',
+      storedAt: new Date().toISOString(),
+      code
+    });
+  }
+
+  public drain(options: DeadLetterDrainOptions = {}): DrainResult {
+    try {
+      return withLockSync(this.lockPath, () => {
+        if (!fs.existsSync(this.filePath)) {
+          return { entries: [], lineCount: 0 };
+        }
+
+        const stats = fs.statSync(this.filePath);
+        if (stats.size > 10 * 1024 * 1024 && options.allowLargeFile !== true) {
+          safeConsole.warn(
+            `[ErrorCore] Dead-letter store is ${Math.round(stats.size / 1024 / 1024)}MB; ` +
+            'skipping automatic drain at startup. Run `errorcore drain` to process manually.'
+          );
+          return { entries: [], lineCount: 0 };
+        }
+
+        const content = fs.readFileSync(this.filePath, 'utf8');
+        const lines = content.split('\n').filter((line) => line.length > 0);
+        const entries: DeadLetterDrainEntry[] = [];
+
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index] as string;
+          const envelope = this.parseEnvelope(line);
+
+          if (envelope === null) {
+            safeConsole.warn('[ErrorCore] Rejected malformed dead-letter entry');
+            continue;
+          }
+
+          if (envelope.kind === 'marker') {
+            continue;
+          }
+
+          const id = envelope.id ?? this.computePayloadId(envelope.payload);
+          if (this.ackedPayloadIds.has(id)) {
+            continue;
+          }
+
+          entries.push({
+            lineNumber: index + 1,
+            id,
+            payload: envelope.payload
+          });
+        }
+
+        return { entries, lineCount: lines.length };
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      safeConsole.warn(`[ErrorCore] Dead-letter store drain failed: ${message}`);
+      return { entries: [], lineCount: 0 };
+    }
+  }
+
+  public markAcked(id: string): void {
+    if (id.length === 0 || this.ackedPayloadIds.has(id)) {
+      return;
+    }
+
+    this.ackedPayloadIds.add(id);
+    if (this.pendingPayloadCount !== null && this.pendingPayloadCount > 0) {
+      this.pendingPayloadCount -= 1;
+    }
+  }
+
+  public clear(): void {
+    try {
+      withLockSync(this.lockPath, () => {
+        if (fs.existsSync(this.filePath)) {
+          fs.unlinkSync(this.filePath);
+        }
+      });
+      this.pendingPayloadCount = 0;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      safeConsole.warn(`[ErrorCore] Dead-letter store clear failed: ${message}`);
+    }
+  }
+
+  public clearSent(sentLineCount: number): void {
+    const tempPath = this.filePath + '.clearing';
+
+    withLockSync(this.lockPath, () => {
+      try {
+        // Atomically rename the file so new appendPayloadSync calls create a
+        // fresh file instead of racing with our read-modify-write.
+        try {
+          fs.renameSync(this.filePath, tempPath);
+        } catch (renameError) {
+          // File gone (already cleared or never existed) - nothing to do.
+          if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
+            this.pendingPayloadCount = 0;
+            return;
+          }
+          throw renameError;
+        }
+
+        const content = fs.readFileSync(tempPath, 'utf8');
+        const lines = content.split('\n').filter((line) => line.length > 0);
+
+        if (lines.length > sentLineCount) {
+          const remaining = lines.slice(sentLineCount).join('\n') + '\n';
+          // Write remaining lines back. If a new file was created by
+          // appendPayloadSync in the meantime, append to it.
+          appendFileSyncDurable(this.filePath, remaining, 0o600);
+        }
+
+        // A successful clearSent invalidates our in-memory counter.
+        // Lazy recount on next getPendingCount() is O(lines) and only
+        // runs rarely (drain-after-failed-send).
+        this.pendingPayloadCount = null;
+
+        try {
+          fs.unlinkSync(tempPath);
+        } catch (unlinkError) {
+          const code = (unlinkError as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT') {
+            this.reportError('clearSent_unlink_failed', unlinkError);
+          }
+        }
+      } catch (error) {
+        // If we renamed but failed to process, try to restore the original.
+        try {
+          if (fs.existsSync(tempPath) && !fs.existsSync(this.filePath)) {
+            fs.renameSync(tempPath, this.filePath);
+          }
+        } catch (restoreError) {
+          this.reportError('clearSent_restore_failed', restoreError);
+        }
+
+        this.reportError('clearSent_failed', error);
+      }
+    });
+  }
+
+  public hasPending(): boolean {
+    try {
+      const stats = fs.statSync(this.filePath);
+      return stats.size > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  public getPendingCount(): number {
+    this.ensurePendingCountInitialized();
+    return this.pendingPayloadCount ?? 0;
+  }
+
+  private ensurePendingCountInitialized(): void {
+    if (this.pendingPayloadCount !== null) {
+      return;
+    }
+
+    try {
+      if (!fs.existsSync(this.filePath)) {
+        this.pendingPayloadCount = 0;
+        return;
+      }
+
+      const content = fs.readFileSync(this.filePath, 'utf8');
+      const lines = content.split('\n').filter((line) => line.length > 0);
+
+      let payloadCount = 0;
+      for (const line of lines) {
+        const envelope = this.parseEnvelope(line);
+        if (envelope !== null && envelope.kind === 'payload') {
+          payloadCount += 1;
+        }
+      }
+
+      this.pendingPayloadCount = payloadCount;
+    } catch {
+      this.pendingPayloadCount = 0;
+    }
+  }
+
+  private appendEnvelopeSync(
+    input:
+      | Omit<DeadLetterPayloadEnvelope, 'mac'>
+      | Omit<DeadLetterMarkerEnvelope, 'mac'>
+  ): boolean {
+    try {
+      const dir = path.dirname(this.filePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      }
+
+      return withLockSync(this.lockPath, () => {
+        if (this.exceedsMaxSize()) {
+          if (!this.rotateIfNeededSync()) {
+            return false;
+          }
+        }
+
+        const envelope: DeadLetterEnvelope =
+          input.kind === 'payload'
+            ? {
+                ...input,
+                mac: this.signEnvelope(input)
+              }
+            : {
+                ...input,
+                mac: this.signEnvelope(input)
+              };
+
+        appendFileSyncDurable(
+          this.filePath,
+          JSON.stringify(envelope) + '\n',
+          0o600
+        );
+        return true;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      safeConsole.warn(`[ErrorCore] Dead-letter store append failed: ${message}`);
+      const code = classifyDlqWriteErrno(error);
+      this.reportWarning({
+        code,
+        message:
+          code === 'EC_DISK_FULL'
+            ? `Dead-letter store append failed: out of disk space. Check disk capacity at the dead-letter path.`
+            : `Dead-letter store append failed: ${message}. Check permissions and path at deadLetterPath.`,
+        cause: error,
+        context: { errno: (error as NodeJS.ErrnoException | null)?.code }
+      });
+      return false;
+    }
+  }
+
+  private parseEnvelope(line: string): DeadLetterEnvelope | null {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+
+      if (!isRecordObject(parsed)) {
+        return null;
+      }
+
+      if (
+        parsed.version !== 1 ||
+        (parsed.kind !== 'payload' && parsed.kind !== 'marker') ||
+        typeof parsed.storedAt !== 'string' ||
+        !isIsoTimestamp(parsed.storedAt) ||
+        typeof parsed.mac !== 'string'
+      ) {
+        return null;
+      }
+
+      if (parsed.kind === 'payload') {
+        if (
+          typeof parsed.payload !== 'string' ||
+          getUtf8ByteLength(parsed.payload) === 0 ||
+          getUtf8ByteLength(parsed.payload) > this.maxPayloadBytes
+        ) {
+          return null;
+        }
+
+        if (this.requireEncryptedPayload && !isEncryptedPayloadFormat(parsed.payload)) {
+          return null;
+        }
+
+        if (parsed.id !== undefined && typeof parsed.id !== 'string') {
+          return null;
+        }
+      } else if (typeof parsed.code !== 'string' || parsed.code.length === 0) {
+        return null;
+      }
+
+      const unsigned =
+        parsed.kind === 'payload'
+          ? {
+              version: 1 as const,
+              kind: 'payload' as const,
+              storedAt: parsed.storedAt,
+              ...(typeof parsed.id === 'string' ? { id: parsed.id } : {}),
+              payload: parsed.payload as string
+            }
+          : {
+              version: 1 as const,
+              kind: 'marker' as const,
+              storedAt: parsed.storedAt,
+              code: parsed.code as string
+            };
+
+      if (!this.verifyMac(unsigned, parsed.mac)) {
+        return null;
+      }
+
+      return parsed.kind === 'payload'
+        ? {
+            version: 1,
+            kind: 'payload',
+            storedAt: parsed.storedAt,
+            ...(typeof parsed.id === 'string' ? { id: parsed.id } : {}),
+            payload: parsed.payload as string,
+            mac: parsed.mac
+          }
+        : {
+            version: 1,
+            kind: 'marker',
+            storedAt: parsed.storedAt,
+            code: parsed.code as string,
+            mac: parsed.mac
+          };
+    } catch {
+      return null;
+    }
+  }
+
+  private signEnvelope(
+    envelope:
+      | Omit<DeadLetterPayloadEnvelope, 'mac'>
+      | Omit<DeadLetterMarkerEnvelope, 'mac'>
+  ): string {
+    return this.verifier.sign(JSON.stringify(envelope));
+  }
+
+  private verifyMac(
+    envelope:
+      | Omit<DeadLetterPayloadEnvelope, 'mac'>
+      | Omit<DeadLetterMarkerEnvelope, 'mac'>,
+    mac: string
+  ): boolean {
+    return this.verifier.verifyKeyIndex(JSON.stringify(envelope), mac) !== null;
+  }
+
+  /**
+   * Like verifyMac but returns the matching key's index in the chain
+   * (or null on failure). Used by reSignAll to detect entries written
+   * under previous keys.
+   */
+  private verifyMacWithIndex(
+    envelope:
+      | Omit<DeadLetterPayloadEnvelope, 'mac'>
+      | Omit<DeadLetterMarkerEnvelope, 'mac'>,
+    mac: string
+  ): number | null {
+    return this.verifier.verifyKeyIndex(JSON.stringify(envelope), mac);
+  }
+
+  private computePayloadId(payload: string): string {
+    return `sha256:${createHash('sha256').update(payload).digest('hex')}`;
+  }
+
+  private exceedsMaxSize(): boolean {
+    try {
+      const stats = fs.statSync(this.filePath);
+      return stats.size >= this.maxSizeBytes;
+    } catch {
+      return false;
+    }
+  }
+
+  private rotateIfNeededSync(): boolean {
+    if (!this.exceedsMaxSize()) {
+      return true;
+    }
+
+    if (this.maxBackups <= 0) {
+      this.reportWarning({
+        code: 'EC_DLQ_FULL',
+        message: `Dead-letter store exceeded maximum size (${this.maxSizeBytes} bytes); dropping payload.`,
+        context: { maxSizeBytes: this.maxSizeBytes, reason: 'size_cap' }
+      });
+      return false;
+    }
+
+    const stamp = Date.now();
+    const seq = ++this.rotateCounter;
+    const rotatedPath = `${this.filePath}.${stamp}-${seq}.bak`;
+    fs.renameSync(this.filePath, rotatedPath);
+    this.pendingPayloadCount = 0;
+    this.cleanupOldBackupsSync();
+    return true;
+  }
+
+  private cleanupOldBackupsSync(): void {
+    if (this.maxBackups < 0) {
+      return;
+    }
+
+    const dir = path.dirname(this.filePath);
+    const base = path.basename(this.filePath);
+    const prefix = `${base}.`;
+    const suffix = '.bak';
+
+    try {
+      const backups = fs
+        .readdirSync(dir)
+        .filter((entry) => entry.startsWith(prefix) && entry.endsWith(suffix))
+        .sort()
+        .reverse();
+
+      for (const backup of backups.slice(this.maxBackups)) {
+        try {
+          fs.unlinkSync(path.join(dir, backup));
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+
+  /**
+   * One-shot maintenance pass. Re-signs every valid entry with the
+   * primary key. Used by `errorcore drain --rotate`. Lines that fail
+   * verification under any key in the chain are dropped (they are not
+   * recoverable). Returns counts so the CLI can report.
+   */
+  public reSignAll(): { resigned: number; dropped: number; markersKept: number } {
+    return withLockSync(this.lockPath, () => {
+      let resigned = 0;
+      let dropped = 0;
+      let markersKept = 0;
+
+      if (!fs.existsSync(this.filePath)) {
+        return { resigned, dropped, markersKept };
+      }
+      const content = fs.readFileSync(this.filePath, 'utf8');
+      const lines = content.split('\n').filter((l) => l.length > 0);
+      const out: string[] = [];
+
+      for (const line of lines) {
+        const parsed = parseRawEnvelope(line);
+        if (parsed === null) {
+          dropped += 1;
+          continue;
+        }
+        const unsigned = stripMac(parsed);
+        const idx = this.verifyMacWithIndex(unsigned, parsed.mac);
+        if (idx === null) {
+          dropped += 1;
+          continue;
+        }
+        // Re-sign with the primary key (always index 0 of the chain).
+        const newMac = this.verifier.sign(JSON.stringify(unsigned));
+        const reSigned = JSON.stringify({ ...unsigned, mac: newMac });
+        out.push(reSigned);
+        if (parsed.kind === 'marker') {
+          markersKept += 1;
+        } else {
+          resigned += 1;
+        }
+      }
+
+      const tempPath = this.filePath + '.rotating';
+      writeFileSyncDurable(
+        tempPath,
+        out.join('\n') + (out.length > 0 ? '\n' : ''),
+        0o600
+      );
+      fs.renameSync(tempPath, this.filePath);
+      this.pendingPayloadCount = resigned;
+      return { resigned, dropped, markersKept };
+    });
+  }
+}
+
+function parseRawEnvelope(line: string): DeadLetterEnvelope | null {
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    if (!isRecordObject(parsed) || parsed.version !== 1) return null;
+    if (parsed.kind === 'payload') {
+      if (
+        typeof parsed.payload !== 'string' ||
+        typeof parsed.mac !== 'string' ||
+        typeof parsed.storedAt !== 'string' ||
+        (parsed.id !== undefined && typeof parsed.id !== 'string')
+      ) return null;
+      return {
+        version: 1,
+        kind: 'payload',
+        storedAt: parsed.storedAt,
+        ...(typeof parsed.id === 'string' ? { id: parsed.id } : {}),
+        payload: parsed.payload,
+        mac: parsed.mac
+      };
+    }
+    if (parsed.kind === 'marker') {
+      if (
+        typeof parsed.code !== 'string' ||
+        typeof parsed.mac !== 'string' ||
+        typeof parsed.storedAt !== 'string'
+      ) return null;
+      return {
+        version: 1,
+        kind: 'marker',
+        storedAt: parsed.storedAt,
+        code: parsed.code,
+        mac: parsed.mac
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function stripMac(
+  env: DeadLetterEnvelope
+): Omit<DeadLetterPayloadEnvelope, 'mac'> | Omit<DeadLetterMarkerEnvelope, 'mac'> {
+  if (env.kind === 'payload') {
+    return {
+      version: 1,
+      kind: 'payload',
+      storedAt: env.storedAt,
+      ...(env.id !== undefined ? { id: env.id } : {}),
+      payload: env.payload
+    };
+  }
+  return {
+    version: 1,
+    kind: 'marker',
+    storedAt: env.storedAt,
+    code: env.code
+  };
+}

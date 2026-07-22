@@ -1,0 +1,2298 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Server } from 'node:http';
+import { channel } from 'node:diagnostics_channel';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import {
+  attachSupplementalLocals,
+  captureError as captureErrorFacade,
+  createSDK as createSDKFacade,
+  getCaptureMode as getCaptureModeFacade,
+  init,
+  setCaptureMode as setCaptureModeFacade,
+  shutdown as shutdownFacade,
+  trackState as trackStateFacade,
+  withContext as withContextFacade
+} from '../../src/index';
+import { createSDK } from '../../src/sdk';
+import { Encryption } from '../../src/security/encryption';
+import { DeadLetterStore } from '../../src/transport/dead-letter-store';
+import {
+  detectBundler,
+  isNextJsNodeRuntime,
+  classifyRecorderStatus,
+  formatStartupLine,
+  formatWarnGuidance
+} from '../../src/sdk-diagnostics';
+import type { TransportPayload } from '../../src/types';
+
+function createTestSDK() {
+  return createSDK({ transport: { type: 'stdout' }, allowUnencrypted: true });
+}
+
+describe('SDK composition', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  it('createSDK returns an SDKInstance with all components wired', async () => {
+    const sdk = createTestSDK();
+
+    try {
+      expect(sdk.config).toBeDefined();
+      expect(sdk.buffer).toBeDefined();
+      expect(sdk.als).toBeDefined();
+      expect(sdk.requestTracker).toBeDefined();
+      expect(sdk.inspector).toBeDefined();
+      expect(sdk.channelSubscriber).toBeDefined();
+      expect(sdk.patchManager).toBeDefined();
+      expect(sdk.stateTracker).toBeDefined();
+      expect(sdk.errorCapturer).toBeDefined();
+      expect(sdk.transport).toBeDefined();
+      expect(sdk.processMetadata).toBeDefined();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('reinstalls the fetch wrapper at request start if a framework replaced fetch after activation', async () => {
+    const originalFetch = globalThis.fetch;
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    globalThis.fetch = vi.fn(async () => new Response('initial')) as typeof globalThis.fetch;
+
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      // Standing fetch-recorder behavior: safe no longer runs the fetch
+      // recorder, so this test pins the full-pipeline mode.
+      captureMode: 'balanced',
+      captureResponseBodies: true,
+      captureLocalVariables: false
+    });
+
+    try {
+      sdk.activate();
+
+      const frameworkFetch = vi.fn(async (_input, init) => {
+        const headers = new Headers(init?.headers);
+        expect(headers.get('traceparent')).toMatch(/^00-/);
+        expect(headers.get('tracestate')).toMatch(/^ec=clk:/);
+        return new Response('framework');
+      }) as typeof globalThis.fetch;
+      globalThis.fetch = frameworkFetch;
+
+      sdk.prepareForRequestStart();
+
+      expect(globalThis.fetch).not.toBe(frameworkFetch);
+
+      const context = sdk.als.createRequestContext({
+        method: 'GET',
+        url: '/framework-fetch',
+        headers: {}
+      });
+      const response = await sdk.als.runWithContext(context, () =>
+        fetch('http://framework-fetch.local', {
+          headers: { accept: 'text/plain' }
+        })
+      );
+
+      expect(await response.text()).toBe('framework');
+      expect(frameworkFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      await sdk.shutdown();
+      globalThis.fetch = originalFetch;
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    }
+  });
+
+  it('does not expose collector authorization on the public config surface', async () => {
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer super-secret'
+      }
+    });
+
+    try {
+      expect(sdk.config.transport).toEqual({
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        protocol: 'auto'
+      });
+      expect(JSON.stringify(sdk.config)).not.toContain('super-secret');
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('fast mode captures explicit request context and supplemental locals, then sends on flush', async () => {
+    const sdk = createSDK({
+      captureMode: 'fast',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true
+    });
+    const sentPayloads: TransportPayload[] = [];
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockImplementation(async (payload) => {
+      sentPayloads.push(payload);
+    });
+    const lagSpy = vi.spyOn(sdk.processMetadata, 'startEventLoopLagMeasurement');
+    const subscribeSpy = vi.spyOn(sdk.channelSubscriber, 'subscribeAll');
+    const patchSpy = vi.spyOn(sdk.patchManager, 'installAll');
+    const httpServerInstallSpy = vi.spyOn(sdk['httpServerRecorder'], 'install');
+
+    try {
+      sdk.activate();
+
+      expect(lagSpy).not.toHaveBeenCalled();
+      expect(subscribeSpy).not.toHaveBeenCalled();
+      expect(patchSpy).not.toHaveBeenCalled();
+      expect(httpServerInstallSpy).not.toHaveBeenCalled();
+
+      const error = new Error('direct synthetic benchmark error');
+      attachSupplementalLocals(error, [{
+        functionName: 'captureSyntheticError',
+        filePath: 'app/error-workload.mjs',
+        lineNumber: 7,
+        columnNumber: 11,
+        locals: {
+          benchmarkLocals: { marker: 'direct:/error/1000:503' },
+          localChecksum: 'checksum-1'
+        }
+      }]);
+
+      sdk.captureError(error, {
+        request: {
+          method: 'POST',
+          url: '/error/1000?token=secret-token',
+          statusCode: 503,
+          headers: {
+            host: 'bench-app',
+            traceparent: '00-0123456789abcdef0123456789abcdef-1111111111111111-01',
+            tracestate: 'vendor=value'
+          },
+          bodyLength: 123,
+          bodyHash: 'sha256:request-body'
+        }
+      });
+
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      await sdk.flush();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      const serialized = sentPayloads[0]?.serialized;
+      expect(typeof serialized).toBe('string');
+      const envelope = JSON.parse(serialized as string) as { ciphertext: string };
+      const pkg = JSON.parse(Buffer.from(envelope.ciphertext, 'base64').toString('utf8')) as {
+        schemaVersion: string;
+        request?: { id?: string; method?: string; url?: string; headers?: Record<string, unknown> };
+        ioTimeline: Array<{
+          type: string;
+          direction: string;
+          requestId: string | null;
+          method: string | null;
+          url: string | null;
+          statusCode: number | null;
+          requestBody: unknown | null;
+          requestBodyDigest?: string | null;
+          requestBodyOriginalSize: number | null;
+        }>;
+        localVariables?: Array<{ locals: Record<string, unknown> }>;
+        trace?: {
+          traceId: string;
+          spanId: string;
+          parentSpanId: string | null;
+          tracestate?: string;
+          traceFlags?: number;
+          isEntrySpan?: boolean;
+        };
+        completeness: {
+          requestCaptured: boolean;
+          ioTimelineCaptured: boolean;
+          alsContextAvailable: boolean;
+          localVariablesCaptured: boolean;
+        };
+      };
+
+      expect(pkg.schemaVersion).toBe('1.3.0');
+      expect(pkg.request).toMatchObject({
+        method: 'POST',
+        url: '/error/1000?token=%5BREDACTED%5D'
+      });
+      expect(pkg.request?.headers).toHaveProperty('host');
+      expect(pkg.ioTimeline).toHaveLength(1);
+      expect(pkg.ioTimeline[0]).toMatchObject({
+        type: 'http-server',
+        direction: 'inbound',
+        requestId: pkg.request?.id,
+        method: 'POST',
+        url: '/error/1000?token=%5BREDACTED%5D',
+        statusCode: 503,
+        requestBody: null,
+        requestBodyDigest: 'sha256:request-body',
+        requestBodyOriginalSize: 123
+      });
+      expect(pkg.localVariables?.[0]?.locals).toHaveProperty('benchmarkLocals');
+      expect(pkg.localVariables?.[0]?.locals).toHaveProperty('localChecksum');
+      expect(pkg.trace).toMatchObject({
+        traceId: '0123456789abcdef0123456789abcdef',
+        parentSpanId: '1111111111111111',
+        tracestate: 'vendor=value',
+        traceFlags: 1,
+        isEntrySpan: false
+      });
+      expect(pkg.trace?.spanId).toMatch(/^[0-9a-f]{16}$/);
+      expect(pkg.trace?.spanId).not.toBe('1111111111111111');
+      expect(pkg.completeness).toMatchObject({
+        requestCaptured: true,
+        ioTimelineCaptured: true,
+        alsContextAvailable: true,
+        localVariablesCaptured: true
+      });
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('fast mode shutdown flushes pending payloads before transport shutdown', async () => {
+    const sdk = createSDK({
+      captureMode: 'fast',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true
+    });
+    const calls: string[] = [];
+    vi.spyOn(sdk.transport, 'send').mockImplementation(async () => {
+      calls.push('send');
+    });
+    vi.spyOn(sdk.transport, 'shutdown').mockImplementation(async () => {
+      calls.push('shutdown');
+    });
+
+    sdk.activate();
+    sdk.captureError(new Error('shutdown-fast'), {
+      request: {
+        method: 'GET',
+        url: '/shutdown',
+        headers: { host: 'bench-app' },
+        statusCode: 500
+      }
+    });
+
+    expect(calls).toEqual([]);
+
+    await sdk.shutdown();
+
+    expect(calls).toEqual(['send', 'shutdown']);
+  });
+
+  it('setCaptureMode hot-swaps mode state and reports changed fields', async () => {
+    const sdk = createSDK({
+      captureMode: 'safe',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+
+    try {
+      sdk.activate();
+
+      expect(sdk.getCaptureMode()).toBe('safe');
+      expect(sdk.getModeState().recorders.database).toBe(false);
+
+      const same = await sdk.setCaptureMode('safe');
+      expect(same).toMatchObject({ from: 'safe', to: 'safe', changed: [] });
+
+      const switched = await sdk.setCaptureMode('forensic');
+
+      expect(switched.from).toBe('safe');
+      expect(switched.to).toBe('forensic');
+      expect(switched.appliedInMs).toBeGreaterThanOrEqual(0);
+      expect(switched.changed).toEqual(expect.arrayContaining([
+        'captureMode',
+        'captureDbBindParams',
+        'captureRequestBodies',
+        'recorders.database'
+      ]));
+      expect(sdk.getCaptureMode()).toBe('forensic');
+      expect(sdk.getModeState()).toMatchObject({
+        captureMode: 'forensic',
+        captureDbBindParams: true,
+        captureRequestBodies: true,
+        captureResponseBodies: true
+      });
+      expect(sdk.getHealth()).toMatchObject({
+        captureMode: 'forensic',
+        adaptive: {
+          active: false,
+          phase: 'inactive',
+          lastEscalationAt: null,
+          switchCount: 1
+        }
+      });
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('refreshes fetch response-body policy across balanced and forensic switches without nesting wrappers', async () => {
+    const originalFetch = globalThis.fetch;
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    const underlyingFetch = vi.fn(async () => new Response('upstream'));
+    globalThis.fetch = underlyingFetch as typeof globalThis.fetch;
+
+    const sdk = createSDK({
+      captureMode: 'balanced',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+    const captureResponseSpy = vi
+      .spyOn(sdk['bodyCapture'], 'captureUndiciResponseStream')
+      .mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      const balancedWrapper = globalThis.fetch;
+
+      await fetch('http://mode-policy.local/balanced');
+      expect(captureResponseSpy).not.toHaveBeenCalled();
+
+      await sdk.setCaptureMode('forensic');
+      const forensicWrapper = globalThis.fetch;
+      expect(forensicWrapper).toBe(balancedWrapper);
+
+      await fetch('http://mode-policy.local/forensic');
+      expect(captureResponseSpy).toHaveBeenCalledTimes(1);
+
+      await sdk.setCaptureMode('balanced');
+      expect(globalThis.fetch).toBe(forensicWrapper);
+
+      await fetch('http://mode-policy.local/balanced-again');
+      expect(captureResponseSpy).toHaveBeenCalledTimes(1);
+      expect(underlyingFetch).toHaveBeenCalledTimes(3);
+
+      await sdk.shutdown();
+      expect(globalThis.fetch).toBe(underlyingFetch);
+    } finally {
+      await sdk.shutdown();
+      globalThis.fetch = originalFetch;
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    }
+  });
+
+  it('deactivates a buried fetch wrapper before wrapping a delegating framework fetch', async () => {
+    const originalFetch = globalThis.fetch;
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+    delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    const underlyingFetch = vi.fn(async () => new Response('upstream'));
+    globalThis.fetch = underlyingFetch as typeof globalThis.fetch;
+
+    const sdk = createSDK({
+      captureMode: 'balanced',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+    const captureResponseSpy = vi
+      .spyOn(sdk['bodyCapture'], 'captureUndiciResponseStream')
+      .mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      const buriedErrorCoreFetch = globalThis.fetch;
+      const frameworkFetch = vi.fn((input, init) =>
+        buriedErrorCoreFetch.call(globalThis, input, init)
+      ) as typeof globalThis.fetch;
+      globalThis.fetch = frameworkFetch;
+
+      sdk.prepareForRequestStart();
+      const outerErrorCoreFetch = globalThis.fetch;
+      expect(outerErrorCoreFetch).not.toBe(frameworkFetch);
+
+      await sdk.setCaptureMode('forensic');
+      expect(globalThis.fetch).toBe(outerErrorCoreFetch);
+      await fetch('http://wrapper-chain.local/forensic');
+
+      expect(sdk.buffer.getStats().slotCount).toBe(1);
+      expect(captureResponseSpy).toHaveBeenCalledTimes(1);
+      expect(frameworkFetch).toHaveBeenCalledTimes(1);
+      expect(underlyingFetch).toHaveBeenCalledTimes(1);
+
+      await sdk.setCaptureMode('balanced');
+      expect(globalThis.fetch).toBe(outerErrorCoreFetch);
+      await fetch('http://wrapper-chain.local/balanced');
+
+      expect(sdk.buffer.getStats().slotCount).toBe(2);
+      expect(captureResponseSpy).toHaveBeenCalledTimes(1);
+      expect(frameworkFetch).toHaveBeenCalledTimes(2);
+      expect(underlyingFetch).toHaveBeenCalledTimes(2);
+
+      await sdk.shutdown();
+      expect(globalThis.fetch).toBe(frameworkFetch);
+      await fetch('http://wrapper-chain.local/after-shutdown');
+
+      expect(sdk.buffer.getStats().slotCount).toBe(0);
+      expect(captureResponseSpy).toHaveBeenCalledTimes(1);
+      expect(frameworkFetch).toHaveBeenCalledTimes(3);
+      expect(underlyingFetch).toHaveBeenCalledTimes(3);
+    } finally {
+      await sdk.shutdown();
+      globalThis.fetch = originalFetch;
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperInstalled')];
+      delete (globalThis as Record<symbol, unknown>)[Symbol.for('errorcore.fetchWrapperPatchedFetch')];
+    }
+  });
+
+  it('coalesces repeat target switches and rejects switching after shutdown', async () => {
+    const sdk = createSDK({
+      captureMode: 'safe',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+
+    sdk.activate();
+    const first = await sdk.setCaptureMode('balanced');
+    const repeat = await sdk.setCaptureMode('balanced');
+    vi.useRealTimers();
+    await sdk.shutdown();
+
+    expect(first.changed).toContain('captureMode');
+    expect(repeat).toMatchObject({ from: 'balanced', to: 'balanced', changed: [] });
+    await expect(sdk.setCaptureMode('safe')).rejects.toThrow('SDK is shut down');
+  });
+
+  it('rejects a mode switch racing shutdown without reinstalling recorder patches', async () => {
+    const originalEmit = Server.prototype.emit;
+    const sdk = createSDK({
+      captureMode: 'fast',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+    const httpServerRecorder = (
+      sdk as unknown as { httpServerRecorder: { install(): void } }
+    ).httpServerRecorder;
+    const installSpy = vi.spyOn(httpServerRecorder, 'install');
+
+    sdk.activate();
+
+    const shutdownPromise = sdk.shutdown();
+    const switchPromise = sdk.setCaptureMode('forensic');
+
+    await expect(switchPromise).rejects.toThrow('SDK is shutting down');
+    await shutdownPromise;
+
+    expect(installSpy).not.toHaveBeenCalled();
+    expect(sdk.getCaptureMode()).toBe('fast');
+    expect(Server.prototype.emit).toBe(originalEmit);
+  });
+
+  it('unbinds the exact diagnostics store across repeated recorder switches and shutdown', async () => {
+    const originalEmit = Server.prototype.emit;
+    const requestStartChannel = channel('http.server.request.start');
+    const sdk = createSDK({
+      captureMode: 'fast',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+    const store = sdk.als.getStore();
+    const httpServerRecorder = (
+      sdk as unknown as {
+        httpServerRecorder: { boundStore: typeof store | null };
+      }
+    ).httpServerRecorder;
+    const readBoundContext = () =>
+      requestStartChannel.runStores({}, () => sdk.als.getContext());
+
+    try {
+      sdk.activate();
+
+      await sdk.setCaptureMode('forensic');
+      expect(Server.prototype.emit).not.toBe(originalEmit);
+      expect(httpServerRecorder.boundStore).toBe(store);
+      expect(readBoundContext()).toBeDefined();
+
+      await sdk.setCaptureMode('safe');
+      expect(Server.prototype.emit).toBe(originalEmit);
+      expect(httpServerRecorder.boundStore).toBeNull();
+      expect(readBoundContext()).toBeUndefined();
+
+      await sdk.setCaptureMode('forensic');
+      expect(Server.prototype.emit).not.toBe(originalEmit);
+      expect(httpServerRecorder.boundStore).toBe(store);
+      expect(readBoundContext()).toBeDefined();
+
+      await sdk.shutdown();
+      expect(Server.prototype.emit).toBe(originalEmit);
+      expect(httpServerRecorder.boundStore).toBeNull();
+      expect(readBoundContext()).toBeUndefined();
+    } finally {
+      if (sdk.isActive()) {
+        await sdk.shutdown();
+      }
+      Server.prototype.emit = originalEmit;
+    }
+  });
+
+  it('lazily creates and reuses mode resources when switching into forensic', async () => {
+    const sdk = createSDK({
+      captureMode: 'fast',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: false,
+      captureLocalVariables: false
+    });
+    const internals = sdk as unknown as {
+      payloadSpool: unknown;
+      sourceMapResolver: unknown;
+      packageAssemblyController: {
+        dispatcher: unknown;
+        idleTimer: NodeJS.Timeout | null;
+      };
+    };
+    const bodyCaptureInternals = sdk.bodyCapture as unknown as { payloadSpool?: unknown };
+    const httpServerInternals = sdk.httpServerRecorder as unknown as { payloadSpool: unknown };
+    const errorCapturerInternals = sdk.errorCapturer as unknown as {
+      payloadSpool: unknown;
+      sourceMapResolver: unknown;
+      packageAssemblyDispatcher: unknown;
+    };
+
+    try {
+      sdk.activate();
+
+      expect(internals.payloadSpool).toBeNull();
+      expect(internals.sourceMapResolver).toBeNull();
+      expect(internals.packageAssemblyController.dispatcher).toBeNull();
+
+      await sdk.setCaptureMode('forensic');
+
+      const payloadSpool = internals.payloadSpool;
+      const sourceMapResolver = internals.sourceMapResolver;
+      const packageAssemblyDispatcher = internals.packageAssemblyController.dispatcher;
+      expect(payloadSpool).toBeTruthy();
+      expect(sourceMapResolver).toBeTruthy();
+      expect(packageAssemblyDispatcher).toBeTruthy();
+      expect(bodyCaptureInternals.payloadSpool).toBe(payloadSpool);
+      expect(httpServerInternals.payloadSpool).toBe(payloadSpool);
+      expect(errorCapturerInternals.payloadSpool).toBe(payloadSpool);
+      expect(errorCapturerInternals.sourceMapResolver).toBe(sourceMapResolver);
+      expect(errorCapturerInternals.packageAssemblyDispatcher).toBe(packageAssemblyDispatcher);
+
+      await sdk.setCaptureMode('safe');
+
+      expect(internals.payloadSpool).toBe(payloadSpool);
+      expect(internals.packageAssemblyController.dispatcher).toBe(packageAssemblyDispatcher);
+      expect(bodyCaptureInternals.payloadSpool).toBeUndefined();
+      expect(httpServerInternals.payloadSpool).toBeNull();
+      expect(errorCapturerInternals.payloadSpool).toBe(payloadSpool);
+      expect(internals.packageAssemblyController.idleTimer).toBeTruthy();
+
+      await sdk.setCaptureMode('forensic');
+
+      expect(internals.payloadSpool).toBe(payloadSpool);
+      expect(internals.sourceMapResolver).toBe(sourceMapResolver);
+      expect(internals.packageAssemblyController.dispatcher).toBe(packageAssemblyDispatcher);
+      expect(internals.packageAssemblyController.idleTimer).toBeNull();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('refreshes the live package worker config across balanced-to-forensic switching', async () => {
+    const sdk = createSDK({
+      captureMode: 'balanced',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureLocalVariables: false
+    });
+    const controller = (sdk as unknown as {
+      packageAssemblyController: {
+        dispatcher: { updateConfig(config: { maxLocalsFrames: number }): Promise<void> };
+      };
+    }).packageAssemblyController;
+    const initialDispatcher = controller.dispatcher;
+    const updateSpy = vi.spyOn(initialDispatcher, 'updateConfig');
+
+    try {
+      sdk.activate();
+      await sdk.setCaptureMode('forensic');
+
+      expect(controller.dispatcher).toBe(initialDispatcher);
+      expect(updateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ captureMode: 'forensic', maxLocalsFrames: 10 })
+      );
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('falls back to inline assembly when a live worker config refresh fails', async () => {
+    const warnings: string[] = [];
+    const sdk = createSDK({
+      captureMode: 'balanced',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureLocalVariables: false,
+      onInternalWarning: (warning) => warnings.push(warning.code)
+    });
+    const controller = (sdk as unknown as {
+      packageAssemblyController: {
+        dispatcher: { updateConfig(config: unknown): Promise<void> } | null;
+      };
+    }).packageAssemblyController;
+    const dispatcher = controller.dispatcher!;
+    vi.spyOn(dispatcher, 'updateConfig').mockRejectedValue(new Error('worker update failed'));
+
+    try {
+      sdk.activate();
+      await expect(sdk.setCaptureMode('forensic')).resolves.toMatchObject({
+        from: 'balanced',
+        to: 'forensic'
+      });
+
+      expect(controller.dispatcher).toBeNull();
+      expect((sdk.errorCapturer as unknown as { packageAssemblyDispatcher: unknown })
+        .packageAssemblyDispatcher).toBeNull();
+      expect(warnings).toContain('EC_PACKAGE_ASSEMBLY_WORKER_FAILED');
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('applies in-process mode resources before awaiting the worker config acknowledgement', async () => {
+    let acknowledgeUpdate!: () => void;
+    const updateAcknowledgement = new Promise<void>((resolve) => {
+      acknowledgeUpdate = resolve;
+    });
+    const sdk = createSDK({
+      captureMode: 'balanced',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureLocalVariables: false
+    });
+    const controller = (sdk as unknown as {
+      packageAssemblyController: {
+        dispatcher: { updateConfig(config: { captureMode: string }): Promise<void> };
+      };
+    }).packageAssemblyController;
+    const updateSpy = vi
+      .spyOn(controller.dispatcher, 'updateConfig')
+      .mockReturnValue(updateAcknowledgement);
+    const bodyStateSpy = vi.spyOn(sdk.bodyCapture, 'applyModeState');
+
+    try {
+      sdk.activate();
+      const switching = sdk.setCaptureMode('forensic');
+      await Promise.resolve();
+
+      expect(updateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ captureMode: 'forensic' })
+      );
+      expect(bodyStateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ captureMode: 'forensic' }),
+        expect.anything()
+      );
+
+      acknowledgeUpdate();
+      await switching;
+    } finally {
+      acknowledgeUpdate();
+      await sdk.shutdown();
+    }
+  });
+
+  it('awaits an idle-started package worker teardown during SDK shutdown', async () => {
+    vi.useFakeTimers();
+    let releaseTeardown!: () => void;
+    const teardown = new Promise<void>((resolve) => {
+      releaseTeardown = resolve;
+    });
+    const sdk = createSDK({
+      captureMode: 'balanced',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureLocalVariables: false
+    });
+    const controller = (sdk as unknown as {
+      packageAssemblyController: {
+        dispatcher: { shutdown(options?: { timeoutMs?: number }): Promise<void> } | null;
+      };
+    }).packageAssemblyController;
+    const dispatcher = controller.dispatcher!;
+    const shutdownSpy = vi.spyOn(dispatcher, 'shutdown').mockReturnValue(teardown);
+
+    try {
+      sdk.activate();
+      await sdk.setCaptureMode('safe');
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+
+      expect(shutdownSpy).toHaveBeenCalledTimes(1);
+      expect(controller.dispatcher).toBeNull();
+
+      let sdkShutdownSettled = false;
+      const sdkShutdown = sdk.shutdown().then(() => {
+        sdkShutdownSettled = true;
+      });
+      await Promise.resolve();
+      expect(sdkShutdownSettled).toBe(false);
+
+      releaseTeardown();
+      await sdkShutdown;
+      expect(sdkShutdownSettled).toBe(true);
+    } finally {
+      releaseTeardown();
+      vi.useRealTimers();
+      await sdk.shutdown();
+    }
+  });
+
+  it('does not disable AsyncLocalStorage during mode switches', async () => {
+    const sdk = createSDK({
+      captureMode: 'safe',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+    const disableSpy = vi.spyOn(sdk.als.getStore(), 'disable');
+
+    sdk.activate();
+    await sdk.setCaptureMode('fast');
+    await sdk.setCaptureMode('safe');
+
+    expect(disableSpy).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+
+    expect(disableSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('exposes module-level setCaptureMode and getCaptureMode', async () => {
+    const sdk = init({
+      captureMode: 'safe',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false
+    });
+
+    try {
+      expect(getCaptureModeFacade()).toBe('safe');
+      const result = await setCaptureModeFacade('fast');
+      expect(result).toMatchObject({ from: 'safe', to: 'fast' });
+      expect(getCaptureModeFacade()).toBe('fast');
+      expect(sdk.getCaptureMode()).toBe('fast');
+    } finally {
+      await shutdownFacade();
+    }
+  });
+
+  it('does not call process.exit when the host has its own uncaughtException handler', async () => {
+    // Regression: the previous behavior was that the SDK always forced
+    // process.exit(1) after capturing an uncaught exception, even when
+    // the host application had installed its own handler that expected
+    // to keep the process alive.
+    const existingHostHandler = vi.fn();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((_code?: number) => {
+      // Do not actually exit during the test; we only need to observe
+      // whether the SDK tried to call exit.
+      return undefined as never;
+    }) as (code?: number | string | null | undefined) => never);
+
+    // Install the host handler BEFORE the SDK activates so the SDK's
+    // snapshot count sees a pre-existing listener.
+    process.on('uncaughtException', existingHostHandler);
+
+    let sdk: ReturnType<typeof createSDK> | undefined;
+    try {
+      sdk = createSDK({
+        transport: { type: 'stdout' },
+        allowUnencrypted: true,
+        // Disable the worker path so capture is synchronous and we do not
+        // race with async package assembly.
+        useWorkerAssembly: false
+      });
+      sdk.activate();
+
+      // Find the SDK's uncaughtException handler and invoke it with a
+      // synthesized error.
+      const listeners = process.listeners('uncaughtException');
+      const sdkHandler = listeners[listeners.length - 1] as (err: Error) => void;
+      expect(typeof sdkHandler).toBe('function');
+
+      sdkHandler(new Error('injected-uncaught'));
+
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.off('uncaughtException', existingHostHandler);
+      if (sdk !== undefined) {
+        await sdk.shutdown();
+      }
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('does not auto-load errorcore.config.js from the current working directory', async () => {
+    // Regression test: init() used to call tryLoadConfigFile() which did
+    // require(process.cwd() + '/errorcore.config.js'). That was an RCE surface
+    // for anything that initialized errorcore from an untrusted directory.
+    // After the fix, init() must never require the cwd config file.
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'errorcore-auto-config-'));
+    const configPath = path.join(tempDir, 'errorcore.config.js');
+    fs.writeFileSync(
+      configPath,
+      'throw new Error("errorcore.config.js was auto-loaded - this is the RCE we fixed");\n'
+    );
+
+    const origCwd = process.cwd();
+    process.chdir(tempDir);
+
+    try {
+      // With a config file on disk but no config argument, init() must not
+      // load it. We pass an explicit stdout config so activation succeeds.
+      const instance = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+      expect(instance.isActive()).toBe(true);
+    } finally {
+      process.chdir(origCwd);
+      await shutdownFacade();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not replay forged dead-letter entries on activate', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-forged-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    fs.writeFileSync(
+      deadLetterPath,
+      JSON.stringify({
+        version: 1,
+        kind: 'payload',
+        storedAt: new Date().toISOString(),
+        payload: '{"forged":true}',
+        mac: 'not-valid'
+      }) + '\n'
+    );
+
+    const sdk = createSDK({
+      encryptionKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer super-secret'
+      },
+      deadLetterPath
+    });
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      await Promise.resolve();
+
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+    }
+  });
+
+  it('replays valid signed dead-letter entries on activate and clears processed lines', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-valid-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const encryptionKey =
+      'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+    const enc = new Encryption(encryptionKey);
+    const envelope = enc.encryptToEnvelope(Buffer.from('{"ok":true}', 'utf8'), {
+      eventId: 'evt-dlq-replay'
+    });
+    const payload = JSON.stringify(envelope);
+    // The SDK reads the dead-letter file with an Encryption-derived HMAC
+    // (HKDF of encryptionKey under the hmac-key salt). Sign the fixture
+    // through the same Encryption instance so verification succeeds when
+    // the SDK replays it.
+    const store = new DeadLetterStore(deadLetterPath, {
+      verifier: {
+        sign: (p) => enc.sign(p),
+        verifyKeyIndex: (p, m) => {
+          const r = enc.verify(p, m);
+          return r.ok ? r.keyIndex : null;
+        }
+      },
+      requireEncryptedPayload: true
+    });
+
+    store.appendPayloadSync(payload);
+
+    const sdk = createSDK({
+      encryptionKey,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer super-secret'
+      },
+      deadLetterPath
+    });
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({
+        serialized: payload,
+        envelope: expect.objectContaining({
+          eventId: 'evt-dlq-replay',
+          keyId: envelope.keyId
+        })
+      }));
+      expect(fs.existsSync(deadLetterPath)).toBe(false);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+    }
+  });
+
+  it('replays dead-letter entries signed with collector authorization when no encryption key is configured', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-auth-only-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const authorization = 'Bearer replay-secret';
+    const payload = '{"ok":true}';
+    const store = new DeadLetterStore(deadLetterPath, {
+      integrityKey: authorization
+    });
+
+    store.appendPayloadSync(payload);
+
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization
+      },
+      deadLetterPath
+    });
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy).toHaveBeenCalledWith({
+        serialized: payload,
+        envelope: undefined
+      });
+      expect(fs.existsSync(deadLetterPath)).toBe(false);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+    }
+  });
+
+  it('replays auth-only dead-letter entries signed with previous collector authorization', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-auth-previous-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const payload = '{"ok":"previous-auth"}';
+    const store = new DeadLetterStore(deadLetterPath, {
+      integrityKey: 'Bearer old-replay-secret'
+    });
+
+    store.appendPayloadSync(payload);
+
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer current-replay-secret'
+      },
+      previousTransportAuthorizations: ['Bearer old-replay-secret'],
+      deadLetterPath
+    });
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockResolvedValue(undefined);
+
+    try {
+      sdk.activate();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy).toHaveBeenCalledWith({
+        serialized: payload,
+        envelope: undefined
+      });
+      expect(fs.existsSync(deadLetterPath)).toBe(false);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+    }
+  });
+
+  it('passes configured dead-letter rotation limits into the SDK-created store', async () => {
+    const deadLetterPath = path.join(
+      os.tmpdir(),
+      `errorcore-sdk-dlq-rotate-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    const sdk = createSDK({
+      allowUnencrypted: true,
+      transport: {
+        type: 'http',
+        url: 'https://collector.example.com/v1/errors',
+        authorization: 'Bearer rotation-secret'
+      },
+      deadLetterPath,
+      deadLetterMaxBytes: 1,
+      deadLetterMaxBackups: 1
+    });
+    const store = (sdk as unknown as {
+      deadLetterStore: DeadLetterStore | null;
+    }).deadLetterStore;
+
+    try {
+      expect(store).not.toBeNull();
+
+      store!.appendPayloadSync('{"p":1}');
+      store!.appendPayloadSync('{"p":2}');
+      store!.appendPayloadSync('{"p":3}');
+
+      const backups = fs
+        .readdirSync(path.dirname(deadLetterPath))
+        .filter((entry) =>
+          entry.startsWith(path.basename(deadLetterPath)) &&
+          entry.endsWith('.bak')
+        );
+
+      expect(backups).toHaveLength(1);
+      expect(store!.drain().entries.map((entry) => entry.payload)).toEqual([
+        '{"p":3}'
+      ]);
+    } finally {
+      await sdk.shutdown();
+      fs.rmSync(deadLetterPath, { force: true });
+      for (const backup of fs
+        .readdirSync(path.dirname(deadLetterPath))
+        .filter((entry) =>
+          entry.startsWith(path.basename(deadLetterPath)) &&
+          entry.endsWith('.bak')
+        )) {
+        fs.rmSync(path.join(path.dirname(deadLetterPath), backup), { force: true });
+      }
+    }
+  });
+
+  it('activate subscribes channels, installs patches, registers handlers, and starts lag measurement', async () => {
+    const onSpy = vi.spyOn(process, 'on');
+    // Full standing pipeline (all recorders + db patches) is balanced
+    // behavior now that safe runs only the inbound recorder.
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMode: 'balanced',
+      captureLocalVariables: false
+    });
+    const collectSpy = vi.spyOn(sdk.processMetadata, 'collectStartupMetadata');
+    const installSpy = vi.spyOn(sdk['httpServerRecorder'], 'install');
+    const lagSpy = vi.spyOn(sdk.processMetadata, 'startEventLoopLagMeasurement');
+    const subscribeSpy = vi.spyOn(sdk.channelSubscriber, 'subscribeAll');
+    const patchSpy = vi.spyOn(sdk.patchManager, 'installAll');
+
+    try {
+      sdk.activate();
+
+      expect(sdk.isActive()).toBe(true);
+      // collectStartupMetadata is called in the constructor, not activate()
+      expect(collectSpy).toHaveBeenCalledTimes(0);
+      expect(installSpy).toHaveBeenCalledTimes(1);
+      expect(subscribeSpy).toHaveBeenCalledTimes(1);
+      expect(patchSpy).toHaveBeenCalledTimes(1);
+      expect(lagSpy).toHaveBeenCalledTimes(1);
+      expect(onSpy.mock.calls.map((call) => call[0])).toEqual(
+        expect.arrayContaining([
+          'uncaughtException',
+          'unhandledRejection',
+          'beforeExit'
+        ])
+      );
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('safe mode drains buffered capture payloads on the flush timer', async () => {
+    vi.useFakeTimers();
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMode: 'safe',
+      captureLocalVariables: false // keep the real inspector out of this test
+    });
+
+    try {
+      sdk.activate();
+      const sendSpy = vi.spyOn(sdk.transport, 'send');
+      sdk.errorCapturer.capture(new Error('deferred'), {
+        request: { method: 'GET', url: '/timer-drain' }
+      });
+
+      // Deferred delivery: buffered at capture, nothing sent in-window.
+      expect(sdk.errorCapturer.getPendingTransportCount()).toBe(1);
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      // The flush timer drained the capturer's buffer into the transport.
+      // (Actual delivery settles on the transport worker's own clock and is
+      // covered by the transport suites.)
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      await sdk.shutdown();
+    }
+  });
+
+  it('does not patch Server.prototype.emit until activate and restores fallback patch on shutdown', async () => {
+    const originalEmit = Server.prototype.emit;
+    // The emit-patch ships with the standing http-server recorder, which
+    // safe no longer runs — pin the full-pipeline mode.
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      captureMode: 'balanced',
+      captureLocalVariables: false
+    });
+
+    try {
+      expect(Server.prototype.emit).toBe(originalEmit);
+
+      sdk.activate();
+      // Post-fix (G2): emit-patch is always installed on activate, regardless
+      // of whether bindStore is available — it is the mechanism that propagates
+      // ALS to handlers registered via server.on('request', ...).
+      expect(Server.prototype.emit).not.toBe(originalEmit);
+
+      await sdk.shutdown();
+      expect(Server.prototype.emit).toBe(originalEmit);
+    } finally {
+      if (sdk.isActive()) {
+        await sdk.shutdown();
+      }
+    }
+  });
+
+  it('captureError delegates only when active', async () => {
+    const sdk = createTestSDK();
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture').mockReturnValue(null);
+
+    try {
+      sdk.captureError(new Error('inactive'));
+      expect(captureSpy).not.toHaveBeenCalled();
+
+      sdk.activate();
+      sdk.captureError(new Error('active'));
+
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('normalizes primitive thrown values before direct capture', async () => {
+    const sdk = createTestSDK();
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture').mockReturnValue(null);
+
+    try {
+      sdk.activate();
+      sdk.captureError('secret=super-secret' as unknown);
+
+      const normalized = captureSpy.mock.calls[0]?.[0] as Error & {
+        thrownType?: string;
+        thrownValue?: unknown;
+      };
+      expect(normalized).toBeInstanceOf(Error);
+      expect(normalized.name).toBe('NonErrorThrown');
+      expect(normalized.message).toBe('Non-Error thrown (string): "secret=[REDACTED]"');
+      expect(normalized.thrownType).toBe('string');
+      expect(normalized.thrownValue).toBe('secret=[REDACTED]');
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('normalizes unhandledRejection reasons before capture', async () => {
+    const sdk = createTestSDK();
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture').mockReturnValue(null);
+    const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => true);
+
+    try {
+      sdk.activate();
+      const listeners = process.listeners('unhandledRejection');
+      const sdkHandler = listeners[listeners.length - 1] as (reason: unknown) => void;
+
+      sdkHandler({ card: '4111111111111111' });
+
+      const normalized = captureSpy.mock.calls[0]?.[0] as Error & {
+        thrownType?: string;
+        thrownValue?: unknown;
+      };
+      expect(normalized.name).toBe('NonErrorThrown');
+      expect(normalized.thrownType).toBe('object');
+      expect(normalized.thrownValue).toEqual({ card: '[REDACTED]' });
+    } finally {
+      warnSpy.mockRestore();
+      await sdk.shutdown();
+    }
+  });
+
+  it('does not let SDK uncaughtException capture failures escape when the host has a handler', async () => {
+    const existingHostHandler = vi.fn();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined as never) as typeof process.exit);
+    process.on('uncaughtException', existingHostHandler);
+
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      useWorkerAssembly: false
+    });
+    vi.spyOn(sdk.errorCapturer, 'capture').mockImplementation(() => {
+      throw new Error('capture pipeline failed');
+    });
+
+    try {
+      sdk.activate();
+      const listeners = process.listeners('uncaughtException');
+      const sdkHandler = listeners[listeners.length - 1] as (err: unknown) => void;
+
+      expect(() => sdkHandler('primitive-crash')).not.toThrow();
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.off('uncaughtException', existingHostHandler);
+      await sdk.shutdown();
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('shutdown is idempotent and tears down components in order', async () => {
+    const removeListenerSpy = vi.spyOn(process, 'removeListener');
+    const sdk = createTestSDK();
+    const unsubscribeSpy = vi.spyOn(sdk.channelSubscriber, 'unsubscribeAll');
+    const unwrapSpy = vi.spyOn(sdk.patchManager, 'unwrapAll');
+    const inspectorSpy = vi.spyOn(sdk.inspector, 'shutdown');
+    const flushSpy = vi.spyOn(sdk.transport, 'flush');
+    const transportShutdownSpy = vi.spyOn(sdk.transport, 'shutdown');
+    const clearSpy = vi.spyOn(sdk.buffer, 'clear');
+
+    sdk.activate();
+    unsubscribeSpy.mockClear();
+    unwrapSpy.mockClear();
+    inspectorSpy.mockClear();
+    flushSpy.mockClear();
+    transportShutdownSpy.mockClear();
+    clearSpy.mockClear();
+
+    await sdk.shutdown();
+    await sdk.shutdown();
+
+    expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+    expect(unwrapSpy).toHaveBeenCalledTimes(1);
+    expect(inspectorSpy).toHaveBeenCalledTimes(1);
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    expect(transportShutdownSpy).toHaveBeenCalledTimes(1);
+    expect(clearSpy).toHaveBeenCalledTimes(1);
+    expect(removeListenerSpy).toHaveBeenCalled();
+    expect(sdk.isActive()).toBe(false);
+  });
+
+  it('closes capture admission before the final shutdown drain', async () => {
+    let releaseTransportFlush!: () => void;
+    const transportFlushGate = new Promise<void>((resolve) => {
+      releaseTransportFlush = resolve;
+    });
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureMode: 'safe',
+      captureLocalVariables: false
+    });
+    const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture');
+    const transportFlushSpy = vi
+      .spyOn(sdk.transport, 'flush')
+      .mockImplementation(async () => transportFlushGate);
+
+    try {
+      sdk.activate();
+      const shuttingDown = sdk.shutdown();
+
+      while (transportFlushSpy.mock.calls.length === 0) {
+        await Promise.resolve();
+      }
+      sdk.captureError(new Error('after final drain'));
+
+      expect(captureSpy).not.toHaveBeenCalled();
+      expect(sdk.errorCapturer.getPendingTransportCount()).toBe(0);
+
+      releaseTransportFlush();
+      await shuttingDown;
+      expect(sdk.errorCapturer.getPendingTransportCount()).toBe(0);
+    } finally {
+      releaseTransportFlush();
+      await sdk.shutdown();
+    }
+  });
+
+  it('init twice warns and returns existing instance, shutdown then init again works', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const first = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+
+    const duplicate = init();
+
+    expect(duplicate).toBe(first);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy.mock.calls[0][0]).toContain('already active');
+
+    await shutdownFacade();
+
+    const second = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+
+    expect(first).not.toBe(second);
+    await shutdownFacade();
+  });
+
+  it('keeps uncaughtException listener counts stable across shutdown and re-init', async () => {
+    const baseline = process.listenerCount('uncaughtException');
+    const first = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+    const firstCount = process.listenerCount('uncaughtException');
+
+    expect(firstCount).toBeGreaterThan(baseline);
+
+    await shutdownFacade();
+
+    const second = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+    const secondCount = process.listenerCount('uncaughtException');
+
+    expect(first).not.toBe(second);
+    expect(secondCount).toBe(firstCount);
+
+    await shutdownFacade();
+
+    expect(process.listenerCount('uncaughtException')).toBe(baseline);
+  });
+
+  it('enableAutoShutdown registers signal handlers', async () => {
+    const onceSpy = vi.spyOn(process, 'once');
+    const sdk = createTestSDK();
+
+    try {
+      sdk.enableAutoShutdown();
+
+      expect(onceSpy.mock.calls.map((call) => call[0])).toEqual(
+        expect.arrayContaining(['SIGTERM', 'SIGINT'])
+      );
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('drains pending safe captures before a switch to fast removes the flush timer', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureMode: 'safe',
+      captureLocalVariables: false
+    });
+    const internals = sdk as unknown as { flushTimer: NodeJS.Timeout | null };
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockImplementation(async () => {
+      expect(internals.flushTimer).not.toBeNull();
+    });
+
+    try {
+      sdk.activate();
+      sdk.captureError(new Error('safe-to-fast pending capture'), {
+        request: { method: 'GET', url: '/safe-to-fast' }
+      });
+
+      expect(sdk.errorCapturer.getPendingTransportCount()).toBe(1);
+      expect(sendSpy).not.toHaveBeenCalled();
+      expect(internals.flushTimer).not.toBeNull();
+
+      await sdk.setCaptureMode('fast');
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sdk.errorCapturer.getPendingTransportCount()).toBe(0);
+      expect(internals.flushTimer).toBeNull();
+      expect(sdk.getCaptureMode()).toBe('fast');
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('drains a safe capture admitted while the first fast-boundary flush is in progress', async () => {
+    let releaseFirstFlush!: () => void;
+    const firstFlushGate = new Promise<void>((resolve) => {
+      releaseFirstFlush = resolve;
+    });
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureMode: 'safe',
+      captureLocalVariables: false
+    });
+    const internals = sdk as unknown as { flushTimer: NodeJS.Timeout | null };
+    const sendSpy = vi.spyOn(sdk.transport, 'send').mockResolvedValue(undefined);
+    let flushCalls = 0;
+    const transportFlushSpy = vi.spyOn(sdk.transport, 'flush').mockImplementation(async () => {
+      flushCalls += 1;
+      if (flushCalls === 1) {
+        await firstFlushGate;
+      }
+    });
+
+    try {
+      sdk.activate();
+      sdk.captureError(new Error('before fast boundary'));
+      const switching = sdk.setCaptureMode('fast');
+
+      while (transportFlushSpy.mock.calls.length === 0) {
+        await Promise.resolve();
+      }
+      sdk.captureError(new Error('during fast boundary'));
+      expect(sdk.errorCapturer.getPendingTransportCount()).toBe(1);
+
+      releaseFirstFlush();
+      await switching;
+
+      expect(sendSpy).toHaveBeenCalledTimes(2);
+      expect(sdk.errorCapturer.getPendingTransportCount()).toBe(0);
+      expect(internals.flushTimer).toBeNull();
+      expect(sdk.getCaptureMode()).toBe('fast');
+    } finally {
+      releaseFirstFlush();
+      await sdk.shutdown();
+    }
+  });
+
+  it('preserves exact auto-shutdown handlers across safe-fast-safe switches', async () => {
+    const signalBaselines = {
+      SIGTERM: process.listeners('SIGTERM'),
+      SIGINT: process.listeners('SIGINT')
+    };
+    const sdk = createSDK({
+      captureMode: 'safe',
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      captureLocalVariables: false
+    });
+    const addedListeners = (signal: 'SIGTERM' | 'SIGINT') =>
+      process.listeners(signal).filter((listener) => !signalBaselines[signal].includes(listener));
+
+    try {
+      sdk.activate();
+      sdk.enableAutoShutdown();
+
+      const handlers = {
+        SIGTERM: addedListeners('SIGTERM'),
+        SIGINT: addedListeners('SIGINT')
+      };
+      expect(handlers.SIGTERM).toHaveLength(1);
+      expect(handlers.SIGINT).toHaveLength(1);
+
+      await sdk.setCaptureMode('fast');
+      expect(addedListeners('SIGTERM')).toEqual(handlers.SIGTERM);
+      expect(addedListeners('SIGINT')).toEqual(handlers.SIGINT);
+      expect(process.listenerCount('SIGTERM')).toBe(signalBaselines.SIGTERM.length + 1);
+      expect(process.listenerCount('SIGINT')).toBe(signalBaselines.SIGINT.length + 1);
+
+      await sdk.setCaptureMode('safe');
+      expect(addedListeners('SIGTERM')).toEqual(handlers.SIGTERM);
+      expect(addedListeners('SIGINT')).toEqual(handlers.SIGINT);
+      expect(process.listenerCount('SIGTERM')).toBe(signalBaselines.SIGTERM.length + 1);
+      expect(process.listenerCount('SIGINT')).toBe(signalBaselines.SIGINT.length + 1);
+
+      await sdk.shutdown();
+      expect(addedListeners('SIGTERM')).toEqual([]);
+      expect(addedListeners('SIGINT')).toEqual([]);
+      expect(process.listenerCount('SIGTERM')).toBe(signalBaselines.SIGTERM.length);
+      expect(process.listenerCount('SIGINT')).toBe(signalBaselines.SIGINT.length);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('trackState facade warns and returns container when uninitialized, withContext facade passes through when absent', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const container = new Map();
+    const result = trackStateFacade('cache', container);
+
+    expect(result).toBe(container);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy.mock.calls[0][0]).toContain('before init()');
+    warnSpy.mockRestore();
+
+    expect(withContextFacade(() => 'value')).toBe('value');
+
+    const sdk = init({ transport: { type: 'stdout' }, allowUnencrypted: true });
+
+    try {
+      const tracked = trackStateFacade('cache', new Map([['a', 1]]));
+      const result = withContextFacade(() => tracked.get('a'));
+
+      expect(result).toBe(1);
+      expect(sdk.isActive()).toBe(true);
+    } finally {
+      await shutdownFacade();
+    }
+  });
+
+  it('keeps overlapping withContext branches isolated across async boundaries', async () => {
+    const sdk = createTestSDK();
+    const firstObserved: string[] = [];
+    const secondObserved: string[] = [];
+
+    try {
+      const [firstId, secondId] = await Promise.all([
+        sdk.withContext(async () => {
+          const observe = () => {
+            const requestId = sdk.als.getRequestId();
+            expect(requestId).toBeDefined();
+            firstObserved.push(requestId as string);
+            return requestId as string;
+          };
+
+          const requestId = observe();
+          await Promise.resolve();
+          observe();
+          await new Promise<void>((resolve) => {
+            setTimeout(() => {
+              observe();
+              resolve();
+            }, 5);
+          });
+          observe();
+          return requestId;
+        }),
+        sdk.withContext(async () => {
+          const observe = () => {
+            const requestId = sdk.als.getRequestId();
+            expect(requestId).toBeDefined();
+            secondObserved.push(requestId as string);
+            return requestId as string;
+          };
+
+          const requestId = observe();
+          await Promise.resolve();
+          observe();
+          await new Promise<void>((resolve) => {
+            setTimeout(() => {
+              observe();
+              resolve();
+            }, 0);
+          });
+          observe();
+          return requestId;
+        })
+      ]);
+
+      expect(firstId).not.toBe(secondId);
+      expect(firstObserved).toEqual([firstId, firstId, firstId, firstId]);
+      expect(secondObserved).toEqual([secondId, secondId, secondId, secondId]);
+      expect(firstObserved).not.toContain(secondId);
+      expect(secondObserved).not.toContain(firstId);
+      expect(sdk.als.getRequestId()).toBeUndefined();
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('supports a full init -> capture -> shutdown cycle through the public API', async () => {
+    const stdoutWrite = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+        callback?.(null);
+        return true;
+      }) as typeof process.stdout.write);
+
+    const sdk = init({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true
+    });
+
+    try {
+      const captureSpy = vi.spyOn(sdk.errorCapturer, 'capture');
+
+      captureErrorFacade(new Error('integration-boom'));
+
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await shutdownFacade();
+    }
+
+    expect(stdoutWrite).toHaveBeenCalled();
+    expect(createSDKFacade).toBeDefined();
+  });
+});
+
+describe('G2 — bundler detection', () => {
+  it('detectBundler returns webpack when __webpack_require__ is defined', () => {
+    (globalThis as Record<string, unknown>).__webpack_require__ = () => undefined;
+    try {
+      expect(detectBundler()).toBe('webpack');
+    } finally {
+      delete (globalThis as Record<string, unknown>).__webpack_require__;
+    }
+  });
+
+  it('detectBundler returns unknown otherwise', () => {
+    expect(detectBundler()).toBe('unknown');
+  });
+
+  it('isNextJsNodeRuntime reads NEXT_RUNTIME === nodejs', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    process.env.NEXT_RUNTIME = 'nodejs';
+    try {
+      expect(isNextJsNodeRuntime()).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+
+  it('isNextJsNodeRuntime returns false when NEXT_RUNTIME is absent or edge', () => {
+    const saved = process.env.NEXT_RUNTIME;
+    delete process.env.NEXT_RUNTIME;
+    try {
+      expect(isNextJsNodeRuntime()).toBe(false);
+      process.env.NEXT_RUNTIME = 'edge';
+      expect(isNextJsNodeRuntime()).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.NEXT_RUNTIME;
+      else process.env.NEXT_RUNTIME = saved;
+    }
+  });
+});
+
+describe('G2 — recorder status assembly', () => {
+  it('classifyRecorderStatus emits ok / skip / warn correctly', () => {
+    expect(classifyRecorderStatus({ installed: true })).toEqual({ state: 'ok' });
+    expect(classifyRecorderStatus({ installed: false, reason: 'not-installed' })).toEqual({
+      state: 'skip',
+      reason: 'not-installed'
+    });
+    expect(classifyRecorderStatus({ installed: false, reason: 'bundled-unpatched' })).toEqual({
+      state: 'warn',
+      reason: 'bundled-unpatched'
+    });
+  });
+
+  it('classifyRecorderStatus defaults reason to unknown when omitted on installed=false', () => {
+    expect(classifyRecorderStatus({ installed: false })).toEqual({
+      state: 'skip',
+      reason: 'unknown'
+    });
+  });
+});
+
+describe('G2 — startup line formatting', () => {
+  it('formats a summary line with mixed ok/skip/warn states', () => {
+    const line = formatStartupLine({
+      version: '0.2.0',
+      nodeVersion: '20.11.0',
+      recorders: {
+        'http-server': { state: 'ok' },
+        'pg': { state: 'skip', reason: 'not-installed' },
+        'mongodb': { state: 'warn', reason: 'bundled-unpatched' }
+      }
+    });
+    expect(line).toBe(
+      '[errorcore] 0.2.0 node=20.11.0 recorders: http-server=ok pg=skip(not-installed) mongodb=warn(bundled-unpatched)'
+    );
+  });
+});
+
+describe('G2 — warn guidance formatting', () => {
+  it('returns null for non-warn states', () => {
+    expect(formatWarnGuidance('pg', { state: 'ok' }, { isNextJs: false })).toBeNull();
+    expect(
+      formatWarnGuidance('pg', { state: 'skip', reason: 'not-installed' }, { isNextJs: false })
+    ).toBeNull();
+  });
+
+  it('formats bundled-unpatched for Next.js recommending serverExternalPackages', () => {
+    const msg = formatWarnGuidance(
+      'pg',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: true }
+    );
+    expect(msg).toContain('serverExternalPackages');
+    expect(msg).toContain("'pg'");
+  });
+
+  it('formats bundled-unpatched for non-Next.js recommending drivers option', () => {
+    const msg = formatWarnGuidance(
+      'mongodb',
+      { state: 'warn', reason: 'bundled-unpatched' },
+      { isNextJs: false }
+    );
+    expect(msg).toContain("drivers:");
+    expect(msg).toContain("require('mongodb')");
+  });
+});
+
+describe('G2 — startup diagnostic emission', () => {
+  let origLog: typeof console.log;
+  let origInfo: typeof console.info;
+  let origWarn: typeof console.warn;
+  let logs: string[];
+
+  beforeEach(() => {
+    logs = [];
+    origLog = console.log;
+    origInfo = console.info;
+    origWarn = console.warn;
+    console.log = (msg: string) => { logs.push(String(msg)); };
+    console.info = (msg: string) => { logs.push(String(msg)); };
+    console.warn = (msg: string) => { logs.push(String(msg)); };
+  });
+  afterEach(() => {
+    console.log = origLog;
+    console.info = origInfo;
+    console.warn = origWarn;
+  });
+
+  it('emits a single summary line when silent is false', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: false
+    });
+    sdk.activate();
+    const line = logs.find((l) => /^\[errorcore\] .* node=.* recorders: /.test(l));
+    expect(line).toBeDefined();
+    // Default (safe) mode runs no standing http-server recorder; the
+    // startup line reports that honestly.
+    expect(line).toContain('http-server=skip(disabled)');
+    await sdk.shutdown();
+  });
+
+  it('emits nothing matching [errorcore] <version> when silent is true', async () => {
+    const sdk = createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true
+    });
+    sdk.activate();
+    const summaryLines = logs.filter((l) => /^\[errorcore\] \d+\.\d+\.\d+ node=/.test(l));
+    expect(summaryLines).toEqual([]);
+    await sdk.shutdown();
+  });
+});
+
+describe('SDKInstance.getHealth', () => {
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+
+  beforeEach(() => {
+    // Silence the stdout transport so test output stays readable.
+    // Must preserve the callback contract — StdoutTransport awaits it.
+    process.stdout.write = ((
+      _chunk: unknown,
+      arg2?: unknown,
+      arg3?: unknown
+    ): boolean => {
+      const cb = typeof arg2 === 'function' ? arg2 : arg3;
+      if (typeof cb === 'function') {
+        (cb as (err?: Error | null) => void)();
+      }
+      return true;
+    }) as typeof process.stdout.write;
+  });
+
+  afterEach(async () => {
+    process.stdout.write = originalStdoutWrite;
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  function makeSDK(overrides: Record<string, unknown> = {}) {
+    return createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      useWorkerAssembly: false,
+      serverless: true, // skip event-loop-lag timer
+      ...overrides
+    });
+  }
+
+  it('returns zeros and nulls on a fresh SDK with no captures', () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(0);
+      expect(health.dropped).toBe(0);
+      expect(health.droppedBreakdown).toEqual({
+        rateLimited: 0,
+        captureFailed: 0,
+        deadLetterWriteFailed: 0
+      });
+      expect(health.transportFailures).toBe(0);
+      expect(health.payloadSpool).toEqual({
+        pressureWarnings: 0,
+        previewFallbacks: 0,
+        drops: 0
+      });
+      expect(health.transportQueueDepth).toBe(0);
+      expect(health.deadLetterDepth).toBe(0);
+      expect(health.ioBufferDepth).toBe(0);
+      expect(health.flushLatencyP50).toBe(0);
+      expect(health.flushLatencyP99).toBe(0);
+      expect(health.lastFailureReason).toBeNull();
+      expect(health.lastFailureAt).toBeNull();
+    } finally {
+      void sdk.shutdown();
+    }
+  });
+
+  it('counts each successful capture and records a flush latency sample', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('boom-1'));
+      sdk.captureError(new Error('boom-2'));
+      sdk.captureError(new Error('boom-3'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(3);
+      expect(health.dropped).toBe(0);
+      expect(health.transportFailures).toBe(0);
+      expect(health.lastFailureReason).toBeNull();
+      expect(health.flushLatencyP50).toBeGreaterThanOrEqual(0);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('monotonicity: repeated reads return equal counter values when nothing changes', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('one'));
+      await sdk.flush();
+
+      const first = sdk.getHealth();
+      const second = sdk.getHealth();
+
+      expect(second.captured).toBe(first.captured);
+      expect(second.dropped).toBe(first.dropped);
+      expect(second.transportFailures).toBe(first.transportFailures);
+      expect(second.droppedBreakdown).toEqual(first.droppedBreakdown);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('invariant: dropped === sum of the three droppedBreakdown buckets', async () => {
+    const sdk = makeSDK({ rateLimitPerMinute: 1 });
+    sdk.activate();
+    try {
+      // One acquires, one is rate-limited.
+      sdk.captureError(new Error('a'));
+      sdk.captureError(new Error('b'));
+      sdk.captureError(new Error('c'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+      const sum =
+        health.droppedBreakdown.rateLimited +
+        health.droppedBreakdown.captureFailed +
+        health.droppedBreakdown.deadLetterWriteFailed;
+
+      expect(health.dropped).toBe(sum);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('rate-limit overflow increments droppedBreakdown.rateLimited, not captured', async () => {
+    const sdk = makeSDK({ rateLimitPerMinute: 1 });
+    sdk.activate();
+    try {
+      sdk.captureError(new Error('first'));
+      sdk.captureError(new Error('limited-1'));
+      sdk.captureError(new Error('limited-2'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(1);
+      expect(health.droppedBreakdown.rateLimited).toBe(2);
+      expect(health.dropped).toBe(2);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('records transport rejections as transportFailures and surfaces the last reason', async () => {
+    const sdk = makeSDK();
+    sdk.activate();
+    vi.spyOn(sdk.transport, 'send').mockRejectedValue(new Error('collector offline'));
+    try {
+      sdk.captureError(new Error('boom'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(1);
+      expect(health.transportFailures).toBe(1);
+      expect(health.lastFailureReason).toContain('collector offline');
+      expect(health.lastFailureAt).toBeTypeOf('number');
+      // No DLQ configured -> the payload is genuinely lost.
+      expect(health.dropped).toBe(1);
+      expect(health.droppedBreakdown.deadLetterWriteFailed).toBe(1);
+    } finally {
+      await sdk.shutdown();
+    }
+  });
+
+  it('dead-letters transport failures when a dead-letter store is configured, without counting them as dropped', async () => {
+    const dlqPath = path.join(
+      os.tmpdir(),
+      `errorcore-health-dlq-${Date.now()}-${Math.random().toString(36).slice(2)}.ndjson`
+    );
+    // 64 hex chars = 32 bytes, matches crypto.randomBytes(32).toString('hex').
+    // Using a fixed, high-entropy key keeps the test deterministic and passes
+    // the Shannon entropy gate in resolveConfig.
+    const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const sdk = makeSDK({
+      encryptionKey: hexKey,
+      deadLetterPath: dlqPath,
+      allowUnencrypted: false
+    });
+    sdk.activate();
+    vi.spyOn(sdk.transport, 'send').mockRejectedValue(new Error('collector offline'));
+    try {
+      sdk.captureError(new Error('boom'));
+      sdk.captureError(new Error('boom-2'));
+      await sdk.flush();
+
+      const health = sdk.getHealth();
+
+      expect(health.captured).toBe(2);
+      expect(health.transportFailures).toBe(2);
+      expect(health.deadLetterDepth).toBe(2);
+      expect(health.dropped).toBe(0);
+    } finally {
+      await sdk.shutdown();
+      try { fs.unlinkSync(dlqPath); } catch { /* best-effort */ }
+    }
+  });
+});
+
+describe('module-level getHealth()', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  it('returns null before init()', async () => {
+    const mod = await import('../../src/index');
+    expect(mod.getHealth()).toBeNull();
+  });
+
+  it('returns a HealthSnapshot after init()', async () => {
+    init({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      useWorkerAssembly: false,
+      serverless: true
+    });
+    const mod = await import('../../src/index');
+    const health = mod.getHealth();
+    expect(health).not.toBeNull();
+    expect(health!.captured).toBe(0);
+  });
+});
+
+describe('adaptive capture mode', () => {
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: 0 });
+    process.stdout.write = ((
+      _chunk: unknown,
+      arg2?: unknown,
+      arg3?: unknown
+    ): boolean => {
+      const cb = typeof arg2 === 'function' ? arg2 : arg3;
+      if (typeof cb === 'function') {
+        (cb as (err?: Error | null) => void)();
+      }
+      return true;
+    }) as typeof process.stdout.write;
+  });
+
+  afterEach(async () => {
+    process.stdout.write = originalStdoutWrite;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    await shutdownFacade();
+  });
+
+  function createAdaptiveSDK(overrides: Record<string, unknown> = {}) {
+    return createSDK({
+      transport: { type: 'stdout' },
+      allowUnencrypted: true,
+      silent: true,
+      serverless: true,
+      captureLocalVariables: false,
+      adaptiveCapture: {
+        enabled: true,
+        deescalateAfterMs: 1000,
+        minDwellMs: 500,
+        maxSwitchesPerHour: 10
+      },
+      ...overrides
+    });
+  }
+
+  async function flushAdaptiveSwitch(): Promise<void> {
+    for (let i = 0; i < 5; i += 1) {
+      await Promise.resolve();
+    }
+  }
+
+  it('reconciles a manual escalation and de-escalates it without charging the manual switch', async () => {
+    const warnings: string[] = [];
+    const sdk = createAdaptiveSDK({
+      adaptiveCapture: {
+        enabled: true,
+        deescalateAfterMs: 1000,
+        minDwellMs: 500,
+        maxSwitchesPerHour: 1
+      },
+      onInternalWarning: (warning: { code: string }) => warnings.push(warning.code)
+    });
+    sdk.activate();
+
+    const escalated = await sdk.setCaptureMode('forensic');
+
+    expect(escalated).toMatchObject({ from: 'safe', to: 'forensic' });
+    expect(sdk.getHealth().adaptive).toEqual({
+      active: true,
+      phase: 'escalated',
+      lastEscalationAt: 0,
+      switchCount: 1
+    });
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(sdk.getCaptureMode()).toBe('forensic');
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sdk.getCaptureMode()).toBe('safe');
+    expect(sdk.getHealth().adaptive).toEqual({
+      active: true,
+      phase: 'base',
+      lastEscalationAt: 0,
+      switchCount: 2
+    });
+    expect(warnings).toEqual([]);
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+  });
+
+  it('reconciles a manual return to base and resumes capture-triggered escalation', async () => {
+    const sdk = createAdaptiveSDK();
+    sdk.activate();
+    sdk.captureError(new Error('first'));
+    await flushAdaptiveSwitch();
+
+    expect(sdk.getHealth().adaptive.phase).toBe('escalated');
+
+    const deescalated = await sdk.setCaptureMode('safe');
+    expect(deescalated).toMatchObject({ from: 'forensic', to: 'safe' });
+    expect(sdk.getHealth().adaptive).toMatchObject({
+      phase: 'base',
+      lastEscalationAt: 0,
+      switchCount: 2
+    });
+
+    sdk.captureError(new Error('second'));
+    await flushAdaptiveSwitch();
+
+    expect(sdk.getCaptureMode()).toBe('forensic');
+    expect(sdk.getHealth().adaptive).toMatchObject({
+      phase: 'escalated',
+      switchCount: 3
+    });
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+  });
+
+  it('keeps a newer manual override ahead of a scheduled adaptive escalation', async () => {
+    const sdk = createAdaptiveSDK();
+    sdk.activate();
+
+    sdk.captureError(new Error('schedule escalation'));
+    const manualSwitch = sdk.setCaptureMode('balanced');
+    await manualSwitch;
+    await flushAdaptiveSwitch();
+
+    expect(sdk.getCaptureMode()).toBe('balanced');
+    expect(sdk.getHealth().adaptive).toMatchObject({
+      active: true,
+      phase: 'manual',
+      lastEscalationAt: null,
+      switchCount: 1
+    });
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(sdk.getCaptureMode()).toBe('balanced');
+
+    await sdk.setCaptureMode('safe');
+    expect(sdk.getHealth().adaptive).toMatchObject({
+      phase: 'base',
+      switchCount: 2
+    });
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+  });
+
+  it('escalates after the first admitted base-mode capture without blocking capture', async () => {
+    const sdk = createAdaptiveSDK();
+    sdk.activate();
+
+    sdk.captureError(new Error('first'));
+
+    expect(sdk.getCaptureMode()).toBe('safe');
+
+    await flushAdaptiveSwitch();
+
+    expect(sdk.getCaptureMode()).toBe('forensic');
+    expect(sdk.getHealth().adaptive).toMatchObject({
+      active: true,
+      phase: 'escalated',
+      lastEscalationAt: 0,
+      switchCount: 1
+    });
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+  });
+
+  it('de-escalates only after quiet time and minimum dwell have both passed', async () => {
+    const sdk = createAdaptiveSDK();
+    sdk.activate();
+    sdk.captureError(new Error('first'));
+    await flushAdaptiveSwitch();
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(sdk.getCaptureMode()).toBe('forensic');
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sdk.getCaptureMode()).toBe('safe');
+    expect(sdk.getHealth().adaptive.phase).toBe('base');
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+  });
+
+  it('refreshes the quiet clock while escalated', async () => {
+    const sdk = createAdaptiveSDK();
+    sdk.activate();
+    sdk.captureError(new Error('first'));
+    await flushAdaptiveSwitch();
+
+    await vi.advanceTimersByTimeAsync(900);
+    sdk.captureError(new Error('second'));
+    await Promise.resolve();
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sdk.getCaptureMode()).toBe('forensic');
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sdk.getCaptureMode()).toBe('safe');
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+  });
+
+  it('pins escalated and warns once when the switch rate budget is exceeded', async () => {
+    const warnings: string[] = [];
+    const sdk = createAdaptiveSDK({
+      adaptiveCapture: {
+        enabled: true,
+        deescalateAfterMs: 1000,
+        minDwellMs: 1,
+        maxSwitchesPerHour: 1
+      },
+      onInternalWarning: (warning: { code: string }) => warnings.push(warning.code)
+    });
+    sdk.activate();
+    sdk.captureError(new Error('first'));
+    await flushAdaptiveSwitch();
+
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(sdk.getCaptureMode()).toBe('forensic');
+    expect(sdk.getHealth().adaptive.phase).toBe('pinned');
+    expect(warnings).toEqual(['EC_ADAPTIVE_CAPTURE_SWITCH_RATE_LIMITED']);
+
+    vi.useRealTimers();
+    await sdk.shutdown();
+  });
+});

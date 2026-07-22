@@ -1,0 +1,179 @@
+x-node-image: &node_image node:22.14.0-bookworm-slim@sha256:745403dc46b5ab4c998502b07a12cbf020cf2c30645427a68ec0718f02d647de
+x-node-limits: &node_limits
+  cpus: "1.00"
+  mem_limit: 768m
+  restart: "no"
+
+name: errorcore-fair-sdk-benchmark
+
+services:
+  postgres:
+    image: postgres:16.4-bookworm
+    restart: "no"
+    environment:
+      POSTGRES_DB: bench
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench -d bench"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.2.5-bookworm
+    restart: "no"
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    restart: "no"
+    command: ["-host=0.0.0.0"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  toxiproxy-init:
+    image: curlimages/curl:8.10.1
+    restart: "no"
+    depends_on:
+      toxiproxy:
+        condition: service_healthy
+      upstream-mock:
+        condition: service_healthy
+    command:
+      [
+        "sh",
+        "-c",
+        "until curl -sf http://toxiproxy:8474/version >/dev/null; do sleep 1; done; for proxy in postgres-proxy redis-proxy upstream-proxy; do curl -sf -X DELETE http://toxiproxy:8474/proxies/$$proxy >/dev/null 2>&1 || true; done; curl -sf -X POST http://toxiproxy:8474/proxies -H 'Content-Type: application/json' -d '{\"name\":\"postgres-proxy\",\"listen\":\"0.0.0.0:15432\",\"upstream\":\"postgres:5432\"}'; curl -sf -X POST http://toxiproxy:8474/proxies -H 'Content-Type: application/json' -d '{\"name\":\"redis-proxy\",\"listen\":\"0.0.0.0:16379\",\"upstream\":\"redis:6379\"}'; curl -sf -X POST http://toxiproxy:8474/proxies -H 'Content-Type: application/json' -d '{\"name\":\"upstream-proxy\",\"listen\":\"0.0.0.0:18080\",\"upstream\":\"upstream-mock:3020\"}'; touch /tmp/toxiproxy-init-ready; tail -f /dev/null"
+      ]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/toxiproxy-init-ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  upstream-mock:
+    <<: *node_limits
+    image: *node_image
+    working_dir: /workspace/bench
+    volumes:
+      - ..:/workspace
+    command: ["node", "upstream-mock/server.mjs"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3020/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  errorcore-sink:
+    <<: *node_limits
+    image: *node_image
+    working_dir: /workspace/bench
+    volumes:
+      - ..:/workspace
+      - ${BENCH_RESULTS_HOST_DIR:-./results}:/workspace/bench/results
+    environment:
+      PORT: "3010"
+      BENCH_ERRORCORE_KEY: ${BENCH_ERRORCORE_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      BENCH_RESULTS_DIR: /workspace/bench/results
+    command: ["node", "sinks/errorcore-sink/server.mjs"]
+    ports:
+      - "3010:3010"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3010/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  sentry-sink:
+    <<: *node_limits
+    image: *node_image
+    working_dir: /workspace/bench
+    volumes:
+      - ..:/workspace
+      - ${BENCH_RESULTS_HOST_DIR:-./results}:/workspace/bench/results
+    environment:
+      PORT: "3011"
+      BENCH_RESULTS_DIR: /workspace/bench/results
+    command: ["node", "sinks/sentry-sink/server.mjs"]
+    ports:
+      - "3011:3011"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3011/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  bugsnag-sink:
+    <<: *node_limits
+    image: *node_image
+    working_dir: /workspace/bench
+    volumes:
+      - ..:/workspace
+      - ${BENCH_RESULTS_HOST_DIR:-./results}:/workspace/bench/results
+    environment:
+      PORT: "3012"
+      BENCH_RESULTS_DIR: /workspace/bench/results
+    command: ["node", "sinks/bugsnag-sink/server.mjs"]
+    ports:
+      - "3012:3012"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3012/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  runner:
+    <<: *node_limits
+    image: *node_image
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - ${BENCH_RESULTS_HOST_DIR:-./results}:/workspace/bench/results
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      toxiproxy-init:
+        condition: service_healthy
+      errorcore-sink:
+        condition: service_healthy
+      sentry-sink:
+        condition: service_healthy
+      bugsnag-sink:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      ERRORCORE_PACKAGE_ROOT: /workspace
+      BENCH_RESULTS_DIR: /workspace/bench/results
+      BENCH_COMPARE_SDK: ${BENCH_COMPARE_SDK:-sentry}
+      BENCH_CANDIDATE_ROOT: ${BENCH_CANDIDATE_ROOT:-}
+      BENCH_CANDIDATE_SHA256: ${BENCH_CANDIDATE_SHA256:-}
+      BENCH_STRICT_RELEASE: ${BENCH_STRICT_RELEASE:-0}
+      BENCH_ERRORCORE_KEY: ${BENCH_ERRORCORE_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      ERRORCORE_SINK_URL: http://errorcore-sink:3010
+      SENTRY_SINK_URL: http://sentry-sink:3011
+      BUGSNAG_SINK_URL: http://bugsnag-sink:3012
+      DATABASE_URL: postgres://bench:bench@toxiproxy:15432/bench
+      REDIS_URL: redis://toxiproxy:16379/0
+      UPSTREAM_URL: http://toxiproxy:18080
+    command:
+      [
+        "sh",
+        "-lc",
+        "if [ -n \"$$BENCH_CANDIDATE_ROOT\" ]; then test -f \"$$BENCH_CANDIDATE_ROOT/package.json\"; cd \"$$BENCH_CANDIDATE_ROOT\"; npm install --omit=dev --ignore-scripts --package-lock=false --no-audit --no-fund; package_root=\"$$BENCH_CANDIDATE_ROOT\"; else rm -rf /tmp/errorcore-package; mkdir -p /tmp/errorcore-package; tar --exclude=node_modules --exclude=./node_modules --exclude='*/node_modules' --exclude=.git --exclude=./.git --exclude=bench/results --exclude=./bench/results -cf - . | tar -C /tmp/errorcore-package -xf -; cd /tmp/errorcore-package; npm ci --include=dev; npm run build; package_root=/tmp/errorcore-package; fi; cd /workspace/bench/apps/benchmark-app; npm install --no-audit --no-fund; cd /workspace/bench; ERRORCORE_PACKAGE_ROOT=\"$$package_root\" node harness/run-all.mjs"
+      ]

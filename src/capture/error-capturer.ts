@@ -1,0 +1,1258 @@
+
+import { cloneAndLimit } from '../serialization/clone-and-limit';
+import { createDebug } from '../debug';
+import { safeConsole } from '../debug-log';
+import { Scrubber, scrubKeyValueAssignments } from '../pii/scrubber';
+import type { Encryption } from '../security/encryption';
+import type { RateLimiter } from '../security/rate-limiter';
+import type { ALSManager } from '../context/als-manager';
+import { EventClock } from '../context/event-clock';
+import type { HealthMetrics } from '../health/health-metrics';
+import { HTTP_TRANSPORT_TIMEOUT_MESSAGE } from '../transport/http-transport';
+
+const debug = createDebug('capturer');
+import type { RequestTracker } from '../context/request-tracker';
+import type { InspectorManager, LocalsWithDiagnostics } from './inspector-manager';
+import {
+  finalizePackageAssemblyResult,
+  finalizePayloadBlobAssemblyResult
+} from './package-builder';
+import { computeFingerprint } from './fingerprint';
+import {
+  getSupplementalLocals,
+  mergeSupplementalLocals
+} from './supplemental-locals';
+import type { PackageBuilder } from './package-builder';
+import type { ProcessMetadata } from './process-metadata';
+import type { DeadLetterStore } from '../transport/dead-letter-store';
+import { parseEnvelopeMetadata } from '../transport/payload';
+import type { SourceMapResolver } from './source-map-resolver';
+import type {
+  AmbientEventContext,
+  CaptureErrorOptions,
+  CaptureRequestContextInput,
+  ErrorInfo,
+  EvictionRecord,
+  ErrorPackage,
+  ErrorPackageParts,
+  ErrorPackageRequestContextData,
+  InternalWarning,
+  InternalWarningCode,
+  IOEventSlot,
+  ModeState,
+  PackageAssemblyResult,
+  RequestContext,
+  ResolvedConfig,
+  TimeAnchor,
+  TransportPayload
+} from '../types';
+
+interface IOEventBufferLike {
+  filterByRequestId(requestId: string): IOEventSlot[];
+  getRecent(count: number): IOEventSlot[];
+  getRecentWithContext(count: number): { events: IOEventSlot[]; context: AmbientEventContext };
+  getOverflowCount(): number;
+  getEvictionLog(): EvictionRecord[];
+}
+
+interface TransportLike {
+  send(payload: TransportPayload): Promise<void> | void;
+}
+
+interface BodyCaptureLike {
+  materializeSlotBodies(slot: IOEventSlot): void;
+  materializeContextBody(context: RequestContext): void;
+}
+
+interface PackageAssemblyDispatcherLike {
+  isAvailable(): boolean;
+  assemble(
+    parts: ErrorPackageParts,
+    options?: { timeoutMs?: number }
+  ): Promise<PackageAssemblyResult>;
+  shutdown(options?: { timeoutMs?: number }): Promise<void>;
+}
+
+interface StateTrackerStatusLike {
+  isTrackingEnabled(): boolean;
+}
+
+type ErrorCaptureOptions = CaptureErrorOptions & { isUncaught?: boolean };
+
+export interface CaptureDeliveryDiagnostics {
+  sent: number;
+  deadLettered: number;
+  dropped: number;
+}
+
+interface BufferedTransportDelivery {
+  transportPayload: TransportPayload;
+  packageObject: ErrorPackage;
+}
+
+// Matches Node's ErrnoException codes that indicate the disk refused to
+// accept the write. Used to split generic write failures from
+// out-of-space conditions so operators can route them differently.
+const DISK_FULL_ERRNO_CODES = new Set<string>(['ENOSPC', 'EDQUOT']);
+const DLQ_RECOVERY_DRAIN_DELAYS_MS = [250, 500, 1000] as const;
+const MAX_LOCALS_CAUSE_DEPTH = 3;
+
+function classifyDlqWriteErrno(err: unknown): 'EC_DISK_FULL' | 'EC_DLQ_WRITE_FAILED' {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code !== undefined && DISK_FULL_ERRNO_CODES.has(code)
+    ? 'EC_DISK_FULL'
+    : 'EC_DLQ_WRITE_FAILED';
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref();
+  });
+}
+
+function normalizeExplicitRequestHeaders(
+  headers: Record<string, unknown> | undefined
+): Record<string, string> {
+  if (headers === undefined) {
+    return {};
+  }
+
+  const normalized: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    if (rawValue === undefined) {
+      continue;
+    }
+
+    const name = rawName.toLowerCase();
+    if (Array.isArray(rawValue)) {
+      normalized[name] = rawValue.map((value) => String(value)).join(', ');
+    } else if (Buffer.isBuffer(rawValue)) {
+      normalized[name] = rawValue.toString('utf8');
+    } else {
+      normalized[name] = String(rawValue);
+    }
+  }
+
+  return normalized;
+}
+
+function getExplicitHeader(headers: Record<string, string>, name: string): string | undefined {
+  const value = headers[name.toLowerCase()];
+  return value === undefined || value.length === 0 ? undefined : value;
+}
+
+export function serializeCause(cause: unknown): unknown {
+  if (cause instanceof Error) {
+    const message = (cause.message ?? '').slice(0, 200);
+    const firstLine = (cause.stack ?? '').split('\n').slice(0, 2).join('\n');
+    const errnoCode = (cause as NodeJS.ErrnoException).code;
+    return {
+      name: cause.name || 'Error',
+      message,
+      ...(firstLine.length > 0 ? { stackHead: firstLine } : {}),
+      ...(typeof errnoCode === 'string' ? { code: errnoCode } : {}),
+    };
+  }
+  return cause;
+}
+
+const WARNING_SENSITIVE_KEY = /authorization|cookie|token|secret|password|credential|api[-_]?key|dsn/i;
+const WARNING_SECRET_VALUE =
+  /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+|([?&](?:token|key|secret|password|authorization)=)[^&\s]+|\b(?:secret|token|password|api[-_]?key)[-_][A-Za-z0-9._~+/=-]+\b|https?:\/\/[^@\s/]+:[^@\s/]+@/gi;
+
+export function scrubInternalWarningValue(value: unknown, depth = 0): unknown {
+  if (depth > 4) {
+    return '[REDACTED_DEPTH]';
+  }
+
+  if (typeof value === 'string') {
+    return value.replace(WARNING_SECRET_VALUE, (match, bearerPrefix, queryPrefix) => {
+      if (typeof bearerPrefix === 'string') return `${bearerPrefix}[REDACTED]`;
+      if (typeof queryPrefix === 'string') return `${queryPrefix}[REDACTED]`;
+      if (!match.startsWith('http')) return '[REDACTED]';
+      return 'https://[REDACTED]@';
+    }).slice(0, 500);
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((entry) => scrubInternalWarningValue(entry, depth + 1));
+  }
+
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>).slice(0, 50)) {
+      out[key] = WARNING_SENSITIVE_KEY.test(key)
+        ? '[REDACTED]'
+        : scrubInternalWarningValue(entry, depth + 1);
+    }
+    return out;
+  }
+
+  return value;
+}
+
+interface PayloadSpoolLike {
+  buildEnvelope(eventId: string, blobId: string): import('../types').PayloadBlobEnvelope | null;
+}
+
+function defaultScrubConfig(config: ResolvedConfig): ResolvedConfig {
+  if (config.piiScrubber === undefined) {
+    return config;
+  }
+
+  return {
+    ...config,
+    piiScrubber: undefined,
+    replaceDefaultScrubber: false
+  };
+}
+
+function sanitizeDiagnosticString(
+  config: ResolvedConfig,
+  value: unknown,
+  maxLength = 500
+): string {
+  let raw: string;
+  try {
+    raw = typeof value === 'string' ? value : String(value);
+  } catch {
+    raw = '[Unserializable diagnostic]';
+  }
+
+  const scrubber = new Scrubber(defaultScrubConfig(config));
+  const scrubbed = scrubber.scrubValue('', scrubKeyValueAssignments(raw));
+  const safe = typeof scrubbed === 'string' ? scrubbed : String(scrubbed);
+  return safe.length > maxLength
+    ? `${safe.slice(0, maxLength)}...[truncated, ${safe.length} chars]`
+    : safe;
+}
+
+function sanitizeDiagnosticValue(config: ResolvedConfig, value: unknown): unknown {
+  const scrubber = new Scrubber(defaultScrubConfig(config));
+  return scrubber.scrubValue('', scrubInternalWarningValue(value));
+}
+
+function emitSafeWarning(
+  config: ResolvedConfig,
+  warning: InternalWarning & { code: InternalWarningCode }
+): void {
+  const message = sanitizeDiagnosticString(config, warning.message, 1000);
+  // Preserve the human-readable console output but route through the
+  // logLevel filter. The structured callback is the unfiltered channel.
+  safeConsole.warn(`[ErrorCore] ${message}`);
+
+  if (config.onInternalWarning !== undefined) {
+    const enriched: InternalWarning = {
+      code: warning.code,
+      message,
+      ...(warning.cause !== undefined
+        ? { cause: sanitizeDiagnosticValue(config, serializeCause(warning.cause)) }
+        : {}),
+      ...(warning.context !== undefined
+        ? { context: sanitizeDiagnosticValue(config, warning.context) as Record<string, unknown> }
+        : {}),
+    };
+    try {
+      config.onInternalWarning(enriched);
+    } catch {
+      // onInternalWarning must never crash the host.
+    }
+  }
+}
+
+// Properties on Error subclasses whose values may contain raw payload
+// fragments - most notably express body-parser's SyntaxError which
+// carries `body` with the prefix of the failing JSON. The full-payload
+// scrubber runs later via the package builder, but it operates on
+// regex matches of complete patterns (CC with Luhn, JWT shape).
+// Partial PII fragments slip through the regex AND the prior cap was
+// 1024 chars, large enough for a credit card and PII context to land
+// verbatim in the capture. Truncate these keys aggressively as a
+// defense-in-depth measure.
+const PAYLOAD_FRAGMENT_KEYS = new Set(['body', 'payload', 'request', 'response', 'data']);
+const PAYLOAD_FRAGMENT_MAX_LENGTH = 200;
+
+// Properties on pg's DatabaseError that contain raw row values verbatim.
+// `detail` for a constraint violation is "Failing row contains (uuid, email,
+// ...)" - every column value in column order. Forwarding it leaks PII for
+// any table with sensitive columns. `hint`, `internalQuery`, and `where`
+// can also carry user-supplied query fragments. The non-PII fields
+// (code/severity/schema/table/constraint/routine/column/file/line) remain
+// captured because they're load-bearing for debugging.
+const PG_SENSITIVE_PROPS = new Set(['detail', 'hint', 'internalQuery', 'where']);
+
+// Why gated to pg DatabaseError specifically and not applied to every error
+// that happens to have a `detail` property: custom error classes legitimately
+// use `detail: 'human-readable explanation'` (express-validator, ajv,
+// react-hook-form internals). Stripping `detail` universally would lose
+// debugging context on those errors. The pg case is the only one where
+// `detail` is structurally a row dump.
+function isLikelyPgDatabaseError(error: Error): boolean {
+  if (error.constructor?.name === 'DatabaseError') {
+    return true;
+  }
+  // Some bundlers strip class names. Fingerprint by the constellation of
+  // pg-specific fields that DatabaseError exposes.
+  const e = error as unknown as Record<string, unknown>;
+  return (
+    typeof e.severity === 'string' &&
+    typeof e.code === 'string' &&
+    (typeof e.routine === 'string' || typeof e.constraint === 'string')
+  );
+}
+
+/** @internal exported for unit tests */
+export function extractCustomProperties(error: Error): Record<string, unknown> {
+  const properties: Record<string, unknown> = {};
+  const isPgError = isLikelyPgDatabaseError(error);
+
+  for (const key of Object.getOwnPropertyNames(error)) {
+    if (key === 'name' || key === 'message' || key === 'stack' || key === 'cause') {
+      continue;
+    }
+
+    if (isPgError && PG_SENSITIVE_PROPS.has(key)) {
+      continue;
+    }
+
+    try {
+      const value = (error as unknown as Record<string, unknown>)[key];
+      if (
+        PAYLOAD_FRAGMENT_KEYS.has(key) &&
+        typeof value === 'string' &&
+        value.length > PAYLOAD_FRAGMENT_MAX_LENGTH
+      ) {
+        properties[key] = `${value.slice(0, PAYLOAD_FRAGMENT_MAX_LENGTH)}[...truncated for safety, ${value.length} chars]`;
+      } else {
+        properties[key] = value;
+      }
+    } catch (propertyError) {
+      properties[key] =
+        propertyError instanceof Error
+          ? `[Serialization error: ${propertyError.message}]`
+          : '[Serialization error]';
+    }
+  }
+
+  return properties;
+}
+
+function serializeError(
+  error: Error,
+  resolver: SourceMapResolver | null,
+  config: ResolvedConfig,
+  depth = 0
+): ErrorInfo {
+  if (depth > 5) {
+    return {
+      type: 'Error',
+      message: '[Cause chain depth limit]',
+      stack: '',
+      properties: {}
+    };
+  }
+
+  const cause = (error as Error & { cause?: unknown }).cause;
+  const rawStack = error.stack || '';
+  let resolvedStack = rawStack;
+  let rawStackField: string | undefined;
+
+  if (resolver !== null && rawStack.length > 0) {
+    try {
+      resolvedStack = resolver.resolveStack(rawStack);
+
+      if (resolvedStack !== rawStack) {
+        rawStackField = rawStack;
+      }
+    } catch {
+      resolvedStack = rawStack;
+    }
+  }
+
+  return {
+    type: error.constructor?.name || 'Error',
+    message: error.message || '',
+    stack: resolvedStack,
+    rawStack: rawStackField,
+    cause: cause instanceof Error ? serializeError(cause, resolver, config, depth + 1) : undefined,
+    properties: cloneAndLimit(extractCustomProperties(error), config.serialization) as Record<
+      string,
+      unknown
+    >
+  };
+}
+
+export class ErrorCapturer {
+  private readonly buffer: IOEventBufferLike;
+
+  private readonly als: ALSManager;
+
+  private readonly inspector: InspectorManager;
+
+  private readonly rateLimiter: RateLimiter;
+
+  private readonly requestTracker: RequestTracker;
+
+  private readonly processMetadata: ProcessMetadata;
+
+  private readonly packageBuilder: PackageBuilder;
+
+  private readonly transport: TransportLike;
+
+  private readonly encryption: Encryption | null;
+
+  private readonly bodyCapture: BodyCaptureLike;
+
+  private readonly config: ResolvedConfig;
+
+  private readonly modeProvider: () => ModeState;
+
+  private readonly onAdmittedCapture: ((modeState: ModeState) => void) | null;
+
+  private packageAssemblyDispatcher: PackageAssemblyDispatcherLike | null;
+
+  private readonly stateTrackerStatus: StateTrackerStatusLike | null;
+
+  private readonly deadLetterStore: DeadLetterStore | null;
+
+  private sourceMapResolver: SourceMapResolver | null;
+
+  private readonly watchdog: { notifyErrorCaptured(error: Error): void } | null;
+
+  private readonly healthMetrics: HealthMetrics | null;
+
+  private readonly eventClock: EventClock;
+
+  private payloadSpool: PayloadSpoolLike | null;
+
+  private readonly pendingTransportDispatches = new Set<Promise<unknown>>();
+
+  private readonly pendingBufferedTransportPayloads: BufferedTransportDelivery[] = [];
+
+  private deadLetterRecoveryDrain: Promise<void> | null = null;
+
+  private transportFailedSinceLastSuccess = false;
+
+  private readonly deliveryDiagnostics: CaptureDeliveryDiagnostics = {
+    sent: 0,
+    deadLettered: 0,
+    dropped: 0
+  };
+
+  // Defense-in-depth dedup: when two captureError calls produce the same
+  // (traceId, requestId, fingerprint) within DEDUP_WINDOW_MS, suppress
+  // the second. Catches user-side double-capture mistakes (e.g. when an
+  // error path is wired both into express's default-error and into
+  // process.on('unhandledRejection', captureError)).
+  private readonly recentCaptures = new Map<string, bigint>();
+  private static readonly DEDUP_WINDOW_NS = 10_000_000_000n; // 10s
+  private static readonly DEDUP_MAX_ENTRIES = 64;
+
+  public constructor(deps: {
+    buffer: IOEventBufferLike;
+    als: ALSManager;
+    inspector: InspectorManager;
+    rateLimiter: RateLimiter;
+    requestTracker: RequestTracker;
+    processMetadata: ProcessMetadata;
+    packageBuilder: PackageBuilder;
+    transport: TransportLike;
+    encryption?: Encryption | null;
+    bodyCapture: BodyCaptureLike;
+    config: ResolvedConfig;
+    eventClock?: EventClock;
+    packageAssemblyDispatcher?: PackageAssemblyDispatcherLike | null;
+    stateTrackerStatus?: StateTrackerStatusLike | null;
+    deadLetterStore?: DeadLetterStore | null;
+    sourceMapResolver?: SourceMapResolver | null;
+    watchdog?: { notifyErrorCaptured(error: Error): void } | null;
+    healthMetrics?: HealthMetrics | null;
+    payloadSpool?: PayloadSpoolLike | null;
+    modeProvider?: () => ModeState;
+    onAdmittedCapture?: (modeState: ModeState) => void;
+  }) {
+    this.buffer = deps.buffer;
+    this.als = deps.als;
+    this.inspector = deps.inspector;
+    this.rateLimiter = deps.rateLimiter;
+    this.requestTracker = deps.requestTracker;
+    this.processMetadata = deps.processMetadata;
+    this.packageBuilder = deps.packageBuilder;
+    this.transport = deps.transport;
+    this.encryption = deps.encryption ?? null;
+    this.bodyCapture = deps.bodyCapture;
+    this.config = deps.config;
+    this.modeProvider = deps.modeProvider ?? (() => this.config.modeState);
+    this.onAdmittedCapture = deps.onAdmittedCapture ?? null;
+    // EventClock is optional for test ergonomics; the SDK composition root
+    // always passes one shared instance (module 19 contract).
+    this.eventClock = deps.eventClock ?? new EventClock();
+    this.packageAssemblyDispatcher = deps.packageAssemblyDispatcher ?? null;
+    this.stateTrackerStatus = deps.stateTrackerStatus ?? null;
+    this.deadLetterStore = deps.deadLetterStore ?? null;
+    this.sourceMapResolver = deps.sourceMapResolver ?? null;
+    this.watchdog = deps.watchdog ?? null;
+    this.healthMetrics = deps.healthMetrics ?? null;
+    this.payloadSpool = deps.payloadSpool ?? null;
+  }
+
+  public setPackageAssemblyDispatcher(dispatcher: PackageAssemblyDispatcherLike | null): void {
+    this.packageAssemblyDispatcher = dispatcher;
+  }
+
+  public setSourceMapResolver(sourceMapResolver: SourceMapResolver | null): void {
+    this.sourceMapResolver = sourceMapResolver;
+  }
+
+  public setPayloadSpool(payloadSpool: PayloadSpoolLike | null): void {
+    this.payloadSpool = payloadSpool;
+  }
+
+  public capture(error: Error, options?: ErrorCaptureOptions): ErrorPackage | null {
+    const modeState = this.modeProvider();
+    const captureFailures: string[] = [];
+    const explicitRequest = options?.request;
+    const explicitContext = this.safeCreateExplicitRequestContext(
+      explicitRequest,
+      captureFailures
+    );
+    const context =
+      explicitRequest === undefined
+        ? this.safeGetContext(captureFailures)
+        : explicitContext;
+    if (context !== undefined) {
+      this.als.ensureTraceMaterialized(context);
+    }
+    // Stamp the error event at function entry - module 20 contract. Captured
+    // BEFORE the rate-limit check so the seq is consumed and observable as a
+    // gap downstream even when the capture itself is dropped.
+    const errorEventSeq = this.eventClock.tick();
+    const errorEventHrtimeNs = process.hrtime.bigint();
+
+    try {
+      debug(
+        `capture() called for ${error.name}: ${sanitizeDiagnosticString(this.config, error.message)}`
+      );
+      if (!this.rateLimiter.tryAcquire()) {
+        debug('capture() rate-limited, dropping');
+        this.healthMetrics?.recordDroppedRateLimited();
+        emitSafeWarning(this.config, {
+          code: 'EC_RATE_LIMITED',
+          message: `Rate limit exceeded (${this.config.rateLimitPerMinute} per ${this.config.rateLimitWindowMs}ms); error dropped.`
+        });
+        return null;
+      }
+
+      const rateLimiterDrops = this.rateLimiter.getAndResetDropSummary() ?? undefined;
+      this.onAdmittedCapture?.(modeState);
+
+      const sourceMapResolver = modeState.resolveSourceMaps ? this.sourceMapResolver : null;
+      const serializedError = serializeError(error, sourceMapResolver, this.config);
+      const localsResult: Pick<LocalsWithDiagnostics, 'frames' | 'captureLayer' | 'degradation'> =
+        this.safeGetLocals(error, captureFailures);
+      const resolvedLocalVariables =
+        sourceMapResolver?.resolveCapturedFrames(localsResult.frames) ?? localsResult.frames;
+      const sourceMapTelemetry = sourceMapResolver?.consumeTelemetry();
+      const usedAmbientEvents = context === undefined;
+
+      let ioTimeline: IOEventSlot[];
+      let ambientContext: AmbientEventContext | undefined;
+
+      if (context === undefined) {
+        const result = this.buffer.getRecentWithContext(20);
+        ioTimeline = result.events;
+        ambientContext = result.context;
+      } else {
+        ioTimeline =
+          context.ioEvents.length > 0
+            ? context.ioEvents.slice()
+            : this.buffer.filterByRequestId(context.requestId).slice();
+      }
+
+      // The low-overhead chassis runs no standing http-server recorder, so
+      // the inbound event is synthesized at capture time from whatever
+      // request identity exists: the middleware's ALS context, or explicit
+      // request data passed to capture().
+      if (
+        modeState.capabilities.syntheticInboundFallback &&
+        context !== undefined &&
+        ioTimeline.length === 0
+      ) {
+        ioTimeline = [
+          this.createSyntheticInboundEvent(
+            context,
+            explicitRequest,
+            errorEventSeq,
+            errorEventHrtimeNs
+          )
+        ];
+      }
+
+      if (context !== undefined && modeState.capabilities.materializeBodies) {
+        this.bodyCapture.materializeContextBody(context);
+      }
+      if (modeState.capabilities.materializeBodies) {
+        for (const event of ioTimeline) {
+          this.bodyCapture.materializeSlotBodies(event);
+        }
+      }
+      const stateReads = context?.stateReads.slice() ?? [];
+      const stateWrites = context?.stateWrites.slice() ?? [];
+      const concurrentRequests = this.requestTracker.getSummaries();
+      const stateTrackingEnabled =
+        stateReads.length > 0 || this.stateTrackerStatus?.isTrackingEnabled() === true;
+      const fingerprint = computeFingerprint(error, resolvedLocalVariables ?? []);
+      const dedupFingerprint = computeFingerprint(error, []);
+      // Defense-in-depth fingerprint dedup. See recentCaptures field doc.
+      // Request-scoped duplicates commonly arrive through both framework
+      // middleware and process-level handlers. Context-less captures use a
+      // coarser background scope so async fatal duplicates do not produce a
+      // second lower-fidelity package during shutdown.
+      if (dedupFingerprint !== undefined && dedupFingerprint !== '') {
+        const dedupScope =
+          context === undefined
+            ? 'background'
+            : `${context.traceId}|${context.requestId}`;
+        const dedupKey = `${dedupScope}|${dedupFingerprint}`;
+        const previousNs = this.recentCaptures.get(dedupKey);
+        if (
+          previousNs !== undefined &&
+          errorEventHrtimeNs - previousNs < ErrorCapturer.DEDUP_WINDOW_NS
+        ) {
+          this.healthMetrics?.recordDroppedRateLimited?.();
+          debug(`capture() deduplicated by fingerprint within window: ${dedupKey}`);
+          return null;
+        }
+        this.recentCaptures.set(dedupKey, errorEventHrtimeNs);
+        if (this.recentCaptures.size > ErrorCapturer.DEDUP_MAX_ENTRIES) {
+          const oldestKey = this.recentCaptures.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.recentCaptures.delete(oldestKey);
+          }
+        }
+      }
+      const currentTracestate =
+        context === undefined
+          ? undefined
+          : explicitRequest === undefined
+            ? this.als.formatOutboundTracestate() ?? undefined
+            : context.inboundTracestate;
+      const parts: ErrorPackageParts = {
+        modeAtCapture: modeState.captureMode,
+        errorEventSeq,
+        errorEventHrtimeNs,
+        error: {
+          type: serializedError.type,
+          message: serializedError.message,
+          stack: serializedError.stack,
+          rawStack: serializedError.rawStack,
+          cause: serializedError.cause,
+          properties: serializedError.properties
+        },
+        localVariables: resolvedLocalVariables,
+        localVariablesCaptureLayer: localsResult.captureLayer,
+        localVariablesDegradation: localsResult.degradation,
+        fingerprint,
+        requestContext: this.toRequestContextData(context),
+        ioTimeline,
+        evictionLog: this.buffer.getEvictionLog(),
+        ambientContext,
+        stateReads,
+        stateWrites,
+        completenessOverflow: context?.completenessOverflow,
+        concurrentRequests,
+        processMetadata: this.processMetadata.getMergedMetadata(),
+        timeAnchor: this.processMetadata.getTimeAnchor(),
+        codeVersion: this.processMetadata.getCodeVersion(),
+        environment: this.processMetadata.getEnvironment(),
+        ioEventsDropped: this.buffer.getOverflowCount(),
+        captureFailures,
+        alsContextAvailable: context !== undefined,
+        stateTrackingEnabled,
+        usedAmbientEvents,
+        rateLimiterDrops,
+        traceContext: context ? {
+          traceId: context.traceId,
+          spanId: context.spanId,
+          parentSpanId: context.parentSpanId,
+          // Module 21: serialize the same live tracestate builder used for
+          // outbound HTTP so root captures and child captures both carry
+          // our current EventClock value plus preserved foreign vendors.
+          tracestate: currentTracestate,
+          // Module 06: W3C trace-flags byte observed at capture time.
+          // Lets the ingestion backend reason about sampling without
+          // re-parsing the inbound traceparent header.
+          traceFlags: context.traceFlags,
+          // Spec §B7: distinguishes gateway entry-spans from
+          // lost-parent spans during reconstruction.
+          isEntrySpan: context.isEntrySpan
+        } : undefined,
+        sourceMapResolution: sourceMapTelemetry
+      };
+
+      if (context !== undefined) {
+        this.als.runPostCaptureCleanup(context);
+      }
+
+      this.watchdog?.notifyErrorCaptured(error);
+
+      if (
+        this.packageAssemblyDispatcher !== null &&
+        this.packageAssemblyDispatcher.isAvailable() &&
+        modeState.useWorkerAssembly &&
+        !modeState.capabilities.deferredDelivery &&
+        !options?.isUncaught &&
+        this.config.piiScrubber === undefined
+      ) {
+        const promise = this.dispatchPackageAssembly(parts);
+        this.pendingTransportDispatches.add(promise);
+        promise.finally(() => this.pendingTransportDispatches.delete(promise));
+        return null;
+      }
+
+      return this.captureInline(parts, modeState);
+    } catch (captureError) {
+      // Include name + truncated message rather than just the constructor
+      // name. The previous behavior gave operators no way to distinguish,
+      // for example, a RangeError from out-of-memory vs. a TypeError from
+      // a bad scrubber return type.
+      const detail =
+        captureError instanceof Error
+          ? sanitizeDiagnosticString(
+              this.config,
+              `${captureError.name}: ${captureError.message}`,
+              200
+            )
+          : 'unknown';
+      emitSafeWarning(this.config, {
+        code: 'EC_CAPTURE_FAILED',
+        message: `Error capture failed: ${detail} [code=EC_CAPTURE_FAILED]. If this recurs, check onInternalWarning for details.`,
+        cause: captureError,
+        context: { stage: 'primary', detail }
+      });
+      this.healthMetrics?.recordDroppedCaptureFailed();
+
+      if (this.deadLetterStore !== null) {
+        try {
+          this.deadLetterStore.appendFailureMarkerSync('EC_CAPTURE_FAILED');
+        } catch {
+        }
+      }
+
+      return null;
+    }
+  }
+
+  private safeGetLocals(
+    error: Error,
+    captureFailures: string[]
+  ): Pick<LocalsWithDiagnostics, 'frames' | 'captureLayer' | 'degradation'> {
+    try {
+      const result = this.resolveLocalsForError(error);
+
+      if (result.frames !== null) {
+        return {
+          frames: result.frames,
+          captureLayer: result.captureLayer,
+          degradation: result.degradation
+        };
+      }
+
+      const visited = new Set<Error>([error]);
+      let cause = (error as Error & { cause?: unknown }).cause;
+      let depth = 0;
+
+      while (
+        cause instanceof Error &&
+        !visited.has(cause) &&
+        depth < MAX_LOCALS_CAUSE_DEPTH
+      ) {
+        visited.add(cause);
+        const causeResult = this.resolveLocalsForError(cause);
+
+        if (causeResult.frames !== null) {
+          return {
+            frames: causeResult.frames,
+            captureLayer: causeResult.captureLayer,
+            degradation: causeResult.degradation
+          };
+        }
+
+        cause = (cause as Error & { cause?: unknown }).cause;
+        depth += 1;
+      }
+
+      if (result.missReason !== null) {
+        captureFailures.push(
+          `locals: ${sanitizeDiagnosticString(this.config, result.missReason)}`
+        );
+      }
+
+      return {
+        frames: result.frames,
+        captureLayer: result.captureLayer,
+        degradation: result.degradation
+      };
+    } catch (inspectorError) {
+      const message =
+        inspectorError instanceof Error ? inspectorError.message : String(inspectorError);
+
+      captureFailures.push(`locals: ${sanitizeDiagnosticString(this.config, message)}`);
+      return { frames: null };
+    }
+  }
+
+  private resolveLocalsForError(error: Error): LocalsWithDiagnostics {
+    const result = this.inspector.getLocalsWithDiagnostics(error);
+    const frames = mergeSupplementalLocals(
+      result.frames,
+      getSupplementalLocals(error),
+      this.config.maxLocalsFrames
+    );
+
+    return {
+      ...result,
+      frames
+    };
+  }
+
+  private safeGetContext(captureFailures: string[]): RequestContext | undefined {
+    try {
+      return this.als.getContext();
+    } catch (alsError) {
+      const message = alsError instanceof Error ? alsError.message : String(alsError);
+
+      captureFailures.push(`als: ${sanitizeDiagnosticString(this.config, message)}`);
+      return undefined;
+    }
+  }
+
+  private safeCreateExplicitRequestContext(
+    request: CaptureRequestContextInput | undefined,
+    captureFailures: string[]
+  ): RequestContext | undefined {
+    if (request === undefined) {
+      return undefined;
+    }
+
+    try {
+      const headers = normalizeExplicitRequestHeaders(request.headers);
+      const traceparent = request.traceparent ?? getExplicitHeader(headers, 'traceparent');
+      const tracestate = request.tracestate ?? getExplicitHeader(headers, 'tracestate');
+
+      return this.als.createRequestContext({
+        method: request.method,
+        url: request.url,
+        headers,
+        ...(traceparent === undefined ? {} : { traceparent }),
+        ...(tracestate === undefined ? {} : { tracestate })
+      });
+    } catch (contextError) {
+      const message = contextError instanceof Error ? contextError.message : String(contextError);
+      captureFailures.push(
+        `explicit-request: ${sanitizeDiagnosticString(this.config, message)}`
+      );
+      return undefined;
+    }
+  }
+
+  private createSyntheticInboundEvent(
+    context: RequestContext,
+    request: CaptureRequestContextInput | undefined,
+    errorEventSeq: number,
+    errorEventHrtimeNs: bigint
+  ): IOEventSlot {
+    const elapsedNs =
+      errorEventHrtimeNs > context.startTime ? errorEventHrtimeNs - context.startTime : 0n;
+
+    return {
+      seq: errorEventSeq,
+      hrtimeNs: errorEventHrtimeNs,
+      phase: 'done',
+      startTime: context.startTime,
+      endTime: errorEventHrtimeNs,
+      durationMs: Number(elapsedNs) / 1_000_000,
+      type: 'http-server',
+      direction: 'inbound',
+      requestId: context.requestId,
+      contextLost: false,
+      target: context.headers.host ?? 'http-server',
+      method: context.method,
+      url: context.url,
+      statusCode: request?.statusCode ?? null,
+      fd: null,
+      requestHeaders: { ...context.headers },
+      responseHeaders: null,
+      requestBody: null,
+      responseBody: null,
+      requestBodyDigest: request?.bodyHash ?? null,
+      responseBodyDigest: null,
+      requestBodyTruncated: false,
+      responseBodyTruncated: false,
+      requestBodyOriginalSize: request?.bodyLength ?? null,
+      responseBodyOriginalSize: null,
+      error: null,
+      aborted: false,
+      estimatedBytes: 0
+    };
+  }
+
+  public async flush(): Promise<void> {
+    if (this.pendingTransportDispatches.size > 0) {
+      await Promise.allSettled([...this.pendingTransportDispatches]);
+    }
+
+    if (this.pendingBufferedTransportPayloads.length > 0) {
+      const pending = this.pendingBufferedTransportPayloads.splice(0);
+      const dispatches = pending.map(({ transportPayload, packageObject }) => {
+        const packageDispatch = this.dispatchTransport(transportPayload);
+        return this.dispatchPayloadBlobsAfter(packageDispatch, packageObject) ?? packageDispatch;
+      });
+      await Promise.allSettled(dispatches);
+    }
+  }
+
+  public async shutdown(options?: { timeoutMs?: number }): Promise<void> {
+    if (this.packageAssemblyDispatcher !== null) {
+      await this.packageAssemblyDispatcher.shutdown(options);
+    }
+
+    await this.flush();
+  }
+
+  public getDiagnostics(): CaptureDeliveryDiagnostics {
+    const snapshot = { ...this.deliveryDiagnostics };
+    this.deliveryDiagnostics.sent = 0;
+    this.deliveryDiagnostics.deadLettered = 0;
+    this.deliveryDiagnostics.dropped = 0;
+    return snapshot;
+  }
+
+  public getPendingTransportCount(): number {
+    return this.pendingTransportDispatches.size + this.pendingBufferedTransportPayloads.length;
+  }
+
+  private toRequestContextData(
+    context: RequestContext | undefined
+  ): ErrorPackageRequestContextData | undefined {
+    if (context === undefined) {
+      return undefined;
+    }
+
+    return {
+      requestId: context.requestId,
+      startTime: context.startTime,
+      method: context.method,
+      url: context.url,
+      headers: { ...context.headers },
+      body: context.body,
+      bodyTruncated: context.bodyTruncated
+    };
+  }
+
+  private captureInline(parts: ErrorPackageParts, modeState?: ModeState): ErrorPackage {
+    const { packageObject, payload, envelope } = finalizePackageAssemblyResult({
+      packageObject: this.packageBuilder.build(parts),
+      config: this.config,
+      encryption: this.encryption
+    });
+    const transportPayload: TransportPayload = {
+      serialized: payload,
+      ...(envelope === undefined ? {} : { envelope })
+    };
+
+    if ((modeState ?? this.modeProvider()).capabilities.deferredDelivery) {
+      this.pendingBufferedTransportPayloads.push({ transportPayload, packageObject });
+      return packageObject;
+    }
+
+    const packageDispatch = this.dispatchTransport(transportPayload);
+    this.dispatchPayloadBlobsAfter(packageDispatch, packageObject);
+    return packageObject;
+  }
+
+  private async dispatchPackageAssembly(parts: ErrorPackageParts): Promise<void> {
+    try {
+      const result = await this.packageAssemblyDispatcher?.assemble(parts);
+
+      if (result === undefined) {
+        throw new Error('Package assembly worker returned no result');
+      }
+
+      const packageDispatch = this.dispatchTransport({
+        serialized: result.payload,
+        ...(result.envelope === undefined ? {} : { envelope: result.envelope })
+      });
+      this.dispatchPayloadBlobsAfter(packageDispatch, result.packageObject);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      parts.captureFailures.push(
+        `package-worker: ${sanitizeDiagnosticString(this.config, message)}`
+      );
+
+      try {
+        this.captureInline(parts, this.modeProvider());
+      } catch (fallbackError) {
+        emitSafeWarning(this.config, {
+          code: 'EC_CAPTURE_FAILED',
+          message: 'Error capture fallback failed [code=EC_CAPTURE_FAILED]. Both the worker and inline capture paths failed.',
+          cause: fallbackError,
+          context: { stage: 'fallback' }
+        });
+      }
+    }
+  }
+
+  private dispatchTransport(payload: TransportPayload): Promise<boolean> {
+    const serializedBytes = Buffer.isBuffer(payload.serialized)
+      ? payload.serialized.length
+      : Buffer.byteLength(payload.serialized, 'utf8');
+    if (serializedBytes > this.config.hardCapBytes) {
+      emitSafeWarning(this.config, {
+        code: 'EC_PACKAGE_OVER_HARD_CAP',
+        message: `Error package exceeded hard cap (${serializedBytes} > ${this.config.hardCapBytes} bytes); payload dropped.`,
+        context: {
+          serializedBytes,
+          hardCapBytes: this.config.hardCapBytes,
+          eventId: payload.envelope?.eventId
+        }
+      });
+      this.deliveryDiagnostics.dropped += 1;
+      this.healthMetrics?.recordDroppedCaptureFailed();
+      return Promise.resolve(false);
+    }
+
+    this.healthMetrics?.recordCaptured();
+    const start = Date.now();
+
+    let sendPromise: Promise<boolean>;
+    sendPromise = Promise.resolve()
+      .then(() => this.transport.send(payload))
+      .then(() => {
+        this.deliveryDiagnostics.sent += 1;
+        this.healthMetrics?.recordFlushLatency(Date.now() - start);
+        if (this.transportFailedSinceLastSuccess) {
+          this.transportFailedSinceLastSuccess = false;
+          this.scheduleDeadLetterRecoveryDrain();
+        }
+        return true;
+      })
+      .catch((transportError) => {
+        const reason =
+          transportError instanceof Error
+            ? transportError.message
+            : String(transportError);
+
+        const isTimeout =
+          transportError instanceof Error &&
+          transportError.message === HTTP_TRANSPORT_TIMEOUT_MESSAGE;
+        // Console-safe message - do NOT interpolate the transport error
+        // text here because it can legitimately contain authorization
+        // fragments or user-supplied URLs (see
+        // test/unit/error-capture-pipeline "emits sanitized warning
+        // codes"). The raw reason is still delivered to
+        // onInternalWarning via `context.reason` and `cause`.
+        emitSafeWarning(this.config, {
+          code: isTimeout ? 'EC_TRANSPORT_TIMEOUT' : 'EC_TRANSPORT_FAILED',
+          message: isTimeout
+            ? 'Transport timeout [code=EC_TRANSPORT_TIMEOUT]. Payload dead-lettered (if configured). Check collector connectivity.'
+            : 'Transport dispatch failed [code=EC_TRANSPORT_FAILED]. Payload dead-lettered (if configured). Check collector connectivity.',
+          cause: transportError,
+          context: { reason }
+        });
+        this.healthMetrics?.recordFlushLatency(Date.now() - start);
+        this.healthMetrics?.recordTransportFailure(reason, Date.now());
+        this.transportFailedSinceLastSuccess = true;
+
+        if (this.deadLetterStore !== null) {
+          try {
+            const stored = this.deadLetterStore.appendPayloadSync(
+              Buffer.isBuffer(payload.serialized)
+                ? payload.serialized.toString('utf8')
+                : payload.serialized
+            );
+            if (stored) {
+              this.scheduleDeadLetterRecoveryDrain();
+            } else {
+              // DLQ declined the write (size cap / oversized payload).
+              // The store has already emitted its own `EC_DLQ_FULL`
+              // warning via the onInternalWarning hook wired at SDK
+              // construction - don't double-emit here.
+              this.deliveryDiagnostics.dropped += 1;
+              this.healthMetrics?.recordDroppedDlqWriteFailed();
+            }
+          } catch (dlError) {
+            const code = classifyDlqWriteErrno(dlError);
+            emitSafeWarning(this.config, {
+              code,
+              // Console message is sanitized (errno only; no raw
+              // exception text). Structured details on the callback.
+              message:
+                code === 'EC_DISK_FULL'
+                  ? 'Dead-letter store write failed: out of disk space [code=EC_DISK_FULL]. Check disk capacity at deadLetterPath.'
+                  : 'Dead-letter store write failed [code=EC_DLQ_WRITE_FAILED]. Check disk space and permissions at deadLetterPath.',
+              cause: dlError,
+              context: {
+                errno: (dlError as NodeJS.ErrnoException | null)?.code
+              }
+            });
+            this.deliveryDiagnostics.dropped += 1;
+            this.healthMetrics?.recordDroppedDlqWriteFailed();
+          }
+        } else {
+          // No DLQ configured - the payload is gone. Same health bucket
+          // as a DLQ write failure because both mean "no durable place
+          // to park this for retry."
+          this.deliveryDiagnostics.dropped += 1;
+          this.healthMetrics?.recordDroppedDlqWriteFailed();
+        }
+        return false;
+      })
+      .finally(() => {
+        this.pendingTransportDispatches.delete(sendPromise);
+      });
+
+    this.pendingTransportDispatches.add(sendPromise);
+    return sendPromise;
+  }
+
+  private scheduleDeadLetterRecoveryDrain(): void {
+    if (
+      this.deadLetterStore === null ||
+      this.deadLetterRecoveryDrain !== null ||
+      !this.deadLetterStore.hasPending()
+    ) {
+      return;
+    }
+
+    const drain = this.drainDeadLettersForRecovery()
+      .catch(() => undefined)
+      .finally(() => {
+        this.pendingTransportDispatches.delete(drain);
+        if (this.deadLetterRecoveryDrain === drain) {
+          this.deadLetterRecoveryDrain = null;
+        }
+      });
+
+    this.deadLetterRecoveryDrain = drain;
+    this.pendingTransportDispatches.add(drain);
+  }
+
+  private async drainDeadLettersForRecovery(): Promise<void> {
+    for (const waitMs of DLQ_RECOVERY_DRAIN_DELAYS_MS) {
+      await delay(waitMs);
+      if (await this.drainDeadLettersOnce()) {
+        this.transportFailedSinceLastSuccess = false;
+        return;
+      }
+    }
+  }
+
+  private async drainDeadLettersOnce(): Promise<boolean> {
+    const store = this.deadLetterStore;
+    if (store === null || !store.hasPending()) {
+      return true;
+    }
+
+    const { entries, lineCount } = store.drain();
+    if (entries.length === 0) {
+      if (lineCount > 0) {
+        store.clearSent(lineCount);
+      }
+      return true;
+    }
+
+    let processedLineCount = 0;
+    for (const entry of entries) {
+      try {
+        await this.transport.send({
+          serialized: entry.payload,
+          envelope: parseEnvelopeMetadata(entry.payload)
+        });
+        store.markAcked(entry.id);
+        processedLineCount = entry.lineNumber;
+      } catch {
+        break;
+      }
+    }
+
+    if (processedLineCount === 0) {
+      return false;
+    }
+
+    const drainedEverything =
+      processedLineCount === entries[entries.length - 1]?.lineNumber;
+    store.clearSent(drainedEverything ? lineCount : processedLineCount);
+    return drainedEverything;
+  }
+
+  private dispatchPayloadBlobsAfter(
+    packageDispatch: Promise<boolean>,
+    pkg: ErrorPackage
+  ): Promise<void> | null {
+    if (this.payloadSpool === null) {
+      return null;
+    }
+
+    let blobDispatch: Promise<void>;
+    blobDispatch = packageDispatch.then(async (packageWasSent) => {
+      if (!packageWasSent) {
+        return;
+      }
+      await this.dispatchPayloadBlobs(pkg);
+    }).finally(() => {
+      this.pendingTransportDispatches.delete(blobDispatch);
+    });
+
+    this.pendingTransportDispatches.add(blobDispatch);
+    return blobDispatch;
+  }
+
+  private async dispatchPayloadBlobs(pkg: ErrorPackage): Promise<void> {
+    if (this.payloadSpool === null) {
+      return;
+    }
+
+    const blobIds = new Set<string>();
+    for (const event of pkg.ioTimeline) {
+      if (event.requestPayloadRef?.storage === 'spool') {
+        blobIds.add(event.requestPayloadRef.blobId);
+      }
+      if (event.responsePayloadRef?.storage === 'spool') {
+        blobIds.add(event.responsePayloadRef.blobId);
+      }
+    }
+
+    const dispatches: Array<Promise<unknown>> = [];
+    for (const blobId of blobIds) {
+      const envelopeObject = this.payloadSpool.buildEnvelope(pkg.eventId, blobId);
+      if (envelopeObject === null) {
+        this.healthMetrics?.recordPayloadSpoolDrop();
+        emitSafeWarning(this.config, {
+          code: 'EC_PAYLOAD_SPOOL_DROPPED',
+          message: 'Payload blob reference could not be resolved during transport; blob dropped.',
+          context: {
+            eventId: pkg.eventId,
+            blobId
+          }
+        });
+        continue;
+      }
+      const result = finalizePayloadBlobAssemblyResult({
+        envelopeObject,
+        config: this.config,
+        encryption: this.encryption
+      });
+      dispatches.push(this.dispatchTransport({
+        kind: 'payload_blob',
+        serialized: result.payload,
+        ...(result.envelope === undefined ? {} : { envelope: result.envelope })
+      }));
+    }
+
+    if (dispatches.length > 0) {
+      await Promise.allSettled(dispatches);
+    }
+  }
+}

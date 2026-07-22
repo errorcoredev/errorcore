@@ -1,0 +1,8 @@
+{
+  "id": "hono",
+  "framework": "hono",
+  "repo": "honojs/examples",
+  "pin": "3b0b62875a0e1265763fea1c6388866d5697ef81",
+  "sourceDir": "source",
+  "overlay": "../benchmark-app"
+}

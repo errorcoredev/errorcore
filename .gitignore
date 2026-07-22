@@ -1,0 +1,60 @@
+# Dependencies, builds, coverage, and generated results
+node_modules/
+dist/
+coverage/
+/results/
+benchmark-harness/
+benchmark-results/
+test/benchmark-profiles/
+
+# Local-only documentation and generated validation evidence
+/docs/
+/harness/captures/
+/harness/checkpoints/
+harness/reports/
+harness/vendor/
+
+# Local audit/review artifacts
+AUDIT*.md
+audit*.md
+audit-*
+*.pre-merge-backup.md
+ship/
+.codex-autoresearch
+autoresearch-*
+
+lean-launch-test/
+compare_against_current.md
+
+# Secrets, local configuration, logs, and package artifacts
+*.env
+.env*
+*.log
+*.tgz
+/errorcore.config.js
+/errorcore.config.mjs
+.errorcore-dead-letters.ndjson
+/errorcore-h2-smoke.pfx
+/worker-file-smoke.ndjson
+/cli-replay-smoke.*
+
+# Temporary files and directories
+/tmp/
+/temp/
+/tmp-*/
+/temp-*/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+*.tsbuildinfo
+.cache/
+.npm/
+
+# Editor and operating-system metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

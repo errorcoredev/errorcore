@@ -1,0 +1,8 @@
+{
+  "id": "koa",
+  "framework": "koa",
+  "repo": "eflem00/koa-boilerplate",
+  "pin": "98265346877a30f3595baf6f574726078b2b6c54",
+  "sourceDir": "source",
+  "overlay": "../benchmark-app"
+}
