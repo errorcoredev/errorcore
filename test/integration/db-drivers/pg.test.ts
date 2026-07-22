@@ -68,7 +68,7 @@ describe.skipIf(!envFlag('EC_INTEGRATION_PG') || pg === null)(
         expect(result.rowCount).toBe(1);
         const events = buffer.getRecentWithContext(50).events;
         const queryEvent = events.find(
-          (e) => e.dbMeta?.query?.startsWith('SELECT 1') ?? false,
+          (e) => e.dbMeta?.query === 'SELECT [REDACTED] AS one',
         );
         expect(queryEvent).toBeDefined();
         expect(queryEvent!.type).toBe('db-query');
