@@ -65,7 +65,7 @@ function setCaptureWarningEmitted(value: boolean): void {
  * @example
  * // With an explicit config object
  * require('errorcore').init({
- *   transport: { type: 'http', url: 'https://collector.example.com/v1/errors' },
+ *   transport: { type: 'http', url: 'https://<ingest-host>/v1/ingest', apiKey: process.env.ERRORCORE_API_KEY },
  *   encryptionKey: process.env.ERRORCORE_DEK,
  * });
  *

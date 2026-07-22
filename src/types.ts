@@ -567,6 +567,7 @@ export type TransportConfig =
   | {
       type: 'http';
       url: string;
+      apiKey?: string;
       authorization?: string;
       timeoutMs?: number;
       protocol?: 'auto' | 'http1' | 'http2';

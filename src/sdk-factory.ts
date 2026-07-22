@@ -1,4 +1,4 @@
-import { resolveConfig } from './config';
+import { getTransportAuthorization, resolveConfig } from './config';
 import { safeConsole, setLogLevel } from './debug-log';
 import { IOEventBuffer } from './buffer/io-event-buffer';
 import { ALSManager } from './context/als-manager';
@@ -44,12 +44,6 @@ import type {
 } from './types';
 import type { SDKInstance } from './sdk';
 import type { DeadLetterHealthState, SDKInstanceInput } from './sdk-instance-input';
-
-function getTransportAuthorization(
-  transport: TransportConfig | undefined
-): string | undefined {
-  return transport?.type === 'http' ? transport.authorization : undefined;
-}
 
 function getWebhookSecret(
   transport: TransportConfig | undefined

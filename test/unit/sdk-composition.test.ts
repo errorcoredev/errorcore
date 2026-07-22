@@ -28,8 +28,56 @@ import {
 } from '../../src/sdk-diagnostics';
 import type { TransportPayload } from '../../src/types';
 
+const TEST_API_KEY = 'ec_live_0123456789abcdef0123456789abcdef';
+const ENV_TEST_API_KEY = 'ec_live_fedcba9876543210fedcba9876543210';
+
 function createTestSDK() {
   return createSDK({ transport: { type: 'stdout' }, allowUnencrypted: true });
+}
+
+async function sendHttpPayloadAndReadAuthorization(
+  credentials: { apiKey?: string; authorization?: string }
+): Promise<string | undefined> {
+  let resolveAuthorization!: (value: string | undefined) => void;
+  const receivedAuthorization = new Promise<string | undefined>((resolve) => {
+    resolveAuthorization = resolve;
+  });
+  const server = new Server((request, response) => {
+    request.resume();
+    resolveAuthorization(request.headers.authorization);
+    response.statusCode = 200;
+    response.end('ok');
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.listen(0, '127.0.0.1', resolve);
+    server.once('error', reject);
+  });
+  const address = server.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('HTTP auth test server did not bind to a TCP port');
+  }
+
+  let sdk: ReturnType<typeof createSDK> | undefined;
+  try {
+    sdk = createSDK({
+      allowUnencrypted: true,
+      allowPlainHttpTransport: true,
+      serverless: true,
+      transport: {
+        type: 'http',
+        url: `http://127.0.0.1:${address.port}/v1/ingest`,
+        protocol: 'http1',
+        ...credentials
+      }
+    });
+    await sdk.transport.send({ serialized: '{"ok":true}' });
+    return await receivedAuthorization;
+  } finally {
+    await sdk?.shutdown();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 }
 
 describe('SDK composition', () => {
@@ -110,13 +158,13 @@ describe('SDK composition', () => {
     }
   });
 
-  it('does not expose collector authorization on the public config surface', async () => {
+  it('does not expose collector API keys on the public config surface', async () => {
     const sdk = createSDK({
       allowUnencrypted: true,
       transport: {
         type: 'http',
         url: 'https://collector.example.com/v1/errors',
-        authorization: 'Bearer super-secret'
+        apiKey: TEST_API_KEY
       }
     });
 
@@ -126,9 +174,36 @@ describe('SDK composition', () => {
         url: 'https://collector.example.com/v1/errors',
         protocol: 'auto'
       });
-      expect(JSON.stringify(sdk.config)).not.toContain('super-secret');
+      expect(sdk.config.transport).not.toHaveProperty('apiKey');
+      expect(sdk.config.transport).not.toHaveProperty('authorization');
+      expect(JSON.stringify(sdk.config)).not.toContain(TEST_API_KEY);
     } finally {
       await sdk.shutdown();
+    }
+  });
+
+  it('sends explicit, environment, and legacy HTTP authentication on the wire', async () => {
+    const previousApiKey = process.env.ERRORCORE_API_KEY;
+    try {
+      delete process.env.ERRORCORE_API_KEY;
+      await expect(
+        sendHttpPayloadAndReadAuthorization({ apiKey: TEST_API_KEY })
+      ).resolves.toBe(`Bearer ${TEST_API_KEY}`);
+
+      process.env.ERRORCORE_API_KEY = ENV_TEST_API_KEY;
+      await expect(
+        sendHttpPayloadAndReadAuthorization({})
+      ).resolves.toBe(`Bearer ${ENV_TEST_API_KEY}`);
+
+      process.env.ERRORCORE_API_KEY = 'invalid-ambient-key';
+      await expect(
+        sendHttpPayloadAndReadAuthorization({
+          authorization: 'Custom legacy-collector-credential'
+        })
+      ).resolves.toBe('Custom legacy-collector-credential');
+    } finally {
+      if (previousApiKey === undefined) delete process.env.ERRORCORE_API_KEY;
+      else process.env.ERRORCORE_API_KEY = previousApiKey;
     }
   });
 

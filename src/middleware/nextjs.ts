@@ -19,6 +19,30 @@ interface NextLikeRequest {
 
 type MaybePromise<T> = T | Promise<T>;
 
+async function captureAndFlush(
+  instance: SDKInstanceLike,
+  error: unknown
+): Promise<void> {
+  if (instance.captureError === undefined) {
+    return;
+  }
+
+  try {
+    instance.captureError(error);
+  } catch {
+    // Error capture must never affect the wrapped route.
+  }
+
+  // A Next.js route may be recycled or the process may be frozen before the
+  // periodic delivery timer runs. Wait for error delivery before returning a
+  // 5xx response or rethrowing so captured route failures are not stranded.
+  try {
+    await instance.flush?.();
+  } catch {
+    // Transport failures are handled by the SDK/DLQ path.
+  }
+}
+
 export function withErrorcore<
   TReq extends NextLikeRequest,
   TCtx,
@@ -52,17 +76,13 @@ export function withErrorcore<
           typeof (result as unknown as { status?: unknown }).status === 'number' &&
           (result as unknown as { status: number }).status >= 500
         ) {
-          try {
-            const err = new Error(`HTTP ${(result as unknown as { status: number }).status}`);
-            err.name = 'ServerError';
-            instance.captureError(err);
-          } catch {}
+          const err = new Error(`HTTP ${(result as unknown as { status: number }).status}`);
+          err.name = 'ServerError';
+          await captureAndFlush(instance, err);
         }
         return result;
       } catch (handlerError) {
-        if (instance.captureError !== undefined) {
-          try { instance.captureError(handlerError); } catch {}
-        }
+        await captureAndFlush(instance, handlerError);
         throw handlerError;
       }
     }
@@ -113,11 +133,9 @@ export function withErrorcore<
             // with streaming responses and with framework internals that
             // had already consumed the clone. The status code alone is
             // enough signal; a real message will come from an exception.
-            try {
-              const err = new Error(`HTTP ${(result as unknown as { status: number }).status}`);
-              err.name = 'ServerError';
-              instance.captureError(err);
-            } catch {}
+            const err = new Error(`HTTP ${(result as unknown as { status: number }).status}`);
+            err.name = 'ServerError';
+            await captureAndFlush(instance, err);
           }
 
           return result;
@@ -127,9 +145,7 @@ export function withErrorcore<
           // outside runWithContext, which meant captured thrown errors
           // fell through to the ambient-events path - no ioTimeline filter
           // by requestId, no trace context, no state reads. [G2]
-          if (instance.captureError !== undefined) {
-            try { instance.captureError(handlerError); } catch {}
-          }
+          await captureAndFlush(instance, handlerError);
           throw handlerError;
         }
       });

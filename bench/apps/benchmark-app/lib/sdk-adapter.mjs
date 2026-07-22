@@ -190,6 +190,7 @@ async function createErrorcoreAdapter(config, logger) {
     transport: {
       type: 'http',
       url: `${sinkUrl}/ingest`,
+      apiKey: process.env.ERRORCORE_API_KEY ?? 'ec_live_0123456789abcdef0123456789abcdef',
       timeoutMs: 750,
       protocol: 'http1',
       maxBackups: 1

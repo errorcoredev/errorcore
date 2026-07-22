@@ -6,7 +6,8 @@ import type {
   PublicTransportConfig,
   ResolvedConfig,
   SDKConfig,
-  SerializationLimits
+  SerializationLimits,
+  TransportConfig
 } from './types';
 import {
   pickModeRelevantUserConfig,
@@ -125,6 +126,64 @@ const DEFAULT_BODY_CAPTURE_CONTENT_TYPES = [
   'text/plain',
   'application/xml'
 ];
+
+const ERRORCORE_API_KEY_PATTERN = /^ec_live_[A-Za-z0-9_-]{32,128}$/;
+
+/**
+ * Resolve the private HTTP credential independently of PublicTransportConfig.
+ * Keeping this value on the runtime-only path prevents SDKInstance.config from
+ * exposing either first-class API keys or legacy Authorization values.
+ */
+export function getTransportAuthorization(
+  transport: TransportConfig | undefined
+): string | undefined {
+  if (transport?.type !== 'http') {
+    return undefined;
+  }
+
+  const hasExplicitApiKey = transport.apiKey !== undefined;
+  const hasExplicitAuthorization = transport.authorization !== undefined;
+
+  if (hasExplicitApiKey && hasExplicitAuthorization) {
+    throw new Error(
+      'HTTP transport authentication is ambiguous: configure transport.apiKey or transport.authorization, not both.'
+    );
+  }
+
+  if (hasExplicitAuthorization) {
+    if (
+      typeof transport.authorization !== 'string' ||
+      transport.authorization.trim().length === 0
+    ) {
+      throw new Error(
+        'transport.authorization must be a non-empty string for HTTP transport.'
+      );
+    }
+
+    return transport.authorization;
+  }
+
+  const apiKey = hasExplicitApiKey
+    ? transport.apiKey
+    : process.env.ERRORCORE_API_KEY;
+  const source = hasExplicitApiKey
+    ? 'transport.apiKey'
+    : 'ERRORCORE_API_KEY';
+
+  if (apiKey === undefined) {
+    throw new Error(
+      'HTTP transport authentication is required. Set transport.apiKey (preferred), ERRORCORE_API_KEY, or transport.authorization for a legacy/custom collector.'
+    );
+  }
+
+  if (typeof apiKey !== 'string' || !ERRORCORE_API_KEY_PATTERN.test(apiKey)) {
+    throw new Error(
+      `${source} must match /^ec_live_[A-Za-z0-9_-]{32,128}$/. Generate or copy a valid ErrorCore ingestion API key.`
+    );
+  }
+
+  return `Bearer ${apiKey}`;
+}
 
 function assertNonNegativeInteger(
   value: number,
@@ -602,6 +661,10 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
       if (transport.protocol === 'http2' && new URL(transport.url).protocol !== 'https:') {
         throw new Error('transport.protocol: "http2" requires an https:// collector URL; h2c is not supported');
       }
+
+      // Validate authentication during config resolution while keeping the
+      // resolved/public transport object free of secret values.
+      getTransportAuthorization(transport);
     }
   }
 

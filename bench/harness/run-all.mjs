@@ -78,6 +78,7 @@ function collectSdkInitConfigs() {
       transport: {
         type: 'http',
         url: `${errorcoreSinkUrl}/ingest`,
+        apiKey: process.env.ERRORCORE_API_KEY ?? 'ec_live_0123456789abcdef0123456789abcdef',
         timeoutMs: 750,
         protocol: 'http1',
         maxBackups: 1

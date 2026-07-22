@@ -12,6 +12,7 @@ import type { InternalWarning } from '../../src/types';
 // 64-char uniformly distributed hex — satisfies the entropy check.
 const TEST_ENCRYPTION_KEY =
   '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+const TEST_API_KEY = 'ec_live_0123456789abcdef0123456789abcdef';
 
 interface CapturedWarning {
   code: string;
@@ -130,6 +131,7 @@ describe('backpressure contract', () => {
         transport: {
           type: 'http',
           url: `http://127.0.0.1:${port}/`,
+          apiKey: TEST_API_KEY,
           timeoutMs: 500
         },
         allowUnencrypted: true,
@@ -178,6 +180,7 @@ describe('backpressure contract', () => {
         transport: {
           type: 'http',
           url: `http://127.0.0.1:${reservedPort}/`,
+          apiKey: TEST_API_KEY,
           timeoutMs: 200
         },
         encryptionKey: TEST_ENCRYPTION_KEY,
@@ -219,6 +222,7 @@ describe('backpressure contract', () => {
         transport: {
           type: 'http',
           url: `http://127.0.0.1:${port}/`,
+          apiKey: TEST_API_KEY,
           timeoutMs: 100
         },
         allowUnencrypted: true,

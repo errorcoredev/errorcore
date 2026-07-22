@@ -7,12 +7,13 @@ module.exports = {
   // Recommended for production collectors.
   // transport: {
   //   type: 'http',
-  //   url: 'https://collector.example.com/v1/errors',
-  //   authorization: 'Bearer <collector-token>',
+  //   url: 'https://<ingest-host>/v1/ingest',
+  //   apiKey: process.env.ERRORCORE_API_KEY,
   //   protocol: 'auto', // 'auto' | 'http1' | 'http2'
   //   timeoutMs: 5000,
   //   maxBackups: 5,
   // },
+  // Keep API keys server-side. Do not include this config in browser or edge bundles.
 
   // Webhook destination with a local NDJSON event store. The SDK stores
   // every event locally first, then ships batches to your endpoint.

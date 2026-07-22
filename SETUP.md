@@ -82,13 +82,21 @@ Pick exactly one transport. The SDK will not start without one.
 ```js
 transport: {
   type: 'http',
-  url: 'https://collector.example.com/v1/errors',
-  authorization: 'Bearer <collector-token>',
+  url: 'https://<ingest-host>/v1/ingest',
+  apiKey: process.env.ERRORCORE_API_KEY,
   protocol: 'auto',
   timeoutMs: 5000,
   maxBackups: 5,
 }
 ```
+
+`transport.apiKey` is preferred. If it is omitted, the SDK reads
+`ERRORCORE_API_KEY`; legacy/custom collectors may continue to set a non-empty
+`transport.authorization` value instead. Do not set both `apiKey` and
+`authorization`.
+
+API keys are server-side secrets. Never expose this HTTP transport config or
+`ERRORCORE_API_KEY` in browser or edge bundles.
 
 `protocol` controls the collector transport only:
 

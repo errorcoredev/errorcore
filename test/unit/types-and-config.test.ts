@@ -27,6 +27,9 @@ import type {
 } from '../../src/types';
 import { resolveTestConfig } from '../helpers/test-config';
 
+const TEST_API_KEY = 'ec_live_0123456789abcdef0123456789abcdef';
+const SECOND_TEST_API_KEY = 'ec_live_fedcba9876543210fedcba9876543210';
+
 describe('resolveConfig', () => {
   it('resolves hot-swappable ModeState for the full mode chain', () => {
     const base = resolveTestConfig({
@@ -785,6 +788,161 @@ describe('resolveConfig', () => {
     expect(JSON.stringify(resolved)).not.toContain('secret-token');
   });
 
+  it('accepts a valid HTTP apiKey without exposing it in resolved config', () => {
+    const resolved = resolveTestConfig({
+      transport: {
+        type: 'http',
+        url: 'https://example.com/v1/ingest',
+        apiKey: TEST_API_KEY
+      }
+    });
+
+    expect(resolved.transport).toEqual({
+      type: 'http',
+      url: 'https://example.com/v1/ingest',
+      protocol: 'auto'
+    });
+    expect(resolved.transport).not.toHaveProperty('apiKey');
+    expect(resolved.transport).not.toHaveProperty('authorization');
+    expect(JSON.stringify(resolved)).not.toContain(TEST_API_KEY);
+  });
+
+  it('uses ERRORCORE_API_KEY when HTTP apiKey and legacy authorization are omitted', () => {
+    const previousApiKey = process.env.ERRORCORE_API_KEY;
+    process.env.ERRORCORE_API_KEY = TEST_API_KEY;
+    try {
+      const resolved = resolveTestConfig({
+        transport: {
+          type: 'http',
+          url: 'https://example.com/v1/ingest'
+        }
+      });
+
+      expect(resolved.transport).not.toHaveProperty('apiKey');
+      expect(resolved.transport).not.toHaveProperty('authorization');
+      expect(JSON.stringify(resolved)).not.toContain(TEST_API_KEY);
+    } finally {
+      if (previousApiKey === undefined) delete process.env.ERRORCORE_API_KEY;
+      else process.env.ERRORCORE_API_KEY = previousApiKey;
+    }
+  });
+
+  it('rejects explicit apiKey together with legacy authorization without exposing either value', () => {
+    let thrown: Error | undefined;
+    try {
+      resolveTestConfig({
+        transport: {
+          type: 'http',
+          url: 'https://example.com/v1/ingest',
+          apiKey: TEST_API_KEY,
+          authorization: 'Bearer legacy-collector-secret'
+        }
+      });
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    expect(thrown?.message).toContain('transport.apiKey or transport.authorization, not both');
+    expect(thrown?.message).not.toContain(TEST_API_KEY);
+    expect(thrown?.message).not.toContain('legacy-collector-secret');
+  });
+
+  it('fails fast for missing, empty, malformed, and wrong-prefix HTTP API keys', () => {
+    const previousApiKey = process.env.ERRORCORE_API_KEY;
+    delete process.env.ERRORCORE_API_KEY;
+
+    const cases: Array<{ apiKey?: string; expected: string }> = [
+      { expected: 'HTTP transport authentication is required' },
+      { apiKey: '', expected: 'transport.apiKey must match' },
+      { apiKey: 'ec_live_too-short', expected: 'transport.apiKey must match' },
+      {
+        apiKey: 'wrong_live_0123456789abcdef0123456789abcdef',
+        expected: 'transport.apiKey must match'
+      }
+    ];
+
+    try {
+      for (const testCase of cases) {
+        let thrown: Error | undefined;
+        try {
+          resolveTestConfig({
+            transport: {
+              type: 'http',
+              url: 'https://example.com/v1/ingest',
+              ...(testCase.apiKey === undefined ? {} : { apiKey: testCase.apiKey })
+            }
+          });
+        } catch (error) {
+          thrown = error as Error;
+        }
+
+        expect(thrown?.message).toContain(testCase.expected);
+        if (testCase.apiKey !== undefined && testCase.apiKey.length > 0) {
+          expect(thrown?.message).not.toContain(testCase.apiKey);
+        }
+      }
+    } finally {
+      if (previousApiKey === undefined) delete process.env.ERRORCORE_API_KEY;
+      else process.env.ERRORCORE_API_KEY = previousApiKey;
+    }
+  });
+
+  it('validates ERRORCORE_API_KEY without exposing its value', () => {
+    const previousApiKey = process.env.ERRORCORE_API_KEY;
+    process.env.ERRORCORE_API_KEY = SECOND_TEST_API_KEY.slice(0, -1) + '!';
+    try {
+      expect(() =>
+        resolveTestConfig({
+          transport: { type: 'http', url: 'https://example.com/v1/ingest' }
+        })
+      ).toThrow('ERRORCORE_API_KEY must match');
+
+      try {
+        resolveTestConfig({
+          transport: { type: 'http', url: 'https://example.com/v1/ingest' }
+        });
+      } catch (error) {
+        expect((error as Error).message).not.toContain(process.env.ERRORCORE_API_KEY);
+      }
+    } finally {
+      if (previousApiKey === undefined) delete process.env.ERRORCORE_API_KEY;
+      else process.env.ERRORCORE_API_KEY = previousApiKey;
+    }
+  });
+
+  it('lets explicit legacy authorization ignore an ambient ERRORCORE_API_KEY', () => {
+    const previousApiKey = process.env.ERRORCORE_API_KEY;
+    process.env.ERRORCORE_API_KEY = 'invalid-ambient-api-key';
+    try {
+      const resolved = resolveTestConfig({
+        transport: {
+          type: 'http',
+          url: 'https://example.com/v1/ingest',
+          authorization: 'Custom legacy-collector-credential'
+        }
+      });
+
+      expect(resolved.transport).not.toHaveProperty('apiKey');
+      expect(resolved.transport).not.toHaveProperty('authorization');
+      expect(JSON.stringify(resolved)).not.toContain('legacy-collector-credential');
+    } finally {
+      if (previousApiKey === undefined) delete process.env.ERRORCORE_API_KEY;
+      else process.env.ERRORCORE_API_KEY = previousApiKey;
+    }
+  });
+
+  it('rejects empty legacy HTTP authorization', () => {
+    expect(() =>
+      resolveTestConfig({
+        transport: {
+          type: 'http',
+          url: 'https://example.com/v1/ingest',
+          authorization: '   '
+        }
+      })
+    ).toThrow('transport.authorization must be a non-empty string');
+  });
+
   it('accepts webhook transport and resolves batching defaults', () => {
     const resolved = resolveTestConfig({
       transport: {
@@ -856,7 +1014,11 @@ describe('resolveConfig', () => {
 
     expect(
       resolveConfig({
-        transport: { type: 'http', url: 'http://example.com/collect' },
+        transport: {
+          type: 'http',
+          url: 'http://example.com/collect',
+          apiKey: 'ec_live_0123456789abcdef0123456789abcdef'
+        },
         allowPlainHttpTransport: true,
         allowInvalidCollectorCertificates: true
       })

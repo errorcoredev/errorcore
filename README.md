@@ -65,7 +65,23 @@ npx errorcore dashboard
 
 The dashboard runs at `127.0.0.1:4400` by default. `npx ecd dashboard` works too.
 
-### Option B: Webhook
+### Option B: ErrorCore HTTP ingestion
+
+Send captures to an ErrorCore ingestion endpoint with a server-side API key:
+
+```js
+// errorcore.config.js
+module.exports = {
+  transport: { type: 'http', url: 'https://<ingest-host>/v1/ingest', apiKey: process.env.ERRORCORE_API_KEY },
+  encryptionKey: process.env.ERRORCORE_DEK
+};
+```
+
+`transport.apiKey` takes precedence over the `ERRORCORE_API_KEY` environment
+fallback and is sent as a Bearer credential. API keys are server-side secrets:
+never embed this config or `ERRORCORE_API_KEY` in browser or edge bundles.
+
+### Option C: Webhook
 
 Send captured errors to your own endpoint:
 

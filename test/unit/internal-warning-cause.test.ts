@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { serializeCause } from '../../src/capture/error-capturer';
+import {
+  scrubInternalWarningValue,
+  serializeCause
+} from '../../src/capture/error-capturer';
 
 describe('serializeCause', () => {
   it('returns a structured object for an Error with a stack', () => {
@@ -34,5 +37,23 @@ describe('serializeCause', () => {
     expect(serializeCause('plain string')).toBe('plain string');
     expect(serializeCause(null)).toBe(null);
     expect(serializeCause(42)).toBe(42);
+  });
+});
+
+describe('scrubInternalWarningValue', () => {
+  it('redacts apiKey and authorization fields plus Bearer values', () => {
+    const apiKey = 'ec_live_0123456789abcdef0123456789abcdef';
+
+    expect(
+      scrubInternalWarningValue({
+        apiKey,
+        authorization: `Bearer ${apiKey}`,
+        detail: `collector rejected Bearer ${apiKey}`
+      })
+    ).toEqual({
+      apiKey: '[REDACTED]',
+      authorization: '[REDACTED]',
+      detail: 'collector rejected Bearer [REDACTED]'
+    });
   });
 });

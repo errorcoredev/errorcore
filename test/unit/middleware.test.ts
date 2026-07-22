@@ -31,6 +31,7 @@ function createSdk(options?: { active?: boolean; throwOnCreate?: boolean }) {
     sdk: {
       isActive: () => options?.active ?? true,
       captureError: vi.fn(),
+      flush: vi.fn(async () => undefined),
       als: {
         createRequestContext: vi.fn((input: {
           method: string;
@@ -1348,6 +1349,28 @@ describe('middleware adapters', () => {
     expect(sdk.requestTracker.add).not.toHaveBeenCalled();
   });
 
+  it('withErrorcore flushes a captured error in an existing context before rethrowing', async () => {
+    const { sdk, als } = createSdk();
+    const existing = als.createRequestContext({
+      method: 'GET',
+      url: '/existing-error',
+      headers: { host: 'service.local' }
+    });
+    const boom = new Error('nested handler boom');
+
+    await als.runWithContext(existing, async () => {
+      await expect(
+        withErrorcore(async () => {
+          throw boom;
+        }, sdk)(createNextRequest())
+      ).rejects.toBe(boom);
+    });
+
+    expect(sdk.captureError).toHaveBeenCalledWith(boom);
+    expect(sdk.flush).toHaveBeenCalledTimes(1);
+    expect(sdk.requestTracker.add).not.toHaveBeenCalled();
+  });
+
   it('withErrorcore still calls handler when SDK throws during setup', async () => {
     const { sdk } = createSdk({ throwOnCreate: true });
     const result = await withErrorcore(async () => 'recovered', sdk)(createNextRequest());
@@ -1366,6 +1389,7 @@ describe('middleware adapters', () => {
 
     const captured = getAddedContext();
     expect(sdk.requestTracker.remove).toHaveBeenCalledWith(captured?.requestId);
+    expect(sdk.flush).toHaveBeenCalledTimes(1);
   });
 
   it('withErrorcore captures 5xx results without reading the response body', async () => {
@@ -1387,6 +1411,7 @@ describe('middleware adapters', () => {
 
     expect(result).toBe(responseLike);
     expect(captureSpy).toHaveBeenCalledTimes(1);
+    expect(sdk.flush).toHaveBeenCalledTimes(1);
     const capturedError = captureSpy.mock.calls[0]?.[0] as Error;
     expect(capturedError.message).toBe('HTTP 500');
     expect(capturedError.name).toBe('ServerError');
