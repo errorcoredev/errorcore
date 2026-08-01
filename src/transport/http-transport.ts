@@ -237,9 +237,11 @@ export class HttpTransport {
                 ...(payload.envelope?.eventId === undefined
                   ? {}
                   : { 'X-Errorcore-Event-Id': payload.envelope.eventId }),
-                ...(payload.kind === undefined
+                // ADR-0001: the kind header MUST equal envelope.kind, so
+                // the envelope value wins over the caller-supplied hint.
+                ...((payload.envelope?.kind ?? payload.kind) === undefined
                   ? {}
-                  : { 'X-Errorcore-Payload-Kind': payload.kind }),
+                  : { 'X-Errorcore-Payload-Kind': payload.envelope?.kind ?? payload.kind }),
                 ...(this.authorization === undefined
                   ? {}
                   : { Authorization: this.authorization })
@@ -332,9 +334,11 @@ export class HttpTransport {
               ...(payload.envelope?.eventId === undefined
                 ? {}
                 : { 'x-errorcore-event-id': payload.envelope.eventId }),
-              ...(payload.kind === undefined
+              // ADR-0001: the kind header MUST equal envelope.kind, so
+              // the envelope value wins over the caller-supplied hint.
+              ...((payload.envelope?.kind ?? payload.kind) === undefined
                 ? {}
-                : { 'x-errorcore-payload-kind': payload.kind }),
+                : { 'x-errorcore-payload-kind': payload.envelope?.kind ?? payload.kind }),
               ...(this.authorization === undefined
                 ? {}
                 : { authorization: this.authorization })

@@ -4,6 +4,7 @@ import * as path from 'node:path';
 
 import {
   resolveConfig,
+  resolveSecrets,
   detectServerlessEnvironment,
   resolveModeState,
   __resetLegacyInsecureTransportWarning
@@ -470,11 +471,6 @@ describe('resolveConfig', () => {
         'REPLICA_SET'
       ],
       envBlocklist: [/key|secret|token|password|passcode|passphrase|passwd|credential|auth|private/i],
-      encryptionKey: undefined,
-      macKey: undefined,
-      encryptionKeyCallback: undefined,
-      previousEncryptionKeys: [],
-      previousTransportAuthorizations: [],
       allowUnencrypted: true, // set explicitly by resolveTestConfig
       allowProductionPlaintext: false,
       hardCapBytes: 1_048_576,
@@ -1368,7 +1364,11 @@ describe('0.2.0 config surface', () => {
 
     expect(resolved.deadLetterMaxBytes).toBe(12 * 1024 * 1024);
     expect(resolved.deadLetterMaxBackups).toBe(7);
-    expect(resolved.previousTransportAuthorizations).toEqual([
+    // The rotation secrets live on ResolvedSecrets, never the public config.
+    expect(resolved).not.toHaveProperty('previousTransportAuthorizations');
+    expect(resolveSecrets({
+      previousTransportAuthorizations: ['Bearer old-token', 'Bearer older-token']
+    }).previousTransportAuthorizations).toEqual([
       'Bearer old-token',
       'Bearer older-token'
     ]);
@@ -1531,20 +1531,34 @@ describe('previousEncryptionKeys resolution', () => {
   const PREV2   = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0';
 
   it('defaults to empty array when not provided', () => {
-    const resolved = resolveConfig({
-      transport: { type: 'stdout' },
-      allowUnencrypted: true,
-    });
-    expect(resolved.previousEncryptionKeys).toEqual([]);
+    expect(resolveSecrets({}).previousEncryptionKeys).toEqual([]);
   });
 
   it('accepts a list of hex keys and preserves order', () => {
-    const resolved = resolveConfig({
-      transport: { type: 'stdout' },
+    const secrets = resolveSecrets({
       encryptionKey: PRIMARY,
       previousEncryptionKeys: [PREV1, PREV2],
     });
-    expect(resolved.previousEncryptionKeys).toEqual([PREV1, PREV2]);
+    expect(secrets.previousEncryptionKeys).toEqual([PREV1, PREV2]);
+  });
+
+  it('keeps key material off the public resolved config', () => {
+    const resolved = resolveConfig({
+      transport: { type: 'stdout' },
+      encryptionKey: PRIMARY,
+      previousEncryptionKeys: [PREV1],
+    });
+
+    expect(resolved).not.toHaveProperty('encryptionKey');
+    expect(resolved).not.toHaveProperty('macKey');
+    expect(resolved).not.toHaveProperty('encryptionKeyCallback');
+    expect(resolved).not.toHaveProperty('previousEncryptionKeys');
+    expect(resolved).not.toHaveProperty('previousTransportAuthorizations');
+    expect(
+      (resolved as unknown as Record<string, unknown>).encryptionKey
+    ).toBeUndefined();
+    expect(JSON.stringify(resolved)).not.toContain(PRIMARY);
+    expect(JSON.stringify(resolved)).not.toContain(PREV1);
   });
 
   it('rejects entries that are not 64-hex', () => {

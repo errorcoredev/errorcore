@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import type {
   PublicTransportConfig,
   ResolvedConfig,
+  ResolvedSecrets,
   SDKConfig,
   SerializationLimits,
   TransportConfig
@@ -183,6 +184,116 @@ export function getTransportAuthorization(
   }
 
   return `Bearer ${apiKey}`;
+}
+
+/**
+ * Resolve and validate key material (DEK, MAC key, rotation chains)
+ * independently of ResolvedConfig, mirroring getTransportAuthorization:
+ * SDKInstance.config is a public surface, so secrets stay on this
+ * runtime-only object held by the composition root. resolveConfig()
+ * calls this for fail-fast validation; the factory calls it again to
+ * obtain the actual values.
+ */
+export function resolveSecrets(userConfig: Partial<SDKConfig> = {}): ResolvedSecrets {
+  // The DEK can come from config.encryptionKey, the ERRORCORE_DEK env
+  // var, or an async callback. Validate the explicit-config form here;
+  // the env-var path is read at SDK init.
+  const resolvedEncryptionKey = userConfig.encryptionKey
+    ?? (process.env.ERRORCORE_DEK !== undefined && process.env.ERRORCORE_DEK !== ''
+      ? process.env.ERRORCORE_DEK
+      : undefined);
+
+  if (
+    resolvedEncryptionKey !== undefined &&
+    !/^[0-9a-f]{64}$/i.test(resolvedEncryptionKey)
+  ) {
+    throw new Error(
+      'encryptionKey must be a 64-character hex string (32 bytes). ' +
+      'Generate one with: ' +
+      'node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"'
+    );
+  }
+
+  const resolvedMacKey = userConfig.macKey
+    ?? (process.env.ERRORCORE_MAC_KEY !== undefined && process.env.ERRORCORE_MAC_KEY !== ''
+      ? process.env.ERRORCORE_MAC_KEY
+      : undefined);
+
+  if (
+    resolvedMacKey !== undefined &&
+    !/^[0-9a-f]{64}$/i.test(resolvedMacKey)
+  ) {
+    throw new Error(
+      'macKey must be a 64-character hex string (32 bytes). ' +
+      'Generate one with: ' +
+      'node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"'
+    );
+  }
+
+  if (
+    userConfig.encryptionKeyCallback !== undefined &&
+    typeof userConfig.encryptionKeyCallback !== 'function'
+  ) {
+    throw new Error('encryptionKeyCallback must be a function or undefined');
+  }
+
+  if (resolvedEncryptionKey !== undefined) {
+    // Shannon entropy over the hex alphabet (max 4.0 bits per character).
+    // A uniformly random 32-byte hex key scores ~3.93. Threshold of 3.5
+    // rejects trivially repetitive keys (all-zeros, single-letter, short
+    // repeating patterns) while still passing any key generated from
+    // crypto.randomBytes.
+    const characterDistribution = hexKeyEntropy(resolvedEncryptionKey);
+    if (characterDistribution < 3.5) {
+      throw new Error(
+        'encryptionKey has insufficient character diversity (all-zeros, repeated characters, or trivially predictable). ' +
+        'Generate a random key with: ' +
+        'node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"'
+      );
+    }
+  }
+
+  const previousEncryptionKeys = userConfig.previousEncryptionKeys ?? [];
+  if (!Array.isArray(previousEncryptionKeys)) {
+    throw new Error('previousEncryptionKeys must be an array of 64-character hex strings');
+  }
+
+  const previousTransportAuthorizations =
+    userConfig.previousTransportAuthorizations ?? [];
+  if (!Array.isArray(previousTransportAuthorizations)) {
+    throw new Error('previousTransportAuthorizations must be an array of strings');
+  }
+  if (!previousTransportAuthorizations.every((value) => typeof value === 'string')) {
+    throw new Error('previousTransportAuthorizations must be an array of strings');
+  }
+  if (previousEncryptionKeys.length > 5) {
+    throw new Error('previousEncryptionKeys must contain at most 5 entries');
+  }
+  for (const prev of previousEncryptionKeys) {
+    if (typeof prev !== 'string' || !/^[0-9a-f]{64}$/i.test(prev)) {
+      throw new Error(
+        'previousEncryptionKeys entries must each be a 64-character hex string (32 bytes)'
+      );
+    }
+    if (hexKeyEntropy(prev) < 3.5) {
+      throw new Error(
+        'previousEncryptionKeys entry has insufficient character diversity'
+      );
+    }
+    if (userConfig.encryptionKey !== undefined && prev === userConfig.encryptionKey) {
+      throw new Error(
+        'previousEncryptionKeys must not include the primary key (encryptionKey)'
+      );
+    }
+  }
+
+  return {
+    encryptionKey: resolvedEncryptionKey,
+    macKey: resolvedMacKey,
+    encryptionKeyCallback: userConfig.encryptionKeyCallback,
+    previousEncryptionKeys: [...previousEncryptionKeys],
+    previousTransportAuthorizations: [...previousTransportAuthorizations]
+  };
 }
 
 function assertNonNegativeInteger(
@@ -423,97 +534,10 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     );
   }
 
-  // The DEK can come from config.encryptionKey, the ERRORCORE_DEK env
-  // var, or an async callback. Validate the explicit-config form here;
-  // the env-var path is read at SDK init.
-  const resolvedEncryptionKey = userConfig.encryptionKey
-    ?? (process.env.ERRORCORE_DEK !== undefined && process.env.ERRORCORE_DEK !== ''
-      ? process.env.ERRORCORE_DEK
-      : undefined);
-
-  if (
-    resolvedEncryptionKey !== undefined &&
-    !/^[0-9a-f]{64}$/i.test(resolvedEncryptionKey)
-  ) {
-    throw new Error(
-      'encryptionKey must be a 64-character hex string (32 bytes). ' +
-      'Generate one with: ' +
-      'node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"'
-    );
-  }
-
-  const resolvedMacKey = userConfig.macKey
-    ?? (process.env.ERRORCORE_MAC_KEY !== undefined && process.env.ERRORCORE_MAC_KEY !== ''
-      ? process.env.ERRORCORE_MAC_KEY
-      : undefined);
-
-  if (
-    resolvedMacKey !== undefined &&
-    !/^[0-9a-f]{64}$/i.test(resolvedMacKey)
-  ) {
-    throw new Error(
-      'macKey must be a 64-character hex string (32 bytes). ' +
-      'Generate one with: ' +
-      'node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"'
-    );
-  }
-
-  if (
-    userConfig.encryptionKeyCallback !== undefined &&
-    typeof userConfig.encryptionKeyCallback !== 'function'
-  ) {
-    throw new Error('encryptionKeyCallback must be a function or undefined');
-  }
-
-  if (resolvedEncryptionKey !== undefined) {
-    // Shannon entropy over the hex alphabet (max 4.0 bits per character).
-    // A uniformly random 32-byte hex key scores ~3.93. Threshold of 3.5
-    // rejects trivially repetitive keys (all-zeros, single-letter, short
-    // repeating patterns) while still passing any key generated from
-    // crypto.randomBytes.
-    const characterDistribution = hexKeyEntropy(resolvedEncryptionKey);
-    if (characterDistribution < 3.5) {
-      throw new Error(
-        'encryptionKey has insufficient character diversity (all-zeros, repeated characters, or trivially predictable). ' +
-        'Generate a random key with: ' +
-        'node -e "process.stdout.write(require(\'crypto\').randomBytes(32).toString(\'hex\') + \'\\n\')"'
-      );
-    }
-  }
-
-  const previousEncryptionKeys = userConfig.previousEncryptionKeys ?? [];
-  if (!Array.isArray(previousEncryptionKeys)) {
-    throw new Error('previousEncryptionKeys must be an array of 64-character hex strings');
-  }
-
-  const previousTransportAuthorizations =
-    userConfig.previousTransportAuthorizations ?? [];
-  if (!Array.isArray(previousTransportAuthorizations)) {
-    throw new Error('previousTransportAuthorizations must be an array of strings');
-  }
-  if (!previousTransportAuthorizations.every((value) => typeof value === 'string')) {
-    throw new Error('previousTransportAuthorizations must be an array of strings');
-  }
-  if (previousEncryptionKeys.length > 5) {
-    throw new Error('previousEncryptionKeys must contain at most 5 entries');
-  }
-  for (const prev of previousEncryptionKeys) {
-    if (typeof prev !== 'string' || !/^[0-9a-f]{64}$/i.test(prev)) {
-      throw new Error(
-        'previousEncryptionKeys entries must each be a 64-character hex string (32 bytes)'
-      );
-    }
-    if (hexKeyEntropy(prev) < 3.5) {
-      throw new Error(
-        'previousEncryptionKeys entry has insufficient character diversity'
-      );
-    }
-    if (userConfig.encryptionKey !== undefined && prev === userConfig.encryptionKey) {
-      throw new Error(
-        'previousEncryptionKeys must not include the primary key (encryptionKey)'
-      );
-    }
-  }
+  // Key material is validated here (so bad config fails fast) but lives
+  // on the runtime-only ResolvedSecrets object, never on ResolvedConfig.
+  const secrets = resolveSecrets(userConfig);
+  const resolvedEncryptionKey = secrets.encryptionKey;
 
   if (
     userConfig.piiScrubber !== undefined &&
@@ -794,11 +818,6 @@ export function resolveConfig(userConfig: Partial<SDKConfig> = {}): ResolvedConf
     headerBlocklist: [...(userConfig.headerBlocklist ?? DEFAULT_HEADER_BLOCKLIST)],
     envAllowlist: [...(userConfig.envAllowlist ?? DEFAULT_ENV_ALLOWLIST)],
     envBlocklist: [...(userConfig.envBlocklist ?? DEFAULT_ENV_BLOCKLIST)],
-    encryptionKey: resolvedEncryptionKey,
-    macKey: resolvedMacKey,
-    encryptionKeyCallback: userConfig.encryptionKeyCallback,
-    previousEncryptionKeys: [...previousEncryptionKeys],
-    previousTransportAuthorizations: [...previousTransportAuthorizations],
     // Default matches the transport default above (isProduction() gate): in
     // development (NODE_ENV !== 'production') plaintext is allowed and the
     // stdout transport is injected automatically; in production encryption

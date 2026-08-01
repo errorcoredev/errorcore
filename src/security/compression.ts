@@ -39,12 +39,38 @@ export function maybeCompress(plaintext: Buffer): MaybeCompressResult {
 }
 
 /**
- * Inverse of maybeCompress. `compressed` is read from the envelope.
+ * Default hard cap on decompressed plaintext (10 MiB). Callers can lower
+ * or raise it, but there is no unbounded path: a deflate bomb must throw
+ * during inflation instead of allocating an arbitrarily large buffer.
  */
-export function maybeDecompress(buf: Buffer, compressed: boolean): Buffer {
+export const DEFAULT_MAX_PLAINTEXT_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Inverse of maybeCompress. `compressed` is read from the envelope.
+ * `maxOutputLength` bounds the inflated size DURING inflation (zlib
+ * aborts as soon as the output would exceed the cap); breaching it
+ * throws EC_DECOMPRESSION_LIMIT_EXCEEDED, any other inflate failure
+ * throws EC_DECOMPRESSION_FAILED.
+ */
+export function maybeDecompress(
+  buf: Buffer,
+  compressed: boolean,
+  maxOutputLength: number = DEFAULT_MAX_PLAINTEXT_BYTES
+): Buffer {
   if (!compressed) {
     return buf;
   }
 
-  return inflateRawSync(buf);
+  try {
+    return inflateRawSync(buf, { maxOutputLength });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === 'ERR_BUFFER_TOO_LARGE') {
+      throw new Error(
+        `EC_DECOMPRESSION_LIMIT_EXCEEDED: inflated payload exceeds ${maxOutputLength} bytes`
+      );
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`EC_DECOMPRESSION_FAILED: ${reason}`);
+  }
 }

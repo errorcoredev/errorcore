@@ -10,8 +10,8 @@ import {
   timingSafeEqual
 } from 'node:crypto';
 
-import type { EncryptedEnvelope } from '../types';
-import { maybeCompress, maybeDecompress } from './compression';
+import type { AnyEncryptedEnvelope, EncryptedEnvelope } from '../types';
+import { DEFAULT_MAX_PLAINTEXT_BYTES, maybeCompress, maybeDecompress } from './compression';
 
 interface EncryptionOptions {
   previousEncryptionKeys?: string[];
@@ -19,6 +19,11 @@ interface EncryptionOptions {
   macKey?: string | Buffer;
   /** SDK version used in AAD binding and envelope.sdk.version. */
   sdkVersion?: string;
+  /**
+   * Hard cap on decompressed plaintext, enforced DURING inflation.
+   * Defaults to DEFAULT_MAX_PLAINTEXT_BYTES (10 MiB).
+   */
+  maxPlaintextBytes?: number;
 }
 
 interface KeyMaterial {
@@ -38,7 +43,11 @@ interface RuntimeKeyMaterial {
 
 const STATIC_KEY_SALT = Buffer.from('errorcore-v1-key-derivation', 'utf8');
 const MAC_DERIVATION_SALT = Buffer.from('errorcore-v1-mac-key', 'utf8');
-const AAD_VERSION = 1;
+// Envelope AAD format version (ADR-0001). v2 adds kind + blobId binding.
+const AAD_VERSION = 2;
+// Field-level AAD is a separate format that never carried kind/blobId;
+// it stays at 1 so field blobs encrypted by earlier SDKs still decrypt.
+const FIELD_AAD_VERSION = 1;
 const KEY_ID_PREFIX_BYTES = 8;
 const MIN_MAC_KEY_BYTES = 32;
 const TRANSPARENT_MARKER = 'unencrypted';
@@ -134,28 +143,63 @@ function getLegacyKeyMaterial(km: KeyMaterial): RuntimeKeyMaterial {
   return km.legacy;
 }
 
-function buildAad(eventId: string, sdkVersion: string, keyId: string): Buffer {
-  return Buffer.from(`${AAD_VERSION}|${keyId}|${sdkVersion}|${eventId}`, 'utf8');
+/** AAD v2 (ADR-0001): `2|keyId|sdkVersion|eventId|kind|blobId-or-empty`. */
+function buildAad(
+  eventId: string,
+  sdkVersion: string,
+  keyId: string,
+  kind: 'error' | 'payload_blob',
+  blobId: string | undefined
+): Buffer {
+  return Buffer.from(
+    `${AAD_VERSION}|${keyId}|${sdkVersion}|${eventId}|${kind}|${blobId ?? ''}`,
+    'utf8'
+  );
+}
+
+/** Legacy v1 AAD, accepted only when verifying v1 envelopes on local read paths. */
+function buildAadV1(eventId: string, sdkVersion: string, keyId: string): Buffer {
+  return Buffer.from(`1|${keyId}|${sdkVersion}|${eventId}`, 'utf8');
+}
+
+function buildEnvelopeAad(
+  envelope: AnyEncryptedEnvelope,
+  sdkVersion: string,
+  keyId: string
+): Buffer {
+  const version = envelope.sdk?.version ?? sdkVersion;
+  return envelope.v === 2
+    ? buildAad(envelope.eventId, version, keyId, envelope.kind, envelope.blobId)
+    : buildAadV1(envelope.eventId, version, keyId);
 }
 
 function buildFieldAad(sdkVersion: string, keyId: string): Buffer {
-  return Buffer.from(`${AAD_VERSION}|field|${keyId}|${sdkVersion}`, 'utf8');
+  return Buffer.from(`${FIELD_AAD_VERSION}|field|${keyId}|${sdkVersion}`, 'utf8');
+}
+
+function assertKindBlobIdCoherence(
+  kind: 'error' | 'payload_blob',
+  blobId: string | undefined
+): void {
+  if (kind === 'payload_blob' && (blobId === undefined || blobId.length === 0)) {
+    throw new Error('EC_ENVELOPE_BLOB_ID_REQUIRED: kind=payload_blob requires a blobId');
+  }
+  if (kind === 'error' && blobId !== undefined) {
+    throw new Error('EC_ENVELOPE_BLOB_ID_FORBIDDEN: kind=error must not carry a blobId');
+  }
 }
 
 function tryDecryptWithMaterial(
   material: RuntimeKeyMaterial,
-  envelope: EncryptedEnvelope,
+  envelope: AnyEncryptedEnvelope,
   sdkVersion: string,
   iv: Buffer,
   ciphertext: Buffer,
   authTag: Buffer,
-  expectedHmac: Buffer
+  expectedHmac: Buffer,
+  maxPlaintextBytes: number
 ): { ok: true; plaintext: string } | { ok: false; failure: 'hmac' | 'authTag' } {
-  const aad = buildAad(
-    envelope.eventId,
-    envelope.sdk?.version ?? sdkVersion,
-    material.keyId
-  );
+  const aad = buildEnvelopeAad(envelope, sdkVersion, material.keyId);
   const computedHmac = createHmac('sha256', material.macKey)
     .update(iv)
     .update(ciphertext)
@@ -170,22 +214,31 @@ function tryDecryptWithMaterial(
     return { ok: false, failure: 'hmac' };
   }
 
+  let plaintextBuf: Buffer;
   try {
     const decipher = createDecipheriv('aes-256-gcm', material.derivedKey, iv);
     decipher.setAAD(aad);
     decipher.setAuthTag(authTag);
-    const plaintextBuf = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    return {
-      ok: true,
-      plaintext: maybeDecompress(plaintextBuf, envelope.compressed).toString('utf8')
-    };
+    plaintextBuf = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   } catch {
     return { ok: false, failure: 'authTag' };
   }
+
+  // Inflate OUTSIDE the authTag catch: at this point the ciphertext is
+  // authenticated, so a decompression failure (bomb over the cap,
+  // corrupt stream) must surface as its own EC_DECOMPRESSION_* error
+  // rather than masquerading as a key mismatch.
+  return {
+    ok: true,
+    plaintext: maybeDecompress(plaintextBuf, envelope.compressed, maxPlaintextBytes).toString('utf8')
+  };
 }
 
 export interface EnvelopeEncryptOptions {
   eventId: string;
+  kind: 'error' | 'payload_blob';
+  /** Required iff kind === 'payload_blob'; forbidden otherwise. */
+  blobId?: string;
 }
 
 export type EncryptionDecryptResult =
@@ -206,6 +259,8 @@ export class Encryption {
 
   private readonly sdkVersion: string;
 
+  private readonly maxPlaintextBytes: number;
+
   public constructor(encryptionKey: string | Buffer, options?: EncryptionOptions) {
     const primary = deriveKeys(encryptionKey, {
       macKey: options?.macKey
@@ -215,6 +270,7 @@ export class Encryption {
     }));
     this.chain = [primary, ...previous];
     this.sdkVersion = options?.sdkVersion ?? 'unknown';
+    this.maxPlaintextBytes = options?.maxPlaintextBytes ?? DEFAULT_MAX_PLAINTEXT_BYTES;
   }
 
   /** Stable identifier for the primary key. Non-secret; safe to log. */
@@ -231,8 +287,9 @@ export class Encryption {
     plaintext: Buffer,
     opts: EnvelopeEncryptOptions
   ): EncryptedEnvelope {
+    assertKindBlobIdCoherence(opts.kind, opts.blobId);
     const primary = this.chain[0]!;
-    const aad = buildAad(opts.eventId, this.sdkVersion, primary.keyId);
+    const aad = buildAad(opts.eventId, this.sdkVersion, primary.keyId, opts.kind, opts.blobId);
     const { buf: working, compressed } = maybeCompress(plaintext);
 
     const iv = randomBytes(12);
@@ -257,8 +314,10 @@ export class Encryption {
     }
 
     return {
-      v: 1,
+      v: 2,
       eventId: opts.eventId,
+      kind: opts.kind,
+      ...(opts.blobId === undefined ? {} : { blobId: opts.blobId }),
       sdk: { name: 'errorcore', version: this.sdkVersion },
       keyId: primary.keyId,
       iv: iv.toString('base64'),
@@ -334,10 +393,17 @@ export class Encryption {
    * keys whose keyId matches the envelope's keyId. Throws structured
    * errors for the two distinct failure modes (HMAC vs GCM authTag) so
    * callers can diagnose tampering vs key-mismatch.
+   *
+   * Accepts v2 (current emit) and v1 (legacy local spools only; the
+   * ingestion wire contract is v2-only per ADR-0001).
    */
-  public decryptEnvelope(envelope: EncryptedEnvelope): EncryptionDecryptResult {
-    if (envelope.v !== 1) {
-      throw new Error(`EC_DECRYPT_UNKNOWN_VERSION: envelope version ${String(envelope.v)} is not supported`);
+  public decryptEnvelope(envelope: AnyEncryptedEnvelope): EncryptionDecryptResult {
+    const version: unknown = envelope.v;
+    if (version !== 1 && version !== 2) {
+      throw new Error(`EC_DECRYPT_UNKNOWN_VERSION: envelope version ${String(version)} is not supported`);
+    }
+    if (envelope.v === 2) {
+      assertKindBlobIdCoherence(envelope.kind, envelope.blobId);
     }
 
     const iv = Buffer.from(envelope.iv, 'base64');
@@ -365,7 +431,8 @@ export class Encryption {
         iv,
         ciphertext,
         authTag,
-        expectedHmac
+        expectedHmac,
+        this.maxPlaintextBytes
       );
       if (attempt.ok) {
         const keyIndex = this.chain.indexOf(km);
@@ -388,7 +455,8 @@ export class Encryption {
         iv,
         ciphertext,
         authTag,
-        expectedHmac
+        expectedHmac,
+        this.maxPlaintextBytes
       );
       if (attempt.ok) {
         const keyIndex = this.chain.indexOf(km);
@@ -409,7 +477,7 @@ export class Encryption {
   /**
    * Convenience wrapper: throws on any decryption failure.
    */
-  public decrypt(envelope: EncryptedEnvelope): string {
+  public decrypt(envelope: AnyEncryptedEnvelope): string {
     const result = this.decryptEnvelope(envelope);
     if (!result.ok) {
       throw new Error('Unable to decrypt: no key in the chain matched');
@@ -467,11 +535,19 @@ export class Encryption {
  */
 export function buildTransparentEnvelope(
   plaintext: Buffer,
-  opts: { eventId: string; sdkVersion: string }
+  opts: {
+    eventId: string;
+    sdkVersion: string;
+    kind: 'error' | 'payload_blob';
+    blobId?: string;
+  }
 ): EncryptedEnvelope {
+  assertKindBlobIdCoherence(opts.kind, opts.blobId);
   return {
-    v: 1,
+    v: 2,
     eventId: opts.eventId,
+    kind: opts.kind,
+    ...(opts.blobId === undefined ? {} : { blobId: opts.blobId }),
     sdk: { name: 'errorcore', version: opts.sdkVersion },
     keyId: TRANSPARENT_MARKER,
     iv: TRANSPARENT_MARKER,
@@ -483,7 +559,7 @@ export function buildTransparentEnvelope(
   };
 }
 
-export function isTransparentEnvelope(envelope: EncryptedEnvelope): boolean {
+export function isTransparentEnvelope(envelope: AnyEncryptedEnvelope): boolean {
   return envelope.iv === TRANSPARENT_MARKER && envelope.authTag === TRANSPARENT_MARKER;
 }
 

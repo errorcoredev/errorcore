@@ -63,4 +63,10 @@ export interface SDKInstanceInput {
   packageAssemblyDispatcher: PackageAssemblyDispatcher | null;
   packageAssemblyEncryption: PackageAssemblyEncryptionConfig | undefined;
   packageAssemblyWorkerAllowed: boolean;
+  /**
+   * True when a DEK was resolved (config, ERRORCORE_DEK, or callback).
+   * Key material itself never crosses this boundary - SDKInstance.config
+   * is public and must not expose secrets.
+   */
+  encryptionKeyConfigured: boolean;
 }

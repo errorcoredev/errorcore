@@ -22,7 +22,7 @@ The SDK scrubs warning `context` and `cause` before invoking user code. When the
 | Condition | SDK behavior | Warning code | Data loss? |
 |---|---|---|---|
 | Transport slow but eventually succeeds | HTTP transport retries internally; payload delivered on any successful attempt | no warning | No |
-| Transport timeout after retries | Each attempt times out at `timeoutMs`; after 5 total attempts or the 30s retry budget the transport rejects; payload dead-lettered if DLQ configured, else dropped | `EC_TRANSPORT_TIMEOUT` | No if DLQ accepts; else Yes |
+| Transport timeout after retries | Each attempt times out at `timeoutMs`; after 3 total attempts (jittered 200ms/600ms delays) or the 30s retry budget the transport rejects; payload dead-lettered if DLQ configured, else dropped | `EC_TRANSPORT_TIMEOUT` | No if DLQ accepts; else Yes |
 | Transport down or rejects | `transport.send()` rejects; payload dead-lettered if DLQ configured, else dropped | `EC_TRANSPORT_FAILED` | No if DLQ accepts; else Yes |
 | Dead-letter write fails from disk capacity (`ENOSPC`, `EDQUOT`) | Append throws; payload dropped | `EC_DISK_FULL` | Yes |
 | Dead-letter write fails from other errno (`EACCES`, `EISDIR`, etc.) | Append throws; payload dropped | `EC_DLQ_WRITE_FAILED` | Yes |
@@ -31,6 +31,7 @@ The SDK scrubs warning `context` and `cause` before invoking user code. When the
 | Dead-letter path configured without a stable signing secret | SDK disables DLQ persistence because unsigned disk content cannot be replayed safely | `EC_DLQ_DISABLED` | Yes if transport also fails |
 | Final serialized envelope exceeds `hardCapBytes` | Payload is dropped before transport | `EC_PACKAGE_OVER_HARD_CAP` | Yes |
 | Rate limit hit | Capture dropped at entry; drop summary rolls into next successful package completeness | `EC_RATE_LIMITED` | Yes |
+| Duplicate fingerprint within the 10s dedup window | Capture suppressed before the rate limiter, so no token is consumed; counted under `droppedBreakdown.deduplicated`, not `rateLimited` | `EC_DUPLICATE_SUPPRESSED` | No (the first capture of the same error was delivered) |
 | Capture assembly fails | Primary or fallback package assembly fails | `EC_CAPTURE_FAILED` | Yes if fallback also fails |
 | Encryption key invalid | `createSDK()` throws synchronously; SDK does not boot | `EC_ENCRYPTION_KEY_INVALID` as thrown error text, not callback | Yes, SDK unavailable |
 | Next.js dev HMR cleanup fails | The dispose hook catches the cleanup error, leaves host code running, and reports the failure through `onInternalWarning` | `EC_NEXT_HMR_CLEANUP_FAILED` | No immediate payload loss; retained SDK resources may persist until process exit |

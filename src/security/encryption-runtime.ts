@@ -1,9 +1,9 @@
-import type { PackageAssemblyEncryptionConfig, ResolvedConfig } from '../types';
+import type { PackageAssemblyEncryptionConfig, ResolvedSecrets } from '../types';
 import { getSdkVersion } from '../version';
 import { Encryption } from './encryption';
 
 export function createPackageAssemblyEncryptionConfig(
-  config: Pick<ResolvedConfig, 'encryptionKey' | 'macKey' | 'previousEncryptionKeys'>
+  config: Pick<ResolvedSecrets, 'encryptionKey' | 'macKey' | 'previousEncryptionKeys'>
 ): PackageAssemblyEncryptionConfig | undefined {
   if (config.encryptionKey === undefined) {
     return undefined;

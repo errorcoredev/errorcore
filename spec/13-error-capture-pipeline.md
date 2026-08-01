@@ -210,7 +210,7 @@ function serializeError(error: Error, depth: number = 0): ErrorInfo {
 
 1. Assemble all parts into `ErrorPackage` schema
 2. Compute `eventClockRange = { min, max }` over the union of `errorEventSeq` plus all stamped seqs in `ioTimeline`, `stateReads`, `stateWrites` (module 20). Use a loop, not `Math.min(...arr)` — large arrays may stack-overflow.
-3. Set `schemaVersion: '1.1.0'`. `capturedAt` remains a per-package ISO timestamp.
+3. Set `schemaVersion: '1.3.0'` (current emit; receivers accept `'1.1.0' | '1.2.0' | '1.3.0'`). `capturedAt` remains a per-package ISO timestamp.
 4. Surface `parts.completenessOverflow.stateWritesDropped` (if present) into `Completeness.stateWritesDropped` (module 22).
 5. Run PII scrubber on the entire package: `scrubber.scrubObject(package)`
 6. Compute completeness flags based on what data is present/absent

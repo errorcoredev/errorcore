@@ -534,6 +534,36 @@ export class ErrorCapturer {
       debug(
         `capture() called for ${error.name}: ${sanitizeDiagnosticString(this.config, error.message)}`
       );
+      // Defense-in-depth fingerprint dedup. See recentCaptures field doc.
+      // Request-scoped duplicates commonly arrive through both framework
+      // middleware and process-level handlers. Context-less captures use a
+      // coarser background scope so async fatal duplicates do not produce a
+      // second lower-fidelity package during shutdown. Checked BEFORE the
+      // rate limiter so a suppressed duplicate consumes no token and is
+      // counted as deduplicated, not rateLimited.
+      const dedupFingerprint = computeFingerprint(error, []);
+      let dedupKey: string | null = null;
+      if (dedupFingerprint !== undefined && dedupFingerprint !== '') {
+        const dedupScope =
+          context === undefined
+            ? 'background'
+            : `${context.traceId}|${context.requestId}`;
+        dedupKey = `${dedupScope}|${dedupFingerprint}`;
+        const previousNs = this.recentCaptures.get(dedupKey);
+        if (
+          previousNs !== undefined &&
+          errorEventHrtimeNs - previousNs < ErrorCapturer.DEDUP_WINDOW_NS
+        ) {
+          this.healthMetrics?.recordDroppedDeduplicated();
+          debug(`capture() deduplicated by fingerprint within window: ${dedupKey}`);
+          emitSafeWarning(this.config, {
+            code: 'EC_DUPLICATE_SUPPRESSED',
+            message: 'Duplicate capture of the same error fingerprint suppressed within the 10s dedup window.'
+          });
+          return null;
+        }
+      }
+
       if (!this.rateLimiter.tryAcquire()) {
         debug('capture() rate-limited, dropping');
         this.healthMetrics?.recordDroppedRateLimited();
@@ -546,6 +576,19 @@ export class ErrorCapturer {
 
       const rateLimiterDrops = this.rateLimiter.getAndResetDropSummary() ?? undefined;
       this.onAdmittedCapture?.(modeState);
+
+      // Register the dedup anchor only for admitted captures: a capture
+      // the rate limiter dropped never produced a package, so its
+      // duplicates should still surface through the limiter accounting.
+      if (dedupKey !== null) {
+        this.recentCaptures.set(dedupKey, errorEventHrtimeNs);
+        if (this.recentCaptures.size > ErrorCapturer.DEDUP_MAX_ENTRIES) {
+          const oldestKey = this.recentCaptures.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.recentCaptures.delete(oldestKey);
+          }
+        }
+      }
 
       const sourceMapResolver = modeState.resolveSourceMaps ? this.sourceMapResolver : null;
       const serializedError = serializeError(error, sourceMapResolver, this.config);
@@ -603,35 +646,6 @@ export class ErrorCapturer {
       const stateTrackingEnabled =
         stateReads.length > 0 || this.stateTrackerStatus?.isTrackingEnabled() === true;
       const fingerprint = computeFingerprint(error, resolvedLocalVariables ?? []);
-      const dedupFingerprint = computeFingerprint(error, []);
-      // Defense-in-depth fingerprint dedup. See recentCaptures field doc.
-      // Request-scoped duplicates commonly arrive through both framework
-      // middleware and process-level handlers. Context-less captures use a
-      // coarser background scope so async fatal duplicates do not produce a
-      // second lower-fidelity package during shutdown.
-      if (dedupFingerprint !== undefined && dedupFingerprint !== '') {
-        const dedupScope =
-          context === undefined
-            ? 'background'
-            : `${context.traceId}|${context.requestId}`;
-        const dedupKey = `${dedupScope}|${dedupFingerprint}`;
-        const previousNs = this.recentCaptures.get(dedupKey);
-        if (
-          previousNs !== undefined &&
-          errorEventHrtimeNs - previousNs < ErrorCapturer.DEDUP_WINDOW_NS
-        ) {
-          this.healthMetrics?.recordDroppedRateLimited?.();
-          debug(`capture() deduplicated by fingerprint within window: ${dedupKey}`);
-          return null;
-        }
-        this.recentCaptures.set(dedupKey, errorEventHrtimeNs);
-        if (this.recentCaptures.size > ErrorCapturer.DEDUP_MAX_ENTRIES) {
-          const oldestKey = this.recentCaptures.keys().next().value;
-          if (oldestKey !== undefined) {
-            this.recentCaptures.delete(oldestKey);
-          }
-        }
-      }
       const currentTracestate =
         context === undefined
           ? undefined

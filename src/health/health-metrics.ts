@@ -10,6 +10,8 @@
 
 export interface DroppedBreakdown {
   rateLimited: number;
+  /** Duplicate captures suppressed by the fingerprint dedup window. */
+  deduplicated: number;
   captureFailed: number;
   deadLetterWriteFailed: number;
 }
@@ -32,6 +34,8 @@ export class HealthMetrics {
   private captured = 0;
 
   private droppedRateLimited = 0;
+
+  private droppedDeduplicated = 0;
 
   private droppedCaptureFailed = 0;
 
@@ -59,6 +63,10 @@ export class HealthMetrics {
 
   public recordDroppedRateLimited(): void {
     this.droppedRateLimited += 1;
+  }
+
+  public recordDroppedDeduplicated(): void {
+    this.droppedDeduplicated += 1;
   }
 
   public recordDroppedCaptureFailed(): void {
@@ -105,6 +113,7 @@ export class HealthMetrics {
   public getDroppedBreakdown(): DroppedBreakdown {
     return {
       rateLimited: this.droppedRateLimited,
+      deduplicated: this.droppedDeduplicated,
       captureFailed: this.droppedCaptureFailed,
       deadLetterWriteFailed: this.droppedDlqWriteFailed
     };

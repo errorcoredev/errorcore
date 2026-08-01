@@ -127,6 +127,10 @@ export class SDKInstance {
 
   private sourceMapResolver: SourceMapResolver | null;
 
+  // Presence flag only - key material never reaches SDKInstance (the
+  // public `config` surface must not expose secrets).
+  private readonly encryptionKeyConfigured: boolean;
+
   private readonly packageAssemblyController: PackageAssemblyController;
 
   private readonly modeController: CaptureModeController;
@@ -156,6 +160,7 @@ export class SDKInstance {
     this.requestContextCarrier = input.requestContextCarrier;
     this.payloadSpool = input.payloadSpool;
     this.sourceMapResolver = input.sourceMapResolver;
+    this.encryptionKeyConfigured = input.encryptionKeyConfigured;
     this.packageAssemblyController = new PackageAssemblyController({
       config: this.config,
       errorCapturer: this.errorCapturer,
@@ -219,7 +224,7 @@ export class SDKInstance {
       return;
     }
 
-    if (!this.config.encryptionKey && !this.config.allowUnencrypted) {
+    if (!this.encryptionKeyConfigured && !this.config.allowUnencrypted) {
       throw new Error(
         'ErrorCore requires an encryptionKey for encrypted error packages.\n\n' +
         'For local development, add to your config:\n' +
@@ -743,6 +748,7 @@ export class SDKInstance {
       captured: this.healthMetrics.getCaptured(),
       dropped:
         breakdown.rateLimited +
+        breakdown.deduplicated +
         breakdown.captureFailed +
         breakdown.deadLetterWriteFailed,
       droppedBreakdown: breakdown,

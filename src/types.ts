@@ -440,12 +440,17 @@ export interface ErrorPackage {
 }
 
 /**
- * Wire-format envelope for a captured ErrorPackage. The plaintext package
- * is JSON, optionally compressed with zlib deflate, then encrypted with
- * AES-256-GCM. AAD binds eventId, sdk.version, and keyId so a leaked
- * ciphertext cannot be replayed against a different key without authTag
- * failure. An outer HMAC-SHA256 over iv|ciphertext|authTag|AAD detects
- * tampering before any GCM verification touches the ciphertext.
+ * Wire-format envelope (v2) for a captured ErrorPackage or payload blob.
+ * The plaintext package is JSON, optionally compressed with zlib raw
+ * deflate, then encrypted with AES-256-GCM. AAD binds eventId,
+ * sdk.version, keyId, kind, and blobId so a leaked ciphertext cannot be
+ * replayed against a different key, event, or payload kind without
+ * authTag failure. An outer HMAC-SHA256 over iv|ciphertext|authTag|AAD
+ * detects tampering before any GCM verification touches the ciphertext.
+ *
+ * `kind` identifies the inner payload schema; `blobId` is required iff
+ * kind === 'payload_blob' and absent otherwise (ADR-0001). For blob
+ * envelopes, `eventId` is the parent error event's id.
  *
  * `iv` / `authTag` / `hmac` carry the literal string `"unencrypted"` when
  * the SDK is running in transparent-envelope mode (allowUnencrypted: true,
@@ -453,8 +458,11 @@ export interface ErrorPackage {
  * decryption pipeline.
  */
 export interface EncryptedEnvelope {
-  v: 1;
+  v: 2;
   eventId: string;
+  kind: 'error' | 'payload_blob';
+  /** Required iff kind === 'payload_blob'; absent otherwise. */
+  blobId?: string;
   sdk: { name: 'errorcore'; version: string };
   keyId: string;
   iv: string;
@@ -465,6 +473,27 @@ export interface EncryptedEnvelope {
   compressed: boolean;
   producedAt: number;
 }
+
+/**
+ * Legacy v1 envelope (no kind/blobId binding). Never emitted anymore;
+ * accepted ONLY on local read paths (dead-letter drain, ingest reader,
+ * local ndjson viewer) so spools written by pre-0.4 SDKs still verify.
+ */
+export interface EncryptedEnvelopeV1 {
+  v: 1;
+  eventId: string;
+  sdk: { name: 'errorcore'; version: string };
+  keyId: string;
+  iv: string;
+  ciphertext: string;
+  authTag: string;
+  hmac: string;
+  compressed: boolean;
+  producedAt: number;
+}
+
+/** Any envelope version accepted by local decrypt/verify paths. */
+export type AnyEncryptedEnvelope = EncryptedEnvelope | EncryptedEnvelopeV1;
 
 export interface ErrorPackageParts {
   modeAtCapture: CaptureMode;
@@ -547,8 +576,19 @@ export interface TraceContextInput {
 export interface TransportPayload {
   /** Exact bytes/string accepted by the transport for persistence or wire send. */
   serialized: string | Buffer;
-  /** Parsed envelope metadata when the payload is an Errorcore envelope. */
-  envelope?: Pick<EncryptedEnvelope, 'v' | 'eventId' | 'sdk' | 'keyId'>;
+  /**
+   * Parsed envelope metadata when the payload is an Errorcore envelope.
+   * `v: 1` appears only when draining legacy dead-letter spools; those
+   * carry no kind/blobId.
+   */
+  envelope?: {
+    v: 1 | 2;
+    eventId: string;
+    sdk: { name: 'errorcore'; version: string };
+    keyId: string;
+    kind?: 'error' | 'payload_blob';
+    blobId?: string;
+  };
   kind?: 'error' | 'payload_blob';
 }
 
@@ -745,6 +785,7 @@ export interface AdaptiveCaptureHealth {
  */
 export type InternalWarningCode =
   | 'EC_RATE_LIMITED'
+  | 'EC_DUPLICATE_SUPPRESSED'
   | 'EC_CAPTURE_FAILED'
   | 'EC_DLQ_WRITE_FAILED'
   | 'EC_DLQ_FULL'
@@ -991,10 +1032,6 @@ export interface ResolvedConfig {
   headerBlocklist: RegExp[];
   envAllowlist: string[];
   envBlocklist: RegExp[];
-  encryptionKey: string | undefined;
-  macKey: string | undefined;
-  encryptionKeyCallback: EncryptionKeyCallback | undefined;
-  previousEncryptionKeys: string[];
   allowUnencrypted: boolean;
   allowProductionPlaintext: boolean;
   hardCapBytes: number;
@@ -1044,7 +1081,6 @@ export interface ResolvedConfig {
   };
   silent: boolean;
   logLevel: LogLevel;
-  previousTransportAuthorizations: string[];
   deadLetterMaxBytes: number;
   deadLetterMaxBackups: number;
   sourceMapSyncThresholdBytes: number;
@@ -1060,6 +1096,22 @@ export interface ResolvedConfig {
   service: string;
   /** Spec §5 deployment environment label, resolved from config or env. */
   deploymentEnv: string | undefined;
+}
+
+/**
+ * Key material and rotation secrets resolved from user config + env.
+ * Deliberately NOT part of ResolvedConfig: SDKInstance.config is a public
+ * surface (mirrors the PublicTransportConfig pattern for transport
+ * credentials), so secrets live on this runtime-only object held by the
+ * composition root and handed to the components that need them
+ * (encryption setup, worker config assembly, DLQ signing).
+ */
+export interface ResolvedSecrets {
+  encryptionKey: string | undefined;
+  macKey: string | undefined;
+  encryptionKeyCallback: EncryptionKeyCallback | undefined;
+  previousEncryptionKeys: string[];
+  previousTransportAuthorizations: string[];
 }
 
 export type PackageAssemblyWorkerScrubberPolicy = Omit<Policy, 'piiDetectors'> & {

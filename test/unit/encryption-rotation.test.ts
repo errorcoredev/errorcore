@@ -34,7 +34,7 @@ describe('Encryption with key rotation', () => {
 
   it('encrypts with the primary key and decrypts via decryptEnvelope', () => {
     const enc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV], sdkVersion: '0.3.0' });
-    const env = enc.encryptToEnvelope(Buffer.from('hello', 'utf8'), { eventId: 'evt-rot-1' });
+    const env = enc.encryptToEnvelope(Buffer.from('hello', 'utf8'), { eventId: 'evt-rot-1', kind: 'error' });
     const result = enc.decryptEnvelope(env);
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -45,7 +45,7 @@ describe('Encryption with key rotation', () => {
 
   it('decrypts an envelope produced by a previous key', () => {
     const oldEnc = new Encryption(PREV, { sdkVersion: '0.3.0' });
-    const env = oldEnc.encryptToEnvelope(Buffer.from('legacy payload', 'utf8'), { eventId: 'evt-rot-2' });
+    const env = oldEnc.encryptToEnvelope(Buffer.from('legacy payload', 'utf8'), { eventId: 'evt-rot-2', kind: 'error' });
 
     const newEnc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV], sdkVersion: '0.3.0' });
     const result = newEnc.decryptEnvelope(env);
@@ -58,7 +58,7 @@ describe('Encryption with key rotation', () => {
 
   it('decrypts a previous-key envelope when an explicit MAC key is configured', () => {
     const oldEnc = new Encryption(PREV, { macKey: MAC_KEY, sdkVersion: '0.3.0' });
-    const env = oldEnc.encryptToEnvelope(Buffer.from('legacy explicit mac', 'utf8'), { eventId: 'evt-rot-mac' });
+    const env = oldEnc.encryptToEnvelope(Buffer.from('legacy explicit mac', 'utf8'), { eventId: 'evt-rot-mac', kind: 'error' });
 
     const newEnc = new Encryption(PRIMARY, {
       previousEncryptionKeys: [PREV],
@@ -76,7 +76,7 @@ describe('Encryption with key rotation', () => {
 
   it('routes via keyId so a previous-key envelope is decrypted directly', () => {
     const oldEnc = new Encryption(PREV, { sdkVersion: '0.3.0' });
-    const env = oldEnc.encryptToEnvelope(Buffer.from('routed', 'utf8'), { eventId: 'evt-rot-3' });
+    const env = oldEnc.encryptToEnvelope(Buffer.from('routed', 'utf8'), { eventId: 'evt-rot-3', kind: 'error' });
     expect(env.keyId).toMatch(/^[0-9a-f]{16}$/);
 
     const newEnc = new Encryption(PRIMARY, { previousEncryptionKeys: [PREV], sdkVersion: '0.3.0' });

@@ -18,9 +18,9 @@ export function parseEnvelopeMetadata(
 ): TransportPayload['envelope'] | undefined {
   try {
     const text = Buffer.isBuffer(serialized) ? serialized.toString('utf8') : serialized;
-    const parsed = JSON.parse(text) as Partial<EncryptedEnvelope>;
+    const parsed = JSON.parse(text) as Omit<Partial<EncryptedEnvelope>, 'v'> & { v?: unknown };
     if (
-      parsed.v === 1 &&
+      (parsed.v === 1 || parsed.v === 2) &&
       typeof parsed.eventId === 'string' &&
       typeof parsed.keyId === 'string' &&
       typeof parsed.sdk === 'object' &&
@@ -28,11 +28,20 @@ export function parseEnvelopeMetadata(
       parsed.sdk.name === 'errorcore' &&
       typeof parsed.sdk.version === 'string'
     ) {
+      // v1 metadata appears only when draining legacy local spools; it
+      // carries no kind/blobId, so the transport omits those headers.
+      const kind = parsed.kind === 'error' || parsed.kind === 'payload_blob'
+        ? parsed.kind
+        : undefined;
       return {
         v: parsed.v,
         eventId: parsed.eventId,
         sdk: parsed.sdk,
-        keyId: parsed.keyId
+        keyId: parsed.keyId,
+        ...(parsed.v === 2 && kind !== undefined ? { kind } : {}),
+        ...(parsed.v === 2 && typeof parsed.blobId === 'string'
+          ? { blobId: parsed.blobId }
+          : {})
       };
     }
   } catch {

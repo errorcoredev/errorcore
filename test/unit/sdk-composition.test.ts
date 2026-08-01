@@ -1015,7 +1015,8 @@ describe('SDK composition', () => {
       'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
     const enc = new Encryption(encryptionKey);
     const envelope = enc.encryptToEnvelope(Buffer.from('{"ok":true}', 'utf8'), {
-      eventId: 'evt-dlq-replay'
+      eventId: 'evt-dlq-replay',
+      kind: 'error'
     });
     const payload = JSON.stringify(envelope);
     // The SDK reads the dead-letter file with an Encryption-derived HMAC
@@ -1955,6 +1956,7 @@ describe('SDKInstance.getHealth', () => {
       expect(health.dropped).toBe(0);
       expect(health.droppedBreakdown).toEqual({
         rateLimited: 0,
+        deduplicated: 0,
         captureFailed: 0,
         deadLetterWriteFailed: 0
       });
@@ -2016,11 +2018,11 @@ describe('SDKInstance.getHealth', () => {
     }
   });
 
-  it('invariant: dropped === sum of the three droppedBreakdown buckets', async () => {
+  it('invariant: dropped === sum of the four droppedBreakdown buckets', async () => {
     const sdk = makeSDK({ rateLimitPerMinute: 1 });
     sdk.activate();
     try {
-      // One acquires, one is rate-limited.
+      // One acquires, the other distinct errors are rate-limited.
       sdk.captureError(new Error('a'));
       sdk.captureError(new Error('b'));
       sdk.captureError(new Error('c'));
@@ -2029,6 +2031,7 @@ describe('SDKInstance.getHealth', () => {
       const health = sdk.getHealth();
       const sum =
         health.droppedBreakdown.rateLimited +
+        health.droppedBreakdown.deduplicated +
         health.droppedBreakdown.captureFailed +
         health.droppedBreakdown.deadLetterWriteFailed;
 

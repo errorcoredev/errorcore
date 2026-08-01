@@ -1,4 +1,4 @@
-import { getTransportAuthorization, resolveConfig } from './config';
+import { getTransportAuthorization, resolveConfig, resolveSecrets } from './config';
 import { safeConsole, setLogLevel } from './debug-log';
 import { IOEventBuffer } from './buffer/io-event-buffer';
 import { ALSManager } from './context/als-manager';
@@ -39,6 +39,7 @@ import { HealthMetrics } from './health/health-metrics';
 import type {
   ModeState,
   ResolvedConfig,
+  ResolvedSecrets,
   SDKConfig,
   TransportConfig
 } from './types';
@@ -53,7 +54,7 @@ function getWebhookSecret(
 
 function deriveDeadLetterVerifier(
   encryption: Encryption | null,
-  config: ResolvedConfig,
+  secrets: ResolvedSecrets,
   transportAuthorization: string | undefined,
   webhookSecret?: string
 ): IntegrityVerifier | null {
@@ -67,11 +68,11 @@ function deriveDeadLetterVerifier(
     };
   }
 
-  const fallback = config.encryptionKey ?? transportAuthorization ?? webhookSecret;
+  const fallback = secrets.encryptionKey ?? transportAuthorization ?? webhookSecret;
   if (fallback === undefined) return null;
   return createHmacVerifier([
     fallback,
-    ...config.previousTransportAuthorizations
+    ...secrets.previousTransportAuthorizations
   ]);
 }
 
@@ -89,12 +90,12 @@ function normalizeCallbackEncryptionKey(value: string | Buffer): string {
   return value;
 }
 
-function resolveEncryptionKeyCallback(config: ResolvedConfig): ResolvedConfig {
-  if (config.encryptionKey !== undefined || config.encryptionKeyCallback === undefined) {
-    return config;
+function resolveEncryptionKeyCallback(secrets: ResolvedSecrets): ResolvedSecrets {
+  if (secrets.encryptionKey !== undefined || secrets.encryptionKeyCallback === undefined) {
+    return secrets;
   }
 
-  const resolved = config.encryptionKeyCallback();
+  const resolved = secrets.encryptionKeyCallback();
   if (
     typeof resolved === 'object' &&
     resolved !== null &&
@@ -106,7 +107,7 @@ function resolveEncryptionKeyCallback(config: ResolvedConfig): ResolvedConfig {
   }
 
   return {
-    ...config,
+    ...secrets,
     encryptionKey: normalizeCallbackEncryptionKey(resolved as string | Buffer)
   };
 }
@@ -115,7 +116,10 @@ export function createSDKComposition(
   userConfig: Partial<SDKConfig>,
   instantiate: (input: SDKInstanceInput) => SDKInstance
 ): SDKInstance {
-  const config = resolveEncryptionKeyCallback(resolveConfig(userConfig));
+  const config = resolveConfig(userConfig);
+  // Key material stays off the public ResolvedConfig; it lives on this
+  // runtime-only object and is handed directly to the components below.
+  const secrets = resolveEncryptionKeyCallback(resolveSecrets(userConfig));
   setLogLevel(config.logLevel);
   const transportAuthorization = getTransportAuthorization(userConfig.transport);
   const webhookSecret = getWebhookSecret(userConfig.transport);
@@ -135,7 +139,7 @@ export function createSDKComposition(
     maxCaptures: config.rateLimitPerMinute,
     windowMs: config.rateLimitWindowMs
   });
-  const packageAssemblyEncryption = createPackageAssemblyEncryptionConfig(config);
+  const packageAssemblyEncryption = createPackageAssemblyEncryptionConfig(secrets);
   const encryption = createEncryptionFromAssemblyConfig(packageAssemblyEncryption);
   const processMetadata = new ProcessMetadata(config);
   const inspector = new InspectorManager(config, {
@@ -260,7 +264,7 @@ export function createSDKComposition(
   });
   const deadLetterVerifier = deriveDeadLetterVerifier(
     encryption,
-    config,
+    secrets,
     transportAuthorization,
     webhookSecret
   );
@@ -273,7 +277,7 @@ export function createSDKComposition(
             maxSizeBytes: config.deadLetterMaxBytes,
             maxBackups: config.deadLetterMaxBackups,
             maxPayloadBytes: config.serialization.maxTotalPackageSize + 16384,
-            requireEncryptedPayload: config.encryptionKey !== undefined,
+            requireEncryptedPayload: secrets.encryptionKey !== undefined,
             onInternalWarning: config.onInternalWarning === undefined
               ? undefined
               : (warning) => {
@@ -377,7 +381,8 @@ export function createSDKComposition(
     sourceMapResolver,
     packageAssemblyDispatcher,
     packageAssemblyEncryption,
-    packageAssemblyWorkerAllowed: !hasCustomFieldDetectors
+    packageAssemblyWorkerAllowed: !hasCustomFieldDetectors,
+    encryptionKeyConfigured: secrets.encryptionKey !== undefined
   });
   modeProvider = () => instance.getModeState();
   onAdmittedCapture = (modeState) => instance.handleAdmittedCapture(modeState);

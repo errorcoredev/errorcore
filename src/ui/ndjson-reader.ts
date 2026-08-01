@@ -299,9 +299,10 @@ export class NdjsonReader {
         'ciphertext' in parsed &&
         'v' in parsed
       ) {
-        // New EncryptedEnvelope shape (v=1). The decrypt() method walks
-        // the rotation chain via keyId; throws on HMAC/authTag failure.
-        const decrypted = this.encryption.decrypt(parsed as import('../types').EncryptedEnvelope);
+        // EncryptedEnvelope shape (v=2 current, v=1 legacy local files).
+        // The decrypt() method walks the rotation chain via keyId; throws
+        // on HMAC/authTag failure.
+        const decrypted = this.encryption.decrypt(parsed as import('../types').AnyEncryptedEnvelope);
         return this.parseParsed(JSON.parse(decrypted), depth + 1);
       }
 
@@ -309,7 +310,7 @@ export class NdjsonReader {
         this.encryption === null &&
         typeof parsed === 'object' &&
         parsed !== null &&
-        (parsed as { v?: unknown }).v === 1 &&
+        ((parsed as { v?: unknown }).v === 1 || (parsed as { v?: unknown }).v === 2) &&
         (parsed as { iv?: unknown }).iv === 'unencrypted' &&
         typeof (parsed as { ciphertext?: unknown }).ciphertext === 'string'
       ) {

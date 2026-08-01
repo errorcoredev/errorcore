@@ -18,6 +18,7 @@
  *     rejection, or both null until the first failure.
  *
  * Invariant: dropped === droppedBreakdown.rateLimited +
+ *            droppedBreakdown.deduplicated +
  *            droppedBreakdown.captureFailed +
  *            droppedBreakdown.deadLetterWriteFailed.
  */
@@ -28,6 +29,8 @@ export interface HealthSnapshot {
   dropped: number;
   droppedBreakdown: {
     rateLimited: number;
+    /** Duplicate captures suppressed by the 10s fingerprint dedup window. */
+    deduplicated: number;
     captureFailed: number;
     deadLetterWriteFailed: number;
   };

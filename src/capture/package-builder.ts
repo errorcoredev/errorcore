@@ -444,11 +444,13 @@ export function finalizePackageAssemblyResult(input: {
 
   const envelope = encrypted
     ? input.encryption!.encryptToEnvelope(plaintextBuf, {
-        eventId: packageObject.eventId
+        eventId: packageObject.eventId,
+        kind: 'error'
       })
     : buildTransparentEnvelope(plaintextBuf, {
         eventId: packageObject.eventId,
-        sdkVersion
+        sdkVersion,
+        kind: 'error'
       });
 
   return {
@@ -470,11 +472,15 @@ export function finalizePayloadBlobAssemblyResult(input: {
   const encrypted = input.encryption !== null && input.encryption !== undefined;
   const envelope = encrypted
     ? input.encryption!.encryptToEnvelope(plaintextBuf, {
-        eventId: input.envelopeObject.eventId
+        eventId: input.envelopeObject.eventId,
+        kind: 'payload_blob',
+        blobId: input.envelopeObject.blobId
       })
     : buildTransparentEnvelope(plaintextBuf, {
         eventId: input.envelopeObject.eventId,
-        sdkVersion
+        sdkVersion,
+        kind: 'payload_blob',
+        blobId: input.envelopeObject.blobId
       });
 
   return {

@@ -11,6 +11,7 @@ describe('HealthMetrics', () => {
       expect(m.getTransportFailures()).toBe(0);
       expect(m.getDroppedBreakdown()).toEqual({
         rateLimited: 0,
+        deduplicated: 0,
         captureFailed: 0,
         deadLetterWriteFailed: 0
       });
@@ -51,6 +52,7 @@ describe('HealthMetrics', () => {
 
       m.recordDroppedRateLimited();
       m.recordDroppedRateLimited();
+      m.recordDroppedDeduplicated();
       m.recordDroppedCaptureFailed();
       m.recordDroppedDlqWriteFailed();
       m.recordDroppedDlqWriteFailed();
@@ -58,6 +60,7 @@ describe('HealthMetrics', () => {
 
       expect(m.getDroppedBreakdown()).toEqual({
         rateLimited: 2,
+        deduplicated: 1,
         captureFailed: 1,
         deadLetterWriteFailed: 3
       });

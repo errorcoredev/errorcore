@@ -87,13 +87,27 @@ function minimalBlob(eventId = 'evt-error'): PayloadBlobEnvelope {
   };
 }
 
-function encryptedPayload(payload: unknown, key = 'ingest-secret'): string {
-  const eventId =
-    typeof payload === 'object' && payload !== null && 'eventId' in payload
-      ? String((payload as { eventId: unknown }).eventId)
-      : 'evt';
+function encryptedPayload(
+  payload: unknown,
+  key = 'ingest-secret',
+  overrides: { eventId?: string; kind?: 'error' | 'payload_blob'; blobId?: string } = {}
+): string {
+  const record = typeof payload === 'object' && payload !== null
+    ? (payload as Record<string, unknown>)
+    : {};
+  const eventId = overrides.eventId
+    ?? ('eventId' in record ? String(record.eventId) : 'evt');
+  const kind = overrides.kind
+    ?? (record.kind === 'payload_blob' ? 'payload_blob' : 'error');
+  const blobId = kind === 'payload_blob'
+    ? overrides.blobId ?? (typeof record.blobId === 'string' ? record.blobId : 'blob-1')
+    : undefined;
   const envelope = new Encryption(key, { sdkVersion: '0.2.0' })
-    .encryptToEnvelope(Buffer.from(JSON.stringify(payload), 'utf8'), { eventId });
+    .encryptToEnvelope(Buffer.from(JSON.stringify(payload), 'utf8'), {
+      eventId,
+      kind,
+      ...(blobId === undefined ? {} : { blobId })
+    });
   return JSON.stringify(envelope);
 }
 
@@ -153,6 +167,115 @@ describe('ingest receiver', () => {
     });
   });
 
+  it('rejects envelopes whose inner eventId differs from the envelope eventId', () => {
+    // The envelope identity is authenticated (AAD), so a re-wrapped inner
+    // payload with a different eventId must be rejected, not silently
+    // accepted under the envelope's identity.
+    const payload = minimalErrorPackage('evt-inner');
+    const body = encryptedPayload(payload, 'ingest-secret', { eventId: 'evt-outer' });
+
+    expect(() => receiveIngestEnvelope(body, { encryptionKey: 'ingest-secret' }))
+      .toThrow(/EC_ENVELOPE_IDENTITY_MISMATCH/);
+  });
+
+  it('rejects blob envelopes whose inner blobId differs from the envelope blobId', () => {
+    const body = encryptedPayload(minimalBlob(), 'ingest-secret', { blobId: 'blob-9' });
+
+    expect(() => receiveIngestEnvelope(body, { encryptionKey: 'ingest-secret' }))
+      .toThrow(/EC_ENVELOPE_IDENTITY_MISMATCH/);
+  });
+
+  it('rejects envelopes whose kind contradicts the inner payload kind', () => {
+    const body = encryptedPayload(minimalErrorPackage(), 'ingest-secret', {
+      kind: 'payload_blob',
+      blobId: 'blob-1'
+    });
+
+    expect(() => receiveIngestEnvelope(body, { encryptionKey: 'ingest-secret' }))
+      .toThrow(/EC_ENVELOPE_IDENTITY_MISMATCH/);
+  });
+
+  it('rejects v2 envelopes with incoherent kind/blobId shape', () => {
+    const envelope = JSON.parse(encryptedPayload(minimalErrorPackage())) as Record<string, unknown>;
+
+    expect(() => receiveIngestEnvelope(
+      JSON.stringify({ ...envelope, kind: 'payload_blob' }),
+      { encryptionKey: 'ingest-secret' }
+    )).toThrow(/EC_INGEST_INVALID_ENVELOPE/);
+    expect(() => receiveIngestEnvelope(
+      JSON.stringify({ ...envelope, blobId: 'blob-1' }),
+      { encryptionKey: 'ingest-secret' }
+    )).toThrow(/EC_INGEST_INVALID_ENVELOPE/);
+    expect(() => receiveIngestEnvelope(
+      JSON.stringify({ ...envelope, kind: undefined }),
+      { encryptionKey: 'ingest-secret' }
+    )).toThrow(/EC_INGEST_INVALID_ENVELOPE/);
+  });
+
+  it('still accepts legacy v1 envelopes on the local read path', () => {
+    const payload = minimalErrorPackage();
+    // Recreate the exact v1 wire shape (SDK 0.3 format, AAD v1) with the
+    // same crypto primitives so old local spools keep draining.
+    const { createCipheriv, createHash, createHmac: hmac, hkdfSync } =
+      require('node:crypto') as typeof import('node:crypto');
+    const secret = Buffer.from('ingest-secret', 'utf8');
+    const derivedKey = Buffer.from(hkdfSync(
+      'sha256', secret, Buffer.from('errorcore-v1-key-derivation', 'utf8'), Buffer.alloc(0), 32
+    ));
+    const macKey = Buffer.from(hkdfSync(
+      'sha256', secret, Buffer.from('errorcore-v1-mac-key', 'utf8'), Buffer.alloc(0), 32
+    ));
+    const keyId = createHash('sha256').update(derivedKey).digest().slice(0, 8).toString('hex');
+    const aad = Buffer.from(`1|${keyId}|0.2.0|evt-error`, 'utf8');
+    const iv = Buffer.from('00112233445566778899aabb', 'hex');
+    const cipher = createCipheriv('aes-256-gcm', derivedKey, iv);
+    cipher.setAAD(aad);
+    const ciphertext = Buffer.concat([
+      cipher.update(Buffer.from(JSON.stringify(payload), 'utf8')),
+      cipher.final()
+    ]);
+    const authTag = cipher.getAuthTag();
+    const v1 = {
+      v: 1,
+      eventId: 'evt-error',
+      sdk: { name: 'errorcore', version: '0.2.0' },
+      keyId,
+      iv: iv.toString('base64'),
+      ciphertext: ciphertext.toString('base64'),
+      authTag: authTag.toString('base64'),
+      hmac: hmac('sha256', macKey)
+        .update(iv).update(ciphertext).update(authTag).update(aad)
+        .digest('base64'),
+      compressed: false,
+      producedAt: 1
+    };
+
+    const received = receiveIngestEnvelope(JSON.stringify(v1), {
+      encryptionKey: 'ingest-secret'
+    });
+
+    expect(received.kind).toBe('error');
+    expect(received.encrypted).toBe(true);
+  });
+
+  it('bounds decompression during inflation with the default 10 MiB cap', () => {
+    // ~24 MB of repeated JSON inflates far past the default cap while the
+    // wire body stays tiny - the reader must throw during inflation.
+    const bomb = {
+      ...minimalErrorPackage(),
+      error: {
+        type: 'Error',
+        message: 'a'.repeat(24 * 1024 * 1024),
+        stack: 'Error: bomb',
+        properties: {}
+      }
+    };
+
+    expect(() => receiveIngestEnvelope(encryptedPayload(bomb), {
+      encryptionKey: 'ingest-secret'
+    })).toThrow(/EC_INGEST_PLAINTEXT_TOO_LARGE/);
+  });
+
   it('rejects encrypted envelopes when no encryption key is configured', () => {
     expect(() => receiveIngestEnvelope(encryptedPayload(minimalErrorPackage())))
       .toThrow(/EC_INGEST_ENCRYPTION_KEY_MISSING/);
@@ -161,7 +284,7 @@ describe('ingest receiver', () => {
   it('rejects transparent envelopes unless explicitly allowed', () => {
     const envelope = buildTransparentEnvelope(
       Buffer.from(JSON.stringify(minimalErrorPackage()), 'utf8'),
-      { eventId: 'evt-error', sdkVersion: '0.2.0' }
+      { eventId: 'evt-error', sdkVersion: '0.2.0', kind: 'error' }
     );
 
     expect(() => receiveIngestEnvelope(JSON.stringify(envelope)))
@@ -171,7 +294,7 @@ describe('ingest receiver', () => {
   it('accepts transparent envelopes when allowUnencrypted is true', () => {
     const envelope = buildTransparentEnvelope(
       Buffer.from(JSON.stringify(minimalErrorPackage()), 'utf8'),
-      { eventId: 'evt-error', sdkVersion: '0.2.0' }
+      { eventId: 'evt-error', sdkVersion: '0.2.0', kind: 'error' }
     );
     const received = receiveIngestEnvelope(JSON.stringify(envelope), {
       allowUnencrypted: true
@@ -184,7 +307,7 @@ describe('ingest receiver', () => {
   it('rejects transparent envelopes with inconsistent markers', () => {
     const envelope = buildTransparentEnvelope(
       Buffer.from(JSON.stringify(minimalErrorPackage()), 'utf8'),
-      { eventId: 'evt-error', sdkVersion: '0.2.0' }
+      { eventId: 'evt-error', sdkVersion: '0.2.0', kind: 'error' }
     );
 
     expect(() => receiveIngestEnvelope(JSON.stringify({ ...envelope, hmac: 'tampered' }), {

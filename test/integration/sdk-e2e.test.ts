@@ -926,7 +926,8 @@ const pkgJson = require('./package.json');
           {
             kind: 'error',
             payload: {
-              v: 1,
+              v: 2,
+              kind: 'error',
               sdk: { name: 'errorcore' }
             }
           }

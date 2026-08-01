@@ -117,12 +117,18 @@ If `worker_threads` is unavailable or worker creation fails:
 
 ### HTTP transport
 
-- Default: require HTTPS. Reject HTTP URLs unless `config.allowInsecureTransport: true`.
-- Include `Authorization` header with user-configured API key.
-- Content-Type: `application/json`
-- Retry: 3 attempts with exponential backoff (1s, 2s, 4s).
-- After 3 failures: drop payload, increment failure counter.
-- Timeout: 10 seconds per request (via `setTimeout` + `req.destroy()`).
+- Default: require HTTPS. Reject HTTP URLs unless `config.allowPlainHttpTransport: true`.
+- Include `Authorization` header with user-configured API key, plus the routing
+  headers `X-Errorcore-Key-Id`, `X-Errorcore-Event-Id`, and
+  `X-Errorcore-Payload-Kind` mirroring the envelope's `keyId`/`eventId`/`kind`
+  (they MUST match the envelope fields — ADR-0001).
+- Content-Type: `application/errorcore+json`
+- Retry: 3 attempts total with jittered delays (~200ms, ~600ms), honoring
+  `Retry-After`, under a 30s total retry budget per payload.
+- After the final failed attempt: reject to the caller (dead-letter if
+  configured), increment failure counter.
+- Timeout: `timeoutMs` per request, default 5 seconds (via `setTimeout` +
+  `req.destroy()`).
 
 ### File transport
 
@@ -151,8 +157,8 @@ If `worker_threads` is unavailable or worker creation fails:
 
 - Worker thread creation fails: fall back to main-thread dispatch
 - Worker thread dies unexpectedly: detect via `worker.on('exit')`, recreate or fall back
-- HTTP endpoint unreachable: retry 3 times, then drop payload
-- HTTP endpoint returns non-2xx: treat as failure, retry
+- HTTP endpoint unreachable: up to 3 attempts total, then reject (dead-letter if configured)
+- HTTP endpoint returns retryable non-2xx (408/429/5xx): treat as failure, retry; permanent 4xx rejects immediately
 - File write fails (disk full, permissions): log warning, drop payload
 - `shutdown()` timeout: forcefully terminate worker
 - `sendSync()` called during exit: must be synchronous (no async operations)

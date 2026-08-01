@@ -181,10 +181,11 @@ function isEncryptedPayloadFormat(payload: string): boolean {
   try {
     const parsed = JSON.parse(payload) as Record<string, unknown>;
 
-    // v=1 EncryptedEnvelope shape (Phase 1 hard cutover). No support for
-    // pre-0.3 payloads - those are documented as needing manual upgrade.
+    // v=2 EncryptedEnvelope shape (current emit) plus v=1 so dead-letter
+    // spools written by pre-0.4 SDKs still drain. No support for pre-0.3
+    // payloads - those are documented as needing manual upgrade.
     return (
-      parsed.v === 1 &&
+      (parsed.v === 1 || parsed.v === 2) &&
       typeof parsed.eventId === 'string' &&
       typeof parsed.iv === 'string' &&
       typeof parsed.ciphertext === 'string' &&

@@ -5,6 +5,96 @@ All notable changes to this project are documented here. The format is based on
 Semantic Versioning from 1.0.0 onward; before then, breaking changes may ship in
 any minor release and are called out under a **Breaking** heading.
 
+## Unreleased - 0.4.0
+
+### Changed
+
+- **Breaking (wire format): the encrypted envelope is now `v: 2`.** Envelopes
+  carry two new fields — `kind: 'error' | 'payload_blob'` and `blobId`
+  (required iff `kind === 'payload_blob'`, absent otherwise) — and both are
+  authenticated: AAD is now
+  `2|keyId|sdkVersion|eventId|kind|blobId-or-empty-string`. The outer HMAC
+  input is unchanged (`iv‖ciphertext‖authTag‖AAD`); the AAD change carries the
+  new binding. Previously the payload kind travelled only in the mutable
+  `X-Errorcore-Payload-Kind` header and blob envelopes carried an
+  unauthenticated `blobId`. Collectors must be upgraded to the envelope-v2
+  verifier before SDKs are upgraded (see ADR-0001 in the ingestion repo).
+- **Breaking (local spools): v1 envelopes are no longer emitted, only read.**
+  `v: 1` acceptance survives on local read paths only — dead-letter drain, the
+  `errorcore/ingest` reader, and the local ndjson viewer — so spools written by
+  0.3.x still verify and drain. A v1 envelope POSTed to an envelope-v2
+  collector will be rejected; dev spools that never drain will be dropped after
+  their retry budget expires.
+- **Breaking (types): key material is no longer on the public resolved
+  config.** `encryptionKey`, `macKey`, `encryptionKeyCallback`,
+  `previousEncryptionKeys`, and `previousTransportAuthorizations` were removed
+  from `ResolvedConfig`, mirroring the existing `PublicTransportConfig`
+  narrowing for transport credentials. `instance.config.encryptionKey` is now
+  both a type error and `undefined` at runtime. The values are resolved and
+  validated by the new exported `resolveSecrets()` into a runtime-only
+  `ResolvedSecrets` object held by the composition root and handed directly to
+  the components that need it (encryption setup, worker config assembly, DLQ
+  signing). Validation behavior and error messages are unchanged.
+- **Duplicate suppression is no longer counted as rate limiting.** The
+  fingerprint dedup check now runs *before* rate-limiter token acquisition, so
+  a suppressed duplicate consumes no token — previously a duplicate burned a
+  token and could starve a later distinct error out of its capture budget.
+  Duplicates increment the new `droppedBreakdown.deduplicated` bucket instead
+  of `droppedBreakdown.rateLimited`, and emit an `EC_DUPLICATE_SUPPRESSED`
+  internal warning (previously silent). The dedup anchor is only registered for
+  admitted captures.
+- `getHealth()`'s `dropped` invariant is now the four-bucket sum:
+  `rateLimited + deduplicated + captureFailed + deadLetterWriteFailed`.
+  Consumers that destructure `droppedBreakdown` exhaustively must add the new
+  field.
+- Documentation corrections: HTTP transport retry is 3 attempts with jittered
+  ~200ms/~600ms delays under a 30s budget (`OPERATIONS.md`,
+  `BACKPRESSURE.md`, `spec/14-transport.md` previously claimed 5 attempts or
+  1s/2s/4s exponential backoff); the transport content type is
+  `application/errorcore+json`, not `application/json`; emitted
+  `schemaVersion` is `1.3.0` (`spec/01`, `spec/13`, `DB.md` previously said
+  `1.1.0`).
+
+### Security
+
+- **Bounded decompression.** `maybeDecompress` now passes zlib's
+  `maxOutputLength`, so an over-cap payload throws *during* inflation instead
+  of allocating unbounded output. The limit threads from the ingest reader
+  through `Encryption` to the inflate call; breaching it raises
+  `EC_DECOMPRESSION_LIMIT_EXCEEDED` (surfaced as `EC_INGEST_PLAINTEXT_TOO_LARGE`
+  / HTTP 413 by the reader) and other inflate failures raise
+  `EC_DECOMPRESSION_FAILED`. Default cap is 10 MiB.
+- **Plaintext limiting is mandatory.** `maxPlaintextBytes` on
+  `receiveIngestEnvelope` now defaults to 10 MiB instead of being optional and
+  unbounded when omitted.
+- **Envelope identity is enforced after decrypt.** The ingest reader rejects a
+  payload whose decrypted inner `eventId` differs from the authenticated
+  envelope `eventId`, whose inner kind contradicts the envelope `kind`, or (for
+  blobs) whose inner `blobId` differs from the envelope `blobId`, with
+  `EC_ENVELOPE_IDENTITY_MISMATCH` (HTTP 422). Previously the inner ids were
+  never compared to the envelope.
+- Envelope `kind`/`blobId` coherence is validated on both encrypt and decrypt
+  (`EC_ENVELOPE_BLOB_ID_REQUIRED` / `EC_ENVELOPE_BLOB_ID_FORBIDDEN`), and the
+  HTTP transport derives `X-Errorcore-Payload-Kind` from the envelope rather
+  than a caller-supplied hint so the header can never disagree with the
+  authenticated field.
+
+### Added
+
+- `resolveSecrets(userConfig)` (exported from `src/config`) and the
+  `ResolvedSecrets` type: the runtime-only home for DEK/MAC/rotation material.
+- `HealthMetrics.recordDroppedDeduplicated()` and
+  `HealthSnapshot.droppedBreakdown.deduplicated`.
+- `EC_DUPLICATE_SUPPRESSED` internal warning code.
+- `DEFAULT_MAX_PLAINTEXT_BYTES` (10 MiB) exported from
+  `src/security/compression`, and a `maxPlaintextBytes` option on
+  `Encryption`.
+- `EncryptedEnvelopeV1` and `AnyEncryptedEnvelope` types for the legacy
+  read-only path.
+
+See `docs/spec-amendments.md` entries 4 and 5 for the rationale behind the
+envelope-v2 and dedup-metric deviations from the locked specs.
+
 ## 0.3.0 - 2026-07-10
 
 ### Changed

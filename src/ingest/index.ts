@@ -1,7 +1,8 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import { Encryption, TRANSPARENT_MARKER, isTransparentEnvelope } from '../security/encryption';
-import type { EncryptedEnvelope, ErrorPackage, PayloadBlobEnvelope } from '../types';
+import { DEFAULT_MAX_PLAINTEXT_BYTES } from '../security/compression';
+import type { AnyEncryptedEnvelope, ErrorPackage, PayloadBlobEnvelope } from '../types';
 
 export type IngestHeaders =
   | Record<string, string | string[] | undefined>
@@ -34,6 +35,11 @@ export interface IngestEnvelopeOptions {
   macKey?: string | Buffer;
   previousEncryptionKeys?: string[];
   allowUnencrypted?: boolean;
+  /**
+   * Hard cap on decrypted/inflated plaintext. Defaults to 10 MiB and is
+   * always enforced - for compressed envelopes DURING inflation, so a
+   * deflate bomb throws before allocating unbounded output.
+   */
   maxPlaintextBytes?: number;
 }
 
@@ -52,7 +58,7 @@ export type IngestedPayload =
       kind: 'error';
       payload: ErrorPackage;
       rawPayload: string;
-      envelope: EncryptedEnvelope;
+      envelope: AnyEncryptedEnvelope;
       encrypted: boolean;
       keyIndex?: number;
     }
@@ -60,7 +66,7 @@ export type IngestedPayload =
       kind: 'payload_blob';
       payload: PayloadBlobEnvelope;
       rawPayload: string;
-      envelope: EncryptedEnvelope;
+      envelope: AnyEncryptedEnvelope;
       encrypted: boolean;
       keyIndex?: number;
     }
@@ -74,7 +80,7 @@ export type IngestedPayload =
       kind: 'unknown';
       payload: unknown;
       rawPayload: string;
-      envelope?: EncryptedEnvelope;
+      envelope?: AnyEncryptedEnvelope;
       encrypted: boolean;
       keyIndex?: number;
     };
@@ -139,14 +145,16 @@ function requiredString(record: Record<string, unknown>, field: string): string 
   return value;
 }
 
-function parseEnvelope(input: unknown): EncryptedEnvelope {
+function parseEnvelope(input: unknown): AnyEncryptedEnvelope {
   if (!isRecord(input)) {
     throw new IngestError('EC_INGEST_INVALID_ENVELOPE', 'Errorcore envelope must be a JSON object');
   }
 
   const sdk = input.sdk;
   if (
-    input.v !== 1 ||
+    // v2 is the wire contract (ADR-0001); v1 is accepted only so local
+    // spools written by pre-0.4 SDKs still drain through this reader.
+    (input.v !== 1 && input.v !== 2) ||
     !isRecord(sdk) ||
     sdk.name !== 'errorcore' ||
     typeof sdk.version !== 'string' ||
@@ -156,10 +164,9 @@ function parseEnvelope(input: unknown): EncryptedEnvelope {
     throw new IngestError('EC_INGEST_INVALID_ENVELOPE', 'Errorcore envelope shape is invalid');
   }
 
-  return {
-    v: 1,
+  const base = {
     eventId: requiredString(input, 'eventId'),
-    sdk: { name: 'errorcore', version: sdk.version },
+    sdk: { name: 'errorcore', version: sdk.version } as const,
     keyId: requiredString(input, 'keyId'),
     iv: requiredString(input, 'iv'),
     ciphertext: requiredString(input, 'ciphertext'),
@@ -167,6 +174,37 @@ function parseEnvelope(input: unknown): EncryptedEnvelope {
     hmac: requiredString(input, 'hmac'),
     compressed: input.compressed,
     producedAt: input.producedAt
+  };
+
+  if (input.v === 1) {
+    return { v: 1, ...base };
+  }
+
+  if (input.kind !== 'error' && input.kind !== 'payload_blob') {
+    throw new IngestError(
+      'EC_INGEST_INVALID_ENVELOPE',
+      "Errorcore v2 envelope kind must be 'error' or 'payload_blob'"
+    );
+  }
+  if (input.kind === 'payload_blob') {
+    if (typeof input.blobId !== 'string' || input.blobId.length === 0) {
+      throw new IngestError(
+        'EC_INGEST_INVALID_ENVELOPE',
+        'Errorcore v2 payload_blob envelope requires a blobId'
+      );
+    }
+  } else if (input.blobId !== undefined) {
+    throw new IngestError(
+      'EC_INGEST_INVALID_ENVELOPE',
+      'Errorcore v2 error envelope must not carry a blobId'
+    );
+  }
+
+  return {
+    v: 2,
+    kind: input.kind,
+    ...(input.kind === 'payload_blob' ? { blobId: input.blobId as string } : {}),
+    ...base
   };
 }
 
@@ -221,9 +259,9 @@ function parseInnerPayload(rawPayload: string): unknown {
   }
 }
 
-function enforcePlaintextLimit(rawPayload: string, maxPlaintextBytes: number | undefined): void {
+function resolvePlaintextLimit(maxPlaintextBytes: number | undefined): number {
   if (maxPlaintextBytes === undefined) {
-    return;
+    return DEFAULT_MAX_PLAINTEXT_BYTES;
   }
   if (!Number.isFinite(maxPlaintextBytes) || maxPlaintextBytes <= 0) {
     throw new IngestError(
@@ -231,7 +269,10 @@ function enforcePlaintextLimit(rawPayload: string, maxPlaintextBytes: number | u
       'maxPlaintextBytes must be a positive number'
     );
   }
+  return maxPlaintextBytes;
+}
 
+function enforcePlaintextLimit(rawPayload: string, maxPlaintextBytes: number): void {
   const size = Buffer.byteLength(rawPayload, 'utf8');
   if (size > maxPlaintextBytes) {
     throw new IngestError(
@@ -242,10 +283,59 @@ function enforcePlaintextLimit(rawPayload: string, maxPlaintextBytes: number | u
   }
 }
 
+/**
+ * Post-decrypt identity checks (ADR-0001): the authenticated envelope
+ * metadata and the decrypted inner payload must agree on eventId, kind,
+ * and (for blobs) blobId. A mismatch means the sender re-wrapped a
+ * payload under a different identity; quarantine, never silently accept.
+ */
+function enforceEnvelopeIdentity(
+  kind: IngestedPayload['kind'],
+  payload: unknown,
+  envelope: AnyEncryptedEnvelope
+): void {
+  if (kind !== 'error' && kind !== 'payload_blob') {
+    return;
+  }
+
+  const record = isRecord(payload) ? payload : {};
+  if (typeof record.eventId !== 'string' || record.eventId !== envelope.eventId) {
+    throw new IngestError(
+      'EC_ENVELOPE_IDENTITY_MISMATCH',
+      'Inner payload eventId does not match the envelope eventId',
+      422
+    );
+  }
+
+  if (envelope.v !== 2) {
+    // Legacy v1 envelopes carry no kind/blobId to compare.
+    return;
+  }
+
+  if (envelope.kind !== kind) {
+    throw new IngestError(
+      'EC_ENVELOPE_IDENTITY_MISMATCH',
+      `Envelope kind ${envelope.kind} does not match inner payload kind ${kind}`,
+      422
+    );
+  }
+
+  if (
+    kind === 'payload_blob' &&
+    (typeof record.blobId !== 'string' || record.blobId !== envelope.blobId)
+  ) {
+    throw new IngestError(
+      'EC_ENVELOPE_IDENTITY_MISMATCH',
+      'Inner payload blobId does not match the envelope blobId',
+      422
+    );
+  }
+}
+
 function buildIngestedPayload(input: {
   payload: unknown;
   rawPayload: string;
-  envelope?: EncryptedEnvelope;
+  envelope?: AnyEncryptedEnvelope;
   encrypted: boolean;
   keyIndex?: number;
 }): IngestedPayload {
@@ -306,6 +396,7 @@ export function receiveIngestEnvelope(
     });
   }
 
+  const maxPlaintextBytes = resolvePlaintextLimit(options.maxPlaintextBytes);
   const envelope = parseEnvelope(parsed);
   let rawPayload: string;
   let keyIndex: number | undefined;
@@ -338,13 +429,23 @@ export function receiveIngestEnvelope(
     const encryption = new Encryption(options.encryptionKey, {
       macKey: options.macKey,
       previousEncryptionKeys: options.previousEncryptionKeys,
-      sdkVersion: envelope.sdk.version
+      sdkVersion: envelope.sdk.version,
+      // Enforced DURING inflation - a compression bomb throws before
+      // any oversized plaintext buffer is allocated.
+      maxPlaintextBytes
     });
     let decrypted: ReturnType<Encryption['decryptEnvelope']>;
     try {
       decrypted = encryption.decryptEnvelope(envelope);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      if (reason.includes('EC_DECOMPRESSION_LIMIT_EXCEEDED')) {
+        throw new IngestError(
+          'EC_INGEST_PLAINTEXT_TOO_LARGE',
+          `Decoded Errorcore envelope plaintext exceeds ${maxPlaintextBytes} bytes`,
+          413
+        );
+      }
       throw new IngestError(
         'EC_INGEST_DECRYPT_FAILED',
         `Unable to decrypt Errorcore envelope: ${reason}`,
@@ -358,9 +459,11 @@ export function receiveIngestEnvelope(
     keyIndex = decrypted.keyIndex;
   }
 
-  enforcePlaintextLimit(rawPayload, options.maxPlaintextBytes);
+  enforcePlaintextLimit(rawPayload, maxPlaintextBytes);
+  const innerPayload = parseInnerPayload(rawPayload);
+  enforceEnvelopeIdentity(classifyPayload(innerPayload), innerPayload, envelope);
   return buildIngestedPayload({
-    payload: parseInnerPayload(rawPayload),
+    payload: innerPayload,
     rawPayload,
     envelope,
     encrypted,

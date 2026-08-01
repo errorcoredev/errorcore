@@ -169,10 +169,10 @@ Don't pre-tune these from synthetic load. Watch the counters under real traffic 
 
 - Sends a POST request to the configured `url`.
 - Sends exactly one serialized Errorcore envelope per POST body, without a trailing newline.
-- Sets `Content-Type: application/errorcore+json`, optional `Authorization`, `X-Errorcore-Key-Id`, and `X-Errorcore-Event-Id`.
+- Sets `Content-Type: application/errorcore+json`, optional `Authorization`, `X-Errorcore-Key-Id`, `X-Errorcore-Event-Id`, and `X-Errorcore-Payload-Kind`.
 - Timeout: `timeoutMs` (default 5000ms).
 - Retry logic:
-  - Up to 5 attempts total.
+  - Up to 3 attempts total, with jittered delays of roughly 200ms then 600ms between attempts.
   - Honors `Retry-After` for retryable responses in both seconds and HTTP-date forms.
   - Gives each payload a total retry budget of 30 seconds.
   - Retryable: network timeouts, 408, 429, 500, 502, 503, 504, and temporary DNS/network failures.
@@ -229,6 +229,7 @@ The snapshot fields:
 | `captured` | `number` | Cumulative count of errors successfully assembled into a package (counter). |
 | `dropped` | `number` | Cumulative count of errors that will never reach a collector (counter). Sum of the breakdown below. |
 | `droppedBreakdown.rateLimited` | `number` | Errors dropped because the rate limit was already exceeded. |
+| `droppedBreakdown.deduplicated` | `number` | Duplicate captures of the same error fingerprint suppressed within the 10s dedup window. Checked before the rate limiter, so these consume no rate-limit token. |
 | `droppedBreakdown.captureFailed` | `number` | Errors that could not be captured (Inspector timeout, fallback failure). |
 | `droppedBreakdown.deadLetterWriteFailed` | `number` | Errors that failed transport AND failed the dead-letter write (true loss). |
 | `transportFailures` | `number` | Cumulative count of transport send failures (counter). |

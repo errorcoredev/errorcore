@@ -26,6 +26,7 @@ import {
 import { PackageAssemblyDispatcher } from '../../src/capture/package-assembly-dispatcher';
 import { ProcessMetadata } from '../../src/capture/process-metadata';
 import { ErrorCapturer } from '../../src/capture/error-capturer';
+import { HealthMetrics } from '../../src/health/health-metrics';
 import { DeadLetterStore } from '../../src/transport/dead-letter-store';
 import { TransportDispatcher } from '../../src/transport/transport';
 import type {
@@ -1103,7 +1104,7 @@ describe('PackageBuilder', () => {
     expect(result.packageObject.request?.id).toBe('req-dispatch');
     expect(result.packageObject.schemaVersion).toBe('1.3.0');
     const envelope = JSON.parse(result.payload);
-    expect(envelope.v).toBe(1);
+    expect(envelope.v).toBe(2);
     expect(typeof envelope.eventId).toBe('string');
 
     await dispatcher.shutdown();
@@ -1516,7 +1517,7 @@ describe('ErrorCapturer', () => {
 
     const sentPayload = (transport.send.mock.calls[0]?.[0] as { serialized: string }).serialized;
     const envelope = JSON.parse(sentPayload) as import('../../src/types').EncryptedEnvelope;
-    expect(envelope.v).toBe(1);
+    expect(envelope.v).toBe(2);
     expect(typeof envelope.eventId).toBe('string');
     expect(envelope.keyId).toMatch(/^[0-9a-f]{16}$/);
     const decrypted = encryption.decrypt(envelope);
@@ -2473,7 +2474,7 @@ describe('ErrorCapturer', () => {
       transport: { type: 'stdout' }
     });
     const store = new DeadLetterStore(deadLetterPath, {
-      integrityKey: config.encryptionKey as string,
+      integrityKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
       maxPayloadBytes: config.serialization.maxTotalPackageSize + 16384,
       requireEncryptedPayload: true
     });
@@ -2492,7 +2493,7 @@ describe('ErrorCapturer', () => {
           throw new Error('collector offline');
         })
       },
-      encryption: new Encryption(config.encryptionKey as string),
+      encryption: new Encryption('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'),
       bodyCapture: noopBodyCapture,
       config,
       deadLetterStore: store
@@ -2531,7 +2532,7 @@ describe('ErrorCapturer', () => {
       transport: { type: 'file', path: transportPath }
     });
     const store = new DeadLetterStore(deadLetterPath, {
-      integrityKey: config.encryptionKey as string,
+      integrityKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
       maxPayloadBytes: config.serialization.maxTotalPackageSize + 16384,
       requireEncryptedPayload: true
     });
@@ -2543,7 +2544,7 @@ describe('ErrorCapturer', () => {
       await withMissingWorkerThreads(async () => {
         const transport = new TransportDispatcher({
           config,
-          encryption: new Encryption(config.encryptionKey as string)
+          encryption: new Encryption('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')
         });
         const capturer = new ErrorCapturer({
           buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
@@ -2557,7 +2558,7 @@ describe('ErrorCapturer', () => {
           processMetadata,
           packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
           transport,
-          encryption: new Encryption(config.encryptionKey as string),
+          encryption: new Encryption('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'),
           bodyCapture: noopBodyCapture,
           config,
           deadLetterStore: store
@@ -2805,7 +2806,7 @@ describe('ErrorCapturer', () => {
       transport: { type: 'stdout' }
     });
     const store = new DeadLetterStore(deadLetterPath, {
-      integrityKey: config.encryptionKey as string,
+      integrityKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
       maxPayloadBytes: config.serialization.maxTotalPackageSize + 16384,
       requireEncryptedPayload: true
     });
@@ -3202,5 +3203,123 @@ describe('G3 — sourceMapResolution telemetry in completeness', () => {
 
     requestTracker.shutdown();
     processMetadata.shutdown();
+  });
+});
+
+describe('ErrorCapturer duplicate suppression', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeDedupHarness(options: {
+    maxCaptures?: number;
+    onInternalWarning?: (warning: import('../../src/types').InternalWarning) => void;
+  } = {}) {
+    const config = resolveConfig({
+      captureMode: 'balanced',
+      captureLocalVariables: false,
+      ...(options.onInternalWarning === undefined
+        ? {}
+        : { onInternalWarning: options.onInternalWarning })
+    });
+    const als = new ALSManager();
+    const requestTracker = new RequestTracker({ maxConcurrent: 10, ttlMs: 60_000 });
+    const processMetadata = new ProcessMetadata(config);
+    const rateLimiter = new RateLimiter({
+      maxCaptures: options.maxCaptures ?? 5,
+      windowMs: 60_000
+    });
+    const healthMetrics = new HealthMetrics();
+    const transport = { send: vi.fn() };
+    const capturer = new ErrorCapturer({
+      buffer: makeBuffer({ capacity: 10, maxBytes: 100000 }),
+      als,
+      inspector: {
+        getLocals: vi.fn(() => null),
+        getLocalsWithDiagnostics: vi.fn(() => ({ frames: null, missReason: null }))
+      } as never,
+      rateLimiter,
+      requestTracker,
+      processMetadata,
+      packageBuilder: new PackageBuilder({ scrubber: new Scrubber(config), config }),
+      transport,
+      encryption: null,
+      bodyCapture: noopBodyCapture,
+      config,
+      healthMetrics
+    });
+
+    return { capturer, healthMetrics, rateLimiter, transport, requestTracker, processMetadata };
+  }
+
+  it('suppresses a duplicate within the 10s window as deduplicated, not rateLimited', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const warnings: string[] = [];
+    const harness = makeDedupHarness({
+      onInternalWarning: (warning) => warnings.push(warning.code)
+    });
+
+    const error = new Error('duplicate boom');
+    expect(harness.capturer.capture(error)).not.toBeNull();
+    expect(harness.capturer.capture(error)).toBeNull();
+
+    const breakdown = harness.healthMetrics.getDroppedBreakdown();
+    expect(breakdown.deduplicated).toBe(1);
+    expect(breakdown.rateLimited).toBe(0);
+    expect(harness.healthMetrics.getCaptured()).toBe(1);
+    expect(warnings).toContain('EC_DUPLICATE_SUPPRESSED');
+    expect(warnings).not.toContain('EC_RATE_LIMITED');
+    expect(warnSpy).toHaveBeenCalled();
+
+    harness.requestTracker.shutdown();
+    harness.processMetadata.shutdown();
+  });
+
+  it('suppressed duplicates consume no limiter token; a distinct error still captures', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Capacity 2: the admitted original takes token 1; if the duplicate
+    // burned token 2 (the old bug) the distinct capture below would be
+    // rate-limited instead of captured.
+    const harness = makeDedupHarness({ maxCaptures: 2 });
+
+    const error = new Error('duplicate boom');
+    expect(harness.capturer.capture(error)).not.toBeNull();
+    expect(harness.capturer.capture(error)).toBeNull();
+
+    const distinct = new Error('a different failure');
+    expect(harness.capturer.capture(distinct)).not.toBeNull();
+
+    const breakdown = harness.healthMetrics.getDroppedBreakdown();
+    expect(breakdown.deduplicated).toBe(1);
+    expect(breakdown.rateLimited).toBe(0);
+    expect(harness.rateLimiter.getDroppedCount()).toBe(0);
+    expect(harness.healthMetrics.getCaptured()).toBe(2);
+
+    harness.requestTracker.shutdown();
+    harness.processMetadata.shutdown();
+  });
+
+  it('captures the same fingerprint again after the 10s window has elapsed', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const harness = makeDedupHarness();
+    const error = new Error('window boom');
+
+    let nowNs = 1_000n;
+    const hrtimeSpy = vi
+      .spyOn(process.hrtime, 'bigint')
+      .mockImplementation(() => nowNs);
+
+    expect(harness.capturer.capture(error)).not.toBeNull();
+    nowNs += 5_000_000_000n; // +5s, inside the window
+    expect(harness.capturer.capture(error)).toBeNull();
+    nowNs += 6_000_000_000n; // +11s from the admitted capture
+    expect(harness.capturer.capture(error)).not.toBeNull();
+
+    expect(harness.healthMetrics.getDroppedBreakdown().deduplicated).toBe(1);
+    expect(harness.healthMetrics.getCaptured()).toBe(2);
+
+    hrtimeSpy.mockRestore();
+    harness.requestTracker.shutdown();
+    harness.processMetadata.shutdown();
   });
 });

@@ -73,6 +73,7 @@ export interface HealthSnapshot {
   dropped: number;
   droppedBreakdown: {
     rateLimited: number;
+    deduplicated: number;    // duplicates suppressed by the 10s fingerprint dedup window
     captureFailed: number;
     deadLetterWriteFailed: number;
   };
@@ -98,14 +99,15 @@ export interface HealthSnapshot {
 
 ### `HealthMetrics` (internal)
 
-Plain class with five integer counters, a 512-slot number array for the latency ring, a ring write index, and two optional last-failure fields.
+Plain class with integer counters (one per breakdown bucket plus captured/transportFailures/spool counters), a 512-slot number array for the latency ring, a ring write index, and two optional last-failure fields.
 
 ---
 
 ## Semantics
 
 - **Monotonicity**: counters never reset for the lifetime of the SDK instance. Operators compute rates by differencing two scraped snapshots.
-- **`dropped` invariant**: `dropped === droppedBreakdown.rateLimited + droppedBreakdown.captureFailed + droppedBreakdown.deadLetterWriteFailed`. Enforced by the aggregation in `SDKInstance.getHealth()`, not by maintaining a separate `dropped` counter.
+- **`dropped` invariant**: `dropped === droppedBreakdown.rateLimited + droppedBreakdown.deduplicated + droppedBreakdown.captureFailed + droppedBreakdown.deadLetterWriteFailed`. Enforced by the aggregation in `SDKInstance.getHealth()`, not by maintaining a separate `dropped` counter.
+- **`deduplicated` vs `rateLimited`**: a duplicate capture suppressed by the 10s fingerprint dedup window is counted as `deduplicated` and consumes no rate-limiter token. The dedup check runs BEFORE token acquisition, so duplicates never inflate `rateLimited`.
 - **"Dead-lettered" is not "dropped"**: a transport failure that was successfully written to the dead-letter store is pending retry, not lost. It increments `transportFailures` and `deadLetterDepth`, not `dropped`.
 - **`captured`**: every payload that entered the transport pipeline (post-rate-limit, post-serialization). An error that later fails transport is still "captured" — the capture succeeded; only the send failed.
 - **`transportFailures`**: counts `transport.send()` rejections (after any HTTP retry). A rejection increments this counter regardless of whether the payload was dead-lettered or dropped, so this is independent of `dropped`.
@@ -152,7 +154,8 @@ Integration tests (`test/unit/sdk-composition.test.ts`):
 - Rate-limit overflow drives `droppedBreakdown.rateLimited` without advancing `captured`.
 - A failing transport with no DLQ yields `transportFailures === N`, `dropped === N`, `droppedBreakdown.deadLetterWriteFailed === N`.
 - A failing transport with a DLQ yields `transportFailures === N`, `deadLetterDepth === N`, `dropped === 0`.
-- Invariant: `dropped === rateLimited + captureFailed + deadLetterWriteFailed` after every scenario.
+- Duplicate suppression drives `droppedBreakdown.deduplicated` without advancing `captured`, `rateLimited`, or the limiter's token count.
+- Invariant: `dropped === rateLimited + deduplicated + captureFailed + deadLetterWriteFailed` after every scenario.
 - Monotonicity: two consecutive reads with no captures between return identical counter values.
 - Module-level `getHealth()` returns `null` before `init()` and a snapshot after.
 

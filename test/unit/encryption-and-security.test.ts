@@ -12,8 +12,8 @@ const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const STATIC_KEY_SALT = Buffer.from('errorcore-v1-key-derivation', 'utf8');
 const MAC_DERIVATION_SALT = Buffer.from('errorcore-v1-mac-key', 'utf8');
 
-function makeEnv(eventId = 'evt-test'): { eventId: string } {
-  return { eventId };
+function makeEnv(eventId = 'evt-test'): { eventId: string; kind: 'error' } {
+  return { eventId, kind: 'error' };
 }
 
 function buf(s: string): Buffer {
@@ -138,8 +138,10 @@ describe('Encryption', () => {
     const env = new Encryption('top-secret-key', { sdkVersion: '0.3.0' })
       .encryptToEnvelope(buf('payload'), makeEnv('evt-x'));
 
-    expect(env.v).toBe(1);
+    expect(env.v).toBe(2);
     expect(env.eventId).toBe('evt-x');
+    expect(env.kind).toBe('error');
+    expect(env.blobId).toBeUndefined();
     expect(env.sdk).toEqual({ name: 'errorcore', version: '0.3.0' });
     expect(env.keyId).toMatch(/^[0-9a-f]{16}$/);
     expect(env.iv).toMatch(BASE64_REGEX);
@@ -276,8 +278,125 @@ describe('Encryption', () => {
     const encryption = new Encryption('top-secret-key', { sdkVersion: '0.3.0' });
     const env = encryption.encryptToEnvelope(buf('hi'), makeEnv());
 
-    expect(() => encryption.decrypt({ ...env, v: 2 as 1 }))
+    expect(() => encryption.decrypt({ ...env, v: 3 as 2 }))
       .toThrow(/EC_DECRYPT_UNKNOWN_VERSION/);
+  });
+
+  it('round-trips a payload_blob envelope with the blobId bound in the AAD', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.4.0' });
+    const env = encryption.encryptToEnvelope(buf('{"kind":"payload_blob"}'), {
+      eventId: 'evt-parent',
+      kind: 'payload_blob',
+      blobId: 'blob_7'
+    });
+
+    expect(env.v).toBe(2);
+    expect(env.kind).toBe('payload_blob');
+    expect(env.blobId).toBe('blob_7');
+    expect(encryption.decrypt(env)).toBe('{"kind":"payload_blob"}');
+  });
+
+  it('binds AAD v2: flipping kind fails verification', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.4.0' });
+    const env = encryption.encryptToEnvelope(buf('{"kind":"payload_blob"}'), {
+      eventId: 'evt-parent',
+      kind: 'payload_blob',
+      blobId: 'blob_7'
+    });
+
+    expect(() =>
+      encryption.decrypt({ ...env, kind: 'error', blobId: undefined })
+    ).toThrow(/EC_DECRYPT_HMAC_MISMATCH/);
+  });
+
+  it('binds AAD v2: flipping blobId fails verification', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.4.0' });
+    const env = encryption.encryptToEnvelope(buf('{"kind":"payload_blob"}'), {
+      eventId: 'evt-parent',
+      kind: 'payload_blob',
+      blobId: 'blob_7'
+    });
+
+    expect(() =>
+      encryption.decrypt({ ...env, blobId: 'blob_8' })
+    ).toThrow(/EC_DECRYPT_HMAC_MISMATCH/);
+  });
+
+  it('enforces kind/blobId coherence on encrypt and decrypt', () => {
+    const encryption = new Encryption('top-secret-key', { sdkVersion: '0.4.0' });
+
+    expect(() =>
+      encryption.encryptToEnvelope(buf('x'), { eventId: 'e', kind: 'payload_blob' })
+    ).toThrow(/EC_ENVELOPE_BLOB_ID_REQUIRED/);
+    expect(() =>
+      encryption.encryptToEnvelope(buf('x'), { eventId: 'e', kind: 'error', blobId: 'blob_1' })
+    ).toThrow(/EC_ENVELOPE_BLOB_ID_FORBIDDEN/);
+
+    const env = encryption.encryptToEnvelope(buf('x'), makeEnv());
+    expect(() =>
+      encryption.decrypt({ ...env, blobId: 'blob_1' })
+    ).toThrow(/EC_ENVELOPE_BLOB_ID_FORBIDDEN/);
+  });
+
+  it('still decrypts v1 envelopes on the local read path', () => {
+    const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const { createCipheriv, createHash, createHmac, hkdfSync } =
+      require('node:crypto') as typeof import('node:crypto');
+
+    const derivedKey = Buffer.from(hkdfSync(
+      'sha256',
+      Buffer.from(hexKey, 'hex'),
+      STATIC_KEY_SALT,
+      Buffer.alloc(0),
+      32
+    ));
+    const macKey = Buffer.from(hkdfSync(
+      'sha256',
+      Buffer.from(hexKey, 'hex'),
+      MAC_DERIVATION_SALT,
+      Buffer.alloc(0),
+      32
+    ));
+    const keyId = createHash('sha256').update(derivedKey).digest().slice(0, 8).toString('hex');
+    const aad = Buffer.from(`1|${keyId}|0.3.0|evt-v1`, 'utf8');
+    const iv = Buffer.from('00112233445566778899aabb', 'hex');
+    const cipher = createCipheriv('aes-256-gcm', derivedKey, iv);
+    cipher.setAAD(aad);
+    const ciphertext = Buffer.concat([cipher.update(buf('v1 spool line')), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const hmac = createHmac('sha256', macKey)
+      .update(iv).update(ciphertext).update(authTag).update(aad)
+      .digest('base64');
+
+    const encryption = new Encryption(hexKey, { sdkVersion: '0.3.0' });
+    expect(encryption.decrypt({
+      v: 1,
+      eventId: 'evt-v1',
+      sdk: { name: 'errorcore', version: '0.3.0' },
+      keyId,
+      iv: iv.toString('base64'),
+      ciphertext: ciphertext.toString('base64'),
+      authTag: authTag.toString('base64'),
+      hmac,
+      compressed: false,
+      producedAt: 1
+    })).toBe('v1 spool line');
+  });
+
+  it('bounds decompression during inflation and throws a structured code on a bomb', () => {
+    const encryption = new Encryption('top-secret-key', {
+      sdkVersion: '0.4.0',
+      maxPlaintextBytes: 64 * 1024
+    });
+    // Highly-redundant 4 MB plaintext deflates to a few KB - a classic
+    // high-ratio bomb relative to the 64 KB cap.
+    const env = encryption.encryptToEnvelope(
+      Buffer.alloc(4 * 1024 * 1024, 0x61),
+      makeEnv('evt-bomb')
+    );
+    expect(env.compressed).toBe(true);
+
+    expect(() => encryption.decrypt(env)).toThrow(/EC_DECOMPRESSION_LIMIT_EXCEEDED/);
   });
 });
 
