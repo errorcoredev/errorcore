@@ -6,6 +6,8 @@ errorcore is an error tracking tool for Node. When your code breaks in productio
 
 *Stack traces tell you where. errorcore tells you why.*
 
+**Source Available / Publicly Auditable SDK.** The public source is governed by the exact [PolyForm Strict License 1.0.0](LICENSE.md) and is not represented as open source. Rights beyond that license require separate authorization from Errorcore under an applicable agreement. Errorcore Cloud and its backend are proprietary services outside the SDK license. See [commercial licensing](COMMERCIAL-LICENSE.md) and the [licensing history](LICENSING_HISTORY.md).
+
 ## 5-Minute Quickstart
 
 ```bash
@@ -176,9 +178,11 @@ Without middleware, safe still captures locals, error, stack, and process
 context; pass explicit request data to `captureError(error, { request })` for
 request identity.
 
-## Pricing
+## Licensing
 
-Free for hobbyists and small projects under the open-core license. Enterprise tier details live in [TEAMS.md](TEAMS.md).
+The Errorcore SDK is Source Available / Publicly Auditable and is not represented as open source. [PolyForm Strict License 1.0.0](LICENSE.md) governs the public SDK source. Separate authorization is required for any rights beyond that license; [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) provides contact information but does not itself grant rights.
+
+Errorcore Cloud and its backend are proprietary services outside the SDK license. Service access does not change the license governing the SDK. Team and service context lives in [TEAMS.md](TEAMS.md).
 
 ## Links
 
@@ -190,3 +194,4 @@ Free for hobbyists and small projects under the open-core license. Enterprise ti
 - [Next.js setup](SETUP.md#nextjs-app-router)
 - [Repository](https://github.com/errorcoredev/errorcore)
 - [Support](https://github.com/errorcoredev/errorcore/issues)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)

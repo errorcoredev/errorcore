@@ -3,6 +3,12 @@
 This document covers local development. For the SDK's user-facing API,
 see [README.md](README.md) and [SETUP.md](SETUP.md).
 
+## Contribution rights and authorization
+
+By submitting a contribution, you represent that you own the contribution or have sufficient authorization from every applicable rights holder and employer to submit it for inclusion in this project. You also represent that the contribution does not knowingly include confidential information, trade secrets, or third-party material that you are not permitted to provide, and that any third-party material is identified with its source and license.
+
+Submitting a patch does not change the license of the existing Errorcore code. Do not add a new license header, dependency, copied implementation, generated asset, or externally sourced design without recording its provenance and applicable terms in the pull request.
+
 ## Build and test
 
 ```bash

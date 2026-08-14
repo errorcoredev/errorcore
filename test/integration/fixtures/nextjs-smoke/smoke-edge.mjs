@@ -1,4 +1,4 @@
-// Copyright 2026 ErrorCore Dev — PolyForm Small Business 1.0.0 — see LICENSE.md
+// Copyright 2026 ErrorCore Dev — see LICENSE.md
 //
 // Smoke test: `errorcore/nextjs` resolves to the Edge stub (dist/integrations/
 // nextjs/edge.mjs) when Node is invoked with --conditions=edge-light. All

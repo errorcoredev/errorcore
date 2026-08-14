@@ -9,6 +9,10 @@ any minor release and are called out under a **Breaking** heading.
 
 ### Changed
 
+- **Licensing:** `0.4.0` is the first version prepared under the unmodified
+  PolyForm Strict License 1.0.0. The last repository version under PolyForm
+  Small Business 1.0.0 was `0.3.0`; the last npm-published version under that
+  license was `0.2.1`. Earlier artifacts and Git history are unchanged.
 - **Breaking (wire format): the encrypted envelope is now `v: 2`.** Envelopes
   carry two new fields — `kind: 'error' | 'payload_blob'` and `blobId`
   (required iff `kind === 'payload_blob'`, absent otherwise) — and both are

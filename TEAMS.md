@@ -4,9 +4,13 @@ The README is intentionally focused on the fast solo-developer path. This page c
 
 ## Licensing
 
-errorcore is free for hobbyists and qualifying small projects under the PolyForm Small Business 1.0.0 license. See [LICENSE.md](LICENSE.md) for the exact terms. Organizations outside those limits should use a commercial license.
+The errorcore SDK is Source Available / Publicly Auditable and is not represented as open source. The public SDK source is governed by the exact [PolyForm Strict License 1.0.0](LICENSE.md). Rights beyond that license require separate authorization from Errorcore under an applicable agreement; the informational [commercial licensing notice](COMMERCIAL-LICENSE.md) does not itself grant rights.
+
+Errorcore Cloud and its backend are proprietary services outside the SDK license. Access to those services does not change the SDK license.
 
 ## Team Features
+
+The following describes Errorcore Cloud/backend service capabilities, not rights under the SDK license:
 
 - Shared rollout guidance for Node, Express, Fastify, and Next.js services
 - Webhook transport and local event-store patterns for self-managed deployments
@@ -14,14 +18,6 @@ errorcore is free for hobbyists and qualifying small projects under the PolyForm
 - Dashboard workflows for local triage and production event inspection
 - Support for security reviews, compliance reviews, audit needs, and procurement workflows
 
-## Tiers
-
-| Tier | Fit | Includes |
-|---|---|---|
-| Hobby / Open Core | Personal projects and qualifying small businesses | Self-managed SDK, local dashboard, webhook transport, community support |
-| Team | Small teams adopting errorcore across several services | Rollout help, operational runbooks, priority issue triage |
-| Enterprise | Larger organizations with formal operating requirements | SSO planning, SLA terms, compliance and audit support, procurement support, custom security review |
-
 ## Support
 
-For bugs, usage questions, and feature requests, use [GitHub Issues](https://github.com/errorcoredev/errorcore/issues). For commercial or enterprise requests, open an issue with the `commercial` or `enterprise` label and include the public contact route your organization prefers.
+For bugs, usage questions, and feature requests, use [GitHub Issues](https://github.com/errorcoredev/errorcore/issues). For commercial licensing inquiries, contact [hv@errorcore.dev](mailto:hv@errorcore.dev).

@@ -1,4 +1,4 @@
-// Copyright 2026 ErrorCore Dev - PolyForm Small Business 1.0.0 - see LICENSE.md
+// Copyright 2026 ErrorCore Dev - see LICENSE.md
 /**
  * @module 17-nextjs-integration
  * @spec spec/17-nextjs-integration.md §7 (C1 middleware wrapper)

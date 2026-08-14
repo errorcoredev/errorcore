@@ -8,6 +8,10 @@ vitest.config.ts
 docs/
 !README.md
 !LICENSE.md
+!COMMERCIAL-LICENSE.md
+!COPYRIGHT.md
+!LICENSING_HISTORY.md
+!THIRD_PARTY_NOTICES.md
 
 # Tests, specs, and fixtures
 test/

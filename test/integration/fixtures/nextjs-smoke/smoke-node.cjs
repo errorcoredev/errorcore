@@ -1,4 +1,4 @@
-// Copyright 2026 ErrorCore Dev — PolyForm Small Business 1.0.0 — see LICENSE.md
+// Copyright 2026 ErrorCore Dev — see LICENSE.md
 //
 // Smoke test: the Node entry of errorcore/nextjs resolves and exposes the
 // expected public API. Run from this directory: `node smoke-node.cjs`.
