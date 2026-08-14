@@ -11,7 +11,7 @@ process.chdir(here);
 const nextBin = path.join(here, 'node_modules', 'next', 'dist', 'bin', 'next');
 const capturePath = path.resolve(here, process.env.ERRORCORE_SMOKE_FILE || './smoke-errors.ndjson');
 const host = '127.0.0.1';
-const runId = `nextjs-smoke-${Date.now()}-${crypto.randomUUID()}`;
+const runId = `nextjs-smoke-${crypto.randomUUID()}`;
 
 fs.mkdirSync(path.dirname(capturePath), { recursive: true });
 fs.rmSync(capturePath, { force: true });
@@ -103,7 +103,7 @@ function decodeCaptureLine(line) {
   if (
     parsed !== null &&
     typeof parsed === 'object' &&
-    parsed.v === 1 &&
+    (parsed.v === 1 || parsed.v === 2) &&
     typeof parsed.ciphertext === 'string'
   ) {
     const decoded = Buffer.from(parsed.ciphertext, 'base64').toString('utf8');

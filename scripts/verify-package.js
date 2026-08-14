@@ -52,6 +52,10 @@ function sha256(contents) {
   return crypto.createHash('sha256').update(contents).digest('hex');
 }
 
+function normalizeLineEndings(contents) {
+  return contents.replace(/\r\n?/g, '\n');
+}
+
 function readUtf8(relativePath) {
   return fs.readFileSync(path.join(root, relativePath), 'utf8');
 }
@@ -108,7 +112,7 @@ function verifyLicensingSources() {
     'utf8'
   ).trim();
   const shippedNotices = readUtf8('THIRD_PARTY_NOTICES.md');
-  if (!shippedNotices.includes(upstreamNotice)) {
+  if (!normalizeLineEndings(shippedNotices).includes(normalizeLineEndings(upstreamNotice))) {
     fail('THIRD_PARTY_NOTICES.md must include the source-map-js@1.2.1 notice unchanged');
   }
 
