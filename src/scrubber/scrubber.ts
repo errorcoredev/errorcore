@@ -1,6 +1,13 @@
 import type { Encryption } from '../security/encryption';
 import { computeMeta, encodeNormal } from './encoder';
-import type { Field, FieldSpool, FieldWarning, Policy, Source } from './types';
+import type {
+  Field,
+  FieldMetadataOnlyReason,
+  FieldSpool,
+  FieldWarning,
+  Policy,
+  Source
+} from './types';
 
 interface ScrubberDeps {
   encryption?: Encryption | null;
@@ -33,8 +40,9 @@ export class Scrubber {
     const meta = computeMeta(value, this.policy.maxKeys);
 
     try {
-      if (this.isSensitive(name, value)) {
-        return { mode: 'meta', meta };
+      const sensitiveReason = this.sensitiveReason(name, value);
+      if (sensitiveReason !== null) {
+        return { schemaVersion: 2, mode: 'meta', meta, reason: sensitiveReason };
       }
 
       if (this.encryption === null) {
@@ -43,7 +51,7 @@ export class Scrubber {
           message: 'Field encryption skipped because no encryption key is configured.',
           context: { name, source }
         });
-        return { mode: 'meta', meta };
+        return { schemaVersion: 2, mode: 'meta', meta, reason: 'encryption_key_missing' };
       }
 
       return encodeNormal({
@@ -62,7 +70,7 @@ export class Scrubber {
         cause: error,
         context: { name, source }
       });
-      return { mode: 'meta', meta };
+      return { schemaVersion: 2, mode: 'meta', meta, reason: 'encode_failed' };
     }
   }
 
@@ -78,8 +86,9 @@ export class Scrubber {
     };
 
     try {
-      if (this.isSensitive(name, value)) {
-        return { mode: 'meta', meta };
+      const sensitiveReason = this.sensitiveReason(name, value);
+      if (sensitiveReason !== null) {
+        return { schemaVersion: 2, mode: 'meta', meta, reason: sensitiveReason };
       }
 
       if (this.encryption === null) {
@@ -88,10 +97,11 @@ export class Scrubber {
           message: 'Field spool ref skipped because no encryption key is configured.',
           context: { name, source, refId: ref.id }
         });
-        return { mode: 'meta', meta };
+        return { schemaVersion: 2, mode: 'meta', meta, reason: 'encryption_key_missing' };
       }
 
       return {
+        schemaVersion: 2,
         mode: 'encrypted',
         meta,
         cipher: {
@@ -107,19 +117,19 @@ export class Scrubber {
         cause: error,
         context: { name, source, refId: ref.id }
       });
-      return { mode: 'meta', meta };
+      return { schemaVersion: 2, mode: 'meta', meta, reason: 'spool_failed' };
     }
   }
 
-  private isSensitive(name: string, value: unknown): boolean {
+  private sensitiveReason(name: string, value: unknown): FieldMetadataOnlyReason | null {
     try {
       if (matches(this.policy.credentialNames, name)) {
-        return true;
+        return 'credential_name';
       }
 
       for (const detector of this.policy.piiDetectors) {
         if (detector(value)) {
-          return true;
+          return 'pii_detector';
         }
       }
     } catch (error) {
@@ -129,10 +139,10 @@ export class Scrubber {
         cause: error,
         context: { name }
       });
-      return true;
+      return 'sensitivity_check_failed';
     }
 
-    return false;
+    return null;
   }
 
   private emitWarning(warning: FieldWarning): void {

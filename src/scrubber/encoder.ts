@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import type { Encryption } from '../security/encryption';
-import type { Blob, Field, FieldSpool, Meta, Policy, Source } from './types';
+import type { CanonicalBlob, Field, FieldSpool, Meta, Policy, Source } from './types';
 
 const REF_NONCE_BYTES = 12;
 
@@ -58,12 +58,13 @@ export function computeMeta(value: unknown, maxKeys: number): Meta {
   return meta;
 }
 
-function toInlineBlob(encryption: Encryption, plaintext: Buffer): Blob {
+function toInlineBlob(encryption: Encryption, plaintext: Buffer): CanonicalBlob {
   const encrypted = encryption.encryptField(plaintext);
   return {
     type: 'inline',
-    bytes: encrypted.bytes,
-    nonce: encrypted.nonce
+    encoding: 'base64',
+    ciphertext: Buffer.from(encrypted.bytes).toString('base64'),
+    nonce: Buffer.from(encrypted.nonce).toString('base64')
   };
 }
 
@@ -73,7 +74,7 @@ function toRefBlob(input: {
   plaintext: Buffer;
   name: string;
   source: Source;
-}): Blob {
+}): CanonicalBlob {
   const encrypted = input.encryption.encryptField(input.plaintext);
   const packed = Buffer.concat([
     Buffer.from(encrypted.nonce),
@@ -105,10 +106,11 @@ export function encodeNormal(input: {
 
   if (input.source === 'http_incoming' && plaintext.length > input.policy.spoolBytes) {
     if (input.spool === undefined) {
-      return { mode: 'meta', meta: input.meta };
+      return { schemaVersion: 2, mode: 'meta', meta: input.meta, reason: 'spool_unavailable' };
     }
 
     return {
+      schemaVersion: 2,
       mode: 'encrypted',
       meta: input.meta,
       cipher: toRefBlob({
@@ -122,10 +124,11 @@ export function encodeNormal(input: {
   }
 
   if (plaintext.length > input.policy.maxField) {
-    return { mode: 'meta', meta: input.meta };
+    return { schemaVersion: 2, mode: 'meta', meta: input.meta, reason: 'max_field_bytes' };
   }
 
   return {
+    schemaVersion: 2,
     mode: 'encrypted',
     meta: input.meta,
     cipher: toInlineBlob(input.encryption, plaintext)
@@ -141,6 +144,12 @@ export function decryptFieldValue(
   }
 
   if (field.cipher.type === 'inline') {
+    if ('ciphertext' in field.cipher) {
+      return input.encryption.decryptField(
+        decodeCanonicalBase64(field.cipher.ciphertext, 'ciphertext'),
+        decodeCanonicalBase64(field.cipher.nonce, 'nonce')
+      );
+    }
     return input.encryption.decryptField(field.cipher.bytes, field.cipher.nonce);
   }
 
@@ -157,6 +166,17 @@ export function decryptFieldValue(
     packed.subarray(REF_NONCE_BYTES),
     packed.subarray(0, REF_NONCE_BYTES)
   );
+}
+
+function decodeCanonicalBase64(value: string, fieldName: string): Buffer {
+  if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    throw new Error(`Field ${fieldName} is not canonical base64`);
+  }
+  const decoded = Buffer.from(value, 'base64');
+  if (decoded.toString('base64') !== value) {
+    throw new Error(`Field ${fieldName} is not canonical base64`);
+  }
+  return decoded;
 }
 
 export function sha256Hex(bytes: Buffer): string {

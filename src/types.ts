@@ -121,6 +121,7 @@ export interface RequestContext {
   headers: Record<string, string>;
   body: string | Buffer | null;
   bodyTruncated: boolean;
+  framework?: FrameworkOperation;
   ioEvents: IOEventSlot[];
   stateReads: StateRead[];
   stateWrites: StateWrite[];
@@ -177,12 +178,87 @@ export interface StateWriteSerialized {
   value: unknown;
 }
 
+export type CapturedValueStatus =
+  | 'captured'
+  | 'optimized_out'
+  | 'redacted'
+  | 'truncated'
+  | 'metadata_only'
+  | 'unavailable';
+
+export type CapturedValueSource = 'v8_inspector' | 'supplemental_instrumentation';
+
+export interface CapturedValue {
+  value?: unknown;
+  status: CapturedValueStatus;
+  captureSource: CapturedValueSource;
+  inspectorSeq?: number;
+  inspectorHrtimeNs?: string;
+  origin: 'scope' | 'argument' | 'this' | 'supplemental_local';
+  correlationQuality?: 'tag_exact' | 'identity_exact' | 'degraded' | 'unmatched';
+  causeOrigin?: { kind: 'error' | 'cause'; depth: number };
+  reason?: string;
+}
+
+export interface CapturedArgument extends CapturedValue {
+  index: number;
+  name: string | null;
+  nameStatus: 'matched_local_binding' | 'unavailable';
+}
+
+export interface CapturedScope {
+  type: 'local' | 'closure' | 'catch' | 'block';
+  name?: string;
+  bindings: Array<{ name: string; captured: CapturedValue }>;
+  truncated: boolean;
+  omittedBindings: number;
+  unavailableReason?: string;
+}
+
 export interface CapturedFrame {
+  /** Stable within one capture and independent of callback completion order. */
+  frameId?: string;
+  callFrameIndex?: number;
+  captureSource?: CapturedValueSource;
   functionName: string;
   filePath: string;
   lineNumber: number;
   columnNumber: number;
+  rawLocation?: StackBoundaryFrame;
+  sourceMapOutcome?: 'disabled' | 'mapped' | 'unmapped';
+  sourceContext?:
+    | { status: 'captured'; lines: string[]; startLine: number; contentHash: string }
+    | { status: 'artifact_ref'; artifactId: string; contentHash: string }
+    | { status: 'unavailable'; reason: string };
+  inspectorSeq?: number;
+  inspectorHrtimeNs?: string;
+  correlationQuality?: 'tag_exact' | 'identity_exact' | 'degraded' | 'unmatched';
+  causeOrigin?: { kind: 'error' | 'cause'; depth: number };
+  scopes?: CapturedScope[];
+  arguments?: CapturedArgument[];
+  argumentsUnavailableReason?: string;
+  thisValue?: CapturedValue;
+  thisUnavailableReason?: string;
+  capturePolicy?: {
+    maxFrames: number;
+    maxBindingsPerScope: number;
+    cacheCapacity: number;
+    cacheTtlMs: number;
+  };
   locals: Record<string, unknown>;
+}
+
+export interface FrameworkOperation {
+  framework: string;
+  routeTemplate?: string;
+  controller?: string;
+  handler?: string;
+  operation?: string;
+  instrumentation: {
+    name: string;
+    version?: string;
+    lifecyclePhase: 'request_start' | 'handler' | 'error' | 'response' | 'unknown';
+  };
 }
 
 export interface AmbientEventContext {
@@ -246,6 +322,12 @@ export interface Completeness {
   localVariablesCaptureLayer?: 'tag' | 'identity';
   localVariablesDegradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'dropped_request' | 'background';
   localVariablesFrameAlignment?: 'full' | 'prefix_only';
+  localVariablesUnavailableReason?: string;
+  localVariablesCache?: {
+    operation: 'consumed' | 'miss' | 'disabled' | 'unavailable';
+    capacity: number;
+    ttlMs: number;
+  };
   sourceMapResolution?: {
     framesResolved: number;
     framesUnresolved: number;
@@ -259,6 +341,8 @@ export interface Completeness {
 
 export interface ErrorInfo {
   type: string;
+  /** Runtime error.name, preserved separately from constructor-derived type. */
+  name?: string;
   message: string;
   stack: string;
   rawStack?: string;
@@ -274,6 +358,31 @@ export interface ErrorPackageRequestContextData {
   headers: Record<string, string>;
   body: string | Buffer | null;
   bodyTruncated: boolean;
+  framework?: FrameworkOperation;
+}
+
+export interface FieldTransformationManifest {
+  schemaVersion: 1;
+  total: number;
+  encrypted: number;
+  metadataOnly: number;
+  redacted: number;
+  truncated: number;
+  byReason: Record<string, number>;
+}
+
+export interface PayloadManifestEntry {
+  blobId: string;
+  state: 'expected' | 'preview_only';
+  originalSize: number;
+  capturedSize: number;
+}
+
+export interface PayloadManifest {
+  schemaVersion: 1;
+  expectedBlobIds: string[];
+  entries: PayloadManifestEntry[];
+  setCompleteAtSdk: boolean;
 }
 
 export interface IOEventSerialized {
@@ -367,7 +476,7 @@ export interface ProcessMetadata {
 }
 
 export interface ErrorPackage {
-  schemaVersion: '1.1.0' | '1.2.0' | '1.3.0';
+  schemaVersion: '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0';
   /** Stable, per-event identifier minted at capture time (UUIDv4 today). */
   eventId: string;
   /**
@@ -386,6 +495,7 @@ export interface ErrorPackage {
   timeAnchor: TimeAnchor;
   error: {
     type: string;
+    name?: string;
     message: string;
     stack: string;
     rawStack?: string;
@@ -393,6 +503,8 @@ export interface ErrorPackage {
     properties: Record<string, unknown>;
   };
   localVariables?: CapturedFrame[];
+  fieldManifest?: FieldTransformationManifest;
+  payloadManifest?: PayloadManifest;
   request?: {
     id: string;
     method: string;
@@ -400,7 +512,8 @@ export interface ErrorPackage {
     headers: Record<string, unknown>;
     body?: unknown;
     bodyTruncated?: boolean;
-    receivedAt: string;
+      receivedAt: string;
+      framework?: FrameworkOperation;
   };
   ioTimeline: IOEventSerialized[];
   evictionLog: EvictionRecordSerialized[];
@@ -501,6 +614,7 @@ export interface ErrorPackageParts {
   errorEventHrtimeNs: bigint;
   error: {
     type: string;
+    name?: string;
     message: string;
     stack: string;
     rawStack?: string;
@@ -549,6 +663,8 @@ export interface ErrorPackageParts {
   localVariablesDegradation?: 'exact' | 'dropped_hash' | 'dropped_count' | 'dropped_request' | 'background';
   /** Layer 3 alignment flag - set by PackageBuilder.build() */
   localVariablesFrameAlignment?: 'full' | 'prefix_only';
+  localVariablesUnavailableReason?: string;
+  localVariablesCacheOperation?: 'consumed' | 'miss' | 'disabled' | 'unavailable';
   fingerprint?: string;
 }
 
@@ -659,6 +775,7 @@ export interface CaptureRequestContextInput {
   bodyHash?: string | null;
   traceparent?: string;
   tracestate?: string;
+  framework?: FrameworkOperation;
 }
 
 export interface CaptureErrorOptions {

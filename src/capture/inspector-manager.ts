@@ -2,13 +2,21 @@
 import path = require('node:path');
 import { createHash } from 'node:crypto';
 
-import type { CapturedFrame, ModeState, ResolvedConfig } from '../types';
+import type {
+  CapturedArgument,
+  CapturedFrame,
+  CapturedScope,
+  CapturedValue,
+  ModeState,
+  ResolvedConfig
+} from '../types';
 import { EventClock } from '../context/event-clock';
 import { looksLikeHighEntropySecret } from '../pii/scrubber';
 import { safeConsole } from '../debug-log';
 import { buildNonErrorThrownInfo } from './normalize-thrown';
 
 export const ERRORCORE_CAPTURE_ID_SYMBOL = Symbol.for('errorcore.v1.captureId');
+export const LOCALS_CACHE_TTL_MS = 30_000;
 
 export interface LocalsRingBufferEntry {
   id: string;
@@ -24,12 +32,14 @@ export interface LocalsRingBufferEntry {
 }
 
 export class LocalsRingBuffer {
-  private readonly capacity: number;
+  private capacity: number;
+  private readonly ttlMs: number;
   private readonly entries: LocalsRingBufferEntry[] = [];
   private nextId = 0;
 
-  public constructor(capacity: number) {
+  public constructor(capacity: number, ttlMs = LOCALS_CACHE_TTL_MS) {
     this.capacity = capacity;
+    this.ttlMs = ttlMs;
   }
 
   public allocateId(): string {
@@ -37,8 +47,36 @@ export class LocalsRingBuffer {
   }
 
   public push(entry: LocalsRingBufferEntry): void {
+    this.pruneExpired(entry.createdAt);
     this.entries.push(entry);
     while (this.entries.length > this.capacity) this.entries.shift();
+  }
+
+  public resize(capacity: number): void {
+    this.capacity = capacity;
+    while (this.entries.length > this.capacity) this.entries.shift();
+  }
+
+  public pruneExpired(now = Date.now()): number {
+    const before = this.entries.length;
+    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
+      const ageMs = now - this.entries[index].createdAt;
+      if (ageMs < 0 || ageMs > this.ttlMs) {
+        this.entries.splice(index, 1);
+      }
+    }
+    return before - this.entries.length;
+  }
+
+  public consumeFrames(frames: CapturedFrame[]): boolean {
+    const index = this.entries.findIndex((entry) => entry.frames === frames);
+    if (index < 0) return false;
+    this.entries.splice(index, 1);
+    return true;
+  }
+
+  public get size(): number {
+    return this.entries.length;
   }
 
   public getById(id: string): LocalsRingBufferEntry | undefined {
@@ -345,10 +383,12 @@ interface PropertyDescriptor {
 
 interface Scope {
   type: string;
+  name?: string;
   object: RemoteObject;
 }
 
 interface CallFrame {
+  callFrameId?: string;
   functionName: string;
   location: {
     lineNumber: number;
@@ -356,6 +396,7 @@ interface CallFrame {
   };
   url?: string;
   scopeChain: Scope[];
+  this?: RemoteObject;
 }
 
 interface PausedEventParams {
@@ -580,6 +621,8 @@ export class InspectorManager {
       return { frames: null, missReason: null };
     }
 
+    this.ringBuffer.pruneExpired();
+
     if (this.guardTripped) {
       return { frames: null, missReason: 'disabled_adaptive_guard' };
     }
@@ -610,6 +653,7 @@ export class InspectorManager {
     if (typeof taggedId === 'string') {
       const entry = this.ringBuffer.getById(taggedId);
       if (entry !== undefined) {
+        this.ringBuffer.consumeFrames(entry.frames);
         return {
           frames: entry.frames,
           missReason: null,
@@ -620,7 +664,11 @@ export class InspectorManager {
     }
 
     // Layer 2: identity-tuple lookup
-    return this._layer2Lookup(error);
+    const result = this._layer2Lookup(error);
+    if (result.frames !== null) {
+      this.ringBuffer.consumeFrames(result.frames);
+    }
+    return result;
   }
 
   /**
@@ -978,6 +1026,7 @@ export class InspectorManager {
       next.captureLocalVariables && next.localVariablesMode !== 'none';
     this.maxCollectionsPerSecond = next.maxLocalsCollectionsPerSecond;
     this.maxCachedLocals = next.maxCachedLocals;
+    this.ringBuffer.resize(next.maxCachedLocals);
     this.maxLocalsFrames = next.maxLocalsFrames;
     this.maxLocalsObjectProperties = next.maxLocalsObjectProperties;
     this.localsGuard = next.localsGuard;
@@ -1383,10 +1432,7 @@ export class InspectorManager {
           return;
         }
 
-        if (this.ringBuffer['entries'].length >= this.maxCachedLocals) {
-          this.recordMiss('cache_full');
-          return;
-        }
+        this.ringBuffer.pruneExpired();
 
         // Frame selection: we want the engineer to see BOTH the throw site
         // (often a library) and at least one app frame (where their own
@@ -1515,16 +1561,32 @@ export class InspectorManager {
         const frameCount = params.callFrames.length;
         const structuralHash = computeStructuralHash(params.callFrames);
 
-        const collected: CapturedFrame[] = [];
+        const collected: Array<CapturedFrame | undefined> = new Array(appFrames.length);
+        const localProperties = new Map<number, PropertyDescriptor[]>();
+        const argumentProperties = new Map<number, PropertyDescriptor[]>();
         let pendingCollections = 0;
+        let setupComplete = false;
         let stored = false;
 
         const storeCollectedFrames = () => {
-          if (stored || pendingCollections > 0) {
+          if (stored || !setupComplete || pendingCollections > 0) {
             return;
           }
 
-          if (collected.length === 0) {
+          const orderedFrames = collected.filter((frame): frame is CapturedFrame => frame !== undefined);
+          for (let frameIndex = 0; frameIndex < orderedFrames.length; frameIndex += 1) {
+            const args = argumentProperties.get(frameIndex);
+            if (args !== undefined) {
+              orderedFrames[frameIndex].arguments = this._extractArguments(
+                args,
+                localProperties.get(frameIndex) ?? [],
+                stampedSeq,
+                stampedHrtimeNs
+              );
+            }
+          }
+
+          if (orderedFrames.length === 0) {
             this.recordMiss('empty_locals');
             stored = true;
             return;
@@ -1539,7 +1601,7 @@ export class InspectorManager {
             errorMessage,
             frameCount,
             structuralHash,
-            frames: collected,
+            frames: orderedFrames,
             createdAt: Date.now()
           };
 
@@ -1548,52 +1610,129 @@ export class InspectorManager {
           stored = true;
         };
 
-        for (const frame of appFrames) {
-          const localScope = frame.scopeChain.find((scope) => scope.type === 'local');
+        for (let selectedIndex = 0; selectedIndex < appFrames.length; selectedIndex += 1) {
+          const frame = appFrames[selectedIndex];
+          const callFrameIndex = params.callFrames.indexOf(frame);
+          const renderedFrame = renderedFrameByCallFrame.get(frame);
+          const rawLocation = {
+            functionName: renderedFrame?.functionName ?? frame.functionName,
+            filePath: renderedFrame?.filePath ?? frame.url ?? '',
+            lineNumber: renderedFrame?.lineNumber ?? frame.location.lineNumber + 1,
+            columnNumber: renderedFrame?.columnNumber ?? frame.location.columnNumber + 1
+          };
+          const capturedFrame: CapturedFrame = {
+            frameId: `frame:${stampedSeq}:${callFrameIndex}`,
+            callFrameIndex,
+            captureSource: 'v8_inspector',
+            ...rawLocation,
+            rawLocation: { ...rawLocation },
+            sourceMapOutcome: 'disabled',
+            sourceContext: { status: 'unavailable', reason: 'source_artifact_not_configured' },
+            inspectorSeq: stampedSeq,
+            inspectorHrtimeNs: stampedHrtimeNs.toString(),
+            correlationQuality: 'unmatched',
+            causeOrigin: { kind: 'error', depth: 0 },
+            scopes: [],
+            arguments: [],
+            argumentsUnavailableReason: frame.callFrameId === undefined
+              ? 'call_frame_id_unavailable'
+              : undefined,
+            thisValue: frame.this === undefined
+              ? undefined
+              : this._captureValue('this', frame.this, 'this', stampedSeq, stampedHrtimeNs),
+            thisUnavailableReason: frame.this === undefined ? 'inspector_this_unavailable' : undefined,
+            capturePolicy: {
+              maxFrames: this.maxLocalsFrames,
+              maxBindingsPerScope: this.config.serialization.maxObjectKeys,
+              cacheCapacity: this.maxCachedLocals,
+              cacheTtlMs: LOCALS_CACHE_TTL_MS
+            },
+            locals: {}
+          };
+          collected[selectedIndex] = capturedFrame;
 
-          if (localScope?.object.objectId === undefined || this.session === null) {
-            continue;
+          const supportedScopes = frame.scopeChain.filter(
+            (scope): scope is Scope & { type: CapturedScope['type'] } =>
+              scope.type === 'local' || scope.type === 'closure' ||
+              scope.type === 'catch' || scope.type === 'block'
+          );
+          for (const scope of supportedScopes) {
+            if (scope.object.objectId === undefined || this.session === null) continue;
+            pendingCollections += 1;
+            this.session.post(
+              'Runtime.getProperties',
+              { objectId: scope.object.objectId, ownProperties: true, generatePreview: true },
+              (error, result) => {
+                if (!error && result !== undefined) {
+                  const properties = (result as { result?: PropertyDescriptor[] }).result ?? [];
+                  if (scope.type === 'local') {
+                    localProperties.set(selectedIndex, properties);
+                    capturedFrame.locals = this._extractLocals(properties);
+                  }
+                  capturedFrame.scopes!.push(
+                    this._extractScope(scope, properties, stampedSeq, stampedHrtimeNs)
+                  );
+                } else {
+                  capturedFrame.scopes!.push({
+                    type: scope.type,
+                    ...(scope.name === undefined ? {} : { name: scope.name }),
+                    bindings: [],
+                    truncated: false,
+                    omittedBindings: 0,
+                    unavailableReason: 'inspector_scope_read_failed'
+                  });
+                }
+                pendingCollections -= 1;
+                storeCollectedFrames();
+              }
+            );
           }
 
-          pendingCollections += 1;
-
-          this.session.post(
-            'Runtime.getProperties',
-            {
-              objectId: localScope.object.objectId,
-              ownProperties: true,
-              // Request previews so _serializeRemoteObject can surface a
-              // useful subset for known classes (IncomingMessage etc.)
-              // instead of just the className placeholder.
-              generatePreview: true
-            },
-            (error, result) => {
-              pendingCollections -= 1;
-
-              if (error || result === undefined) {
+          if (frame.callFrameId !== undefined && this.session !== null) {
+            pendingCollections += 1;
+            this.session.post(
+              'Debugger.evaluateOnCallFrame',
+              {
+                callFrameId: frame.callFrameId,
+                expression: 'typeof arguments === "undefined" ? null : arguments',
+                silent: true,
+                returnByValue: false,
+                generatePreview: true
+              },
+              (error, result) => {
+                const remote = (result as { result?: RemoteObject } | undefined)?.result;
+                if (!error && remote?.objectId !== undefined && this.session !== null) {
+                  pendingCollections += 1;
+                  this.session.post(
+                    'Runtime.getProperties',
+                    { objectId: remote.objectId, ownProperties: true, generatePreview: true },
+                    (propertiesError, propertiesResult) => {
+                      if (!propertiesError && propertiesResult !== undefined) {
+                        argumentProperties.set(
+                          selectedIndex,
+                          (propertiesResult as { result?: PropertyDescriptor[] }).result ?? []
+                        );
+                        delete capturedFrame.argumentsUnavailableReason;
+                      }
+                      pendingCollections -= 1;
+                      storeCollectedFrames();
+                    }
+                  );
+                } else if (!error) {
+                  argumentProperties.set(selectedIndex, []);
+                  delete capturedFrame.argumentsUnavailableReason;
+                } else {
+                  capturedFrame.argumentsUnavailableReason = 'inspector_arguments_read_failed';
+                }
+                pendingCollections -= 1;
                 storeCollectedFrames();
-                return;
               }
-
-              const properties = (result as { result?: PropertyDescriptor[] }).result;
-
-              if (properties === undefined) {
-                storeCollectedFrames();
-                return;
-              }
-
-              const renderedFrame = renderedFrameByCallFrame.get(frame);
-              collected.push({
-                functionName: renderedFrame?.functionName ?? frame.functionName,
-                filePath: renderedFrame?.filePath ?? frame.url ?? '',
-                lineNumber: renderedFrame?.lineNumber ?? frame.location.lineNumber + 1,
-                columnNumber: renderedFrame?.columnNumber ?? frame.location.columnNumber + 1,
-                locals: this._extractLocals(properties)
-              });
-              storeCollectedFrames();
-            }
-          );
+            );
+          }
         }
+
+        setupComplete = true;
+        storeCollectedFrames();
 
         if (params.data?.objectId !== undefined) {
           this.installCaptureTag(params.data.objectId, captureId);
@@ -1628,6 +1767,110 @@ export class InspectorManager {
     }
 
     return locals;
+  }
+
+  private _extractScope(
+    scope: Scope & { type: CapturedScope['type'] },
+    properties: PropertyDescriptor[],
+    seq: number,
+    hrtimeNs: bigint
+  ): CapturedScope {
+    const limit = this.config.serialization.maxObjectKeys;
+    const selected = properties.slice(0, limit);
+    return {
+      type: scope.type,
+      ...(scope.name === undefined ? {} : { name: scope.name }),
+      bindings: selected.map((property) => ({
+        name: property.name,
+        captured: this._captureValue(property.name, property.value, 'scope', seq, hrtimeNs)
+      })),
+      truncated: properties.length > selected.length,
+      omittedBindings: Math.max(0, properties.length - selected.length)
+    };
+  }
+
+  private _extractArguments(
+    properties: PropertyDescriptor[],
+    locals: PropertyDescriptor[],
+    seq: number,
+    hrtimeNs: bigint
+  ): CapturedArgument[] {
+    const numeric = properties
+      .filter((property) => /^(?:0|[1-9]\d*)$/.test(property.name))
+      .sort((a, b) => Number(a.name) - Number(b.name))
+      .slice(0, this.config.serialization.maxArrayItems);
+    const usedNames = new Set<string>();
+    return numeric.map((property) => {
+      const matches = locals.filter(
+        (candidate) => !usedNames.has(candidate.name) && this._sameRemoteValue(candidate.value, property.value)
+      );
+      const matchedName = matches.length === 1 ? matches[0].name : null;
+      if (matchedName !== null) usedNames.add(matchedName);
+      return {
+        index: Number(property.name),
+        name: matchedName,
+        nameStatus: matchedName === null ? 'unavailable' : 'matched_local_binding',
+        ...this._captureValue(matchedName ?? `argument_${property.name}`, property.value, 'argument', seq, hrtimeNs)
+      };
+    });
+  }
+
+  private _sameRemoteValue(left: RemoteObject | undefined, right: RemoteObject | undefined): boolean {
+    if (left === undefined || right === undefined) return false;
+    if (left.objectId !== undefined || right.objectId !== undefined) {
+      return left.objectId !== undefined && left.objectId === right.objectId;
+    }
+    return left.type === right.type && left.subtype === right.subtype &&
+      Object.is(left.value, right.value) && left.description === right.description;
+  }
+
+  private _captureValue(
+    name: string,
+    object: RemoteObject | undefined,
+    origin: CapturedValue['origin'],
+    seq: number,
+    hrtimeNs: bigint
+  ): CapturedValue {
+    if (SENSITIVE_VAR_RE.test(name)) {
+      return {
+        status: 'redacted',
+        captureSource: 'v8_inspector',
+        inspectorSeq: seq,
+        inspectorHrtimeNs: hrtimeNs.toString(),
+        origin,
+        correlationQuality: 'unmatched',
+        causeOrigin: { kind: 'error', depth: 0 },
+        reason: 'sensitive_binding_name'
+      };
+    }
+    if (object === undefined || object.description === '<optimized out>') {
+      return {
+        status: 'optimized_out',
+        captureSource: 'v8_inspector',
+        inspectorSeq: seq,
+        inspectorHrtimeNs: hrtimeNs.toString(),
+        origin,
+        correlationQuality: 'unmatched',
+        causeOrigin: { kind: 'error', depth: 0 },
+        reason: 'v8_optimized_out'
+      };
+    }
+    const value = this._serializeRemoteObject(object);
+    const truncated =
+      (typeof value === 'string' && value.includes('...[truncated,')) ||
+      (typeof value === 'object' && value !== null &&
+        (value as { _overflow?: unknown })._overflow === true);
+    return {
+      value,
+      status: truncated ? 'truncated' : value === '[REDACTED]' ? 'redacted' : 'captured',
+      captureSource: 'v8_inspector',
+      inspectorSeq: seq,
+      inspectorHrtimeNs: hrtimeNs.toString(),
+      origin,
+      correlationQuality: 'unmatched',
+      causeOrigin: { kind: 'error', depth: 0 },
+      ...(truncated ? { reason: 'capture_budget' } : {})
+    };
   }
 
   private _serializeRemoteObject(object: RemoteObject | undefined): unknown {

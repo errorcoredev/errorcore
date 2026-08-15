@@ -29,6 +29,7 @@ import { parseEnvelopeMetadata } from '../transport/payload';
 import type { SourceMapResolver } from './source-map-resolver';
 import type {
   AmbientEventContext,
+  CapturedFrame,
   CaptureErrorOptions,
   CaptureRequestContextInput,
   ErrorInfo,
@@ -372,10 +373,21 @@ function serializeError(
 
   return {
     type: error.constructor?.name || 'Error',
+    name: error.name || 'Error',
     message: error.message || '',
     stack: resolvedStack,
     rawStack: rawStackField,
-    cause: cause instanceof Error ? serializeError(cause, resolver, config, depth + 1) : undefined,
+    cause: cause instanceof Error
+      ? serializeError(cause, resolver, config, depth + 1)
+      : cause === undefined
+        ? undefined
+        : {
+            type: 'NonErrorThrown',
+            name: 'NonErrorThrown',
+            message: typeof cause === 'string' ? cause : `Non-Error cause (${typeof cause})`,
+            stack: '',
+            properties: { thrownValue: cloneAndLimit(cause, config.serialization) }
+          },
     properties: cloneAndLimit(extractCustomProperties(error), config.serialization) as Record<
       string,
       unknown
@@ -592,10 +604,18 @@ export class ErrorCapturer {
 
       const sourceMapResolver = modeState.resolveSourceMaps ? this.sourceMapResolver : null;
       const serializedError = serializeError(error, sourceMapResolver, this.config);
-      const localsResult: Pick<LocalsWithDiagnostics, 'frames' | 'captureLayer' | 'degradation'> =
+      const localsResult: LocalsWithDiagnostics =
         this.safeGetLocals(error, captureFailures);
-      const resolvedLocalVariables =
-        sourceMapResolver?.resolveCapturedFrames(localsResult.frames) ?? localsResult.frames;
+      const rawLocalVariables = localsResult.frames;
+      const mappedLocalVariables =
+        sourceMapResolver?.resolveCapturedFrames(rawLocalVariables) ?? rawLocalVariables;
+      const resolvedLocalVariables = this.annotateFrameResolution(
+        rawLocalVariables,
+        mappedLocalVariables,
+        sourceMapResolver !== null,
+        localsResult.captureLayer,
+        localsResult.degradation
+      );
       const sourceMapTelemetry = sourceMapResolver?.consumeTelemetry();
       const usedAmbientEvents = context === undefined;
 
@@ -658,6 +678,7 @@ export class ErrorCapturer {
         errorEventHrtimeNs,
         error: {
           type: serializedError.type,
+          name: serializedError.name,
           message: serializedError.message,
           stack: serializedError.stack,
           rawStack: serializedError.rawStack,
@@ -667,6 +688,13 @@ export class ErrorCapturer {
         localVariables: resolvedLocalVariables,
         localVariablesCaptureLayer: localsResult.captureLayer,
         localVariablesDegradation: localsResult.degradation,
+        localVariablesUnavailableReason: localsResult.missReason ?? undefined,
+        localVariablesCacheOperation:
+          localsResult.frames !== null
+            ? 'consumed'
+            : this.config.captureLocalVariables
+              ? 'miss'
+              : 'disabled',
         fingerprint,
         requestContext: this.toRequestContextData(context),
         ioTimeline,
@@ -761,13 +789,14 @@ export class ErrorCapturer {
   private safeGetLocals(
     error: Error,
     captureFailures: string[]
-  ): Pick<LocalsWithDiagnostics, 'frames' | 'captureLayer' | 'degradation'> {
+  ): LocalsWithDiagnostics {
     try {
       const result = this.resolveLocalsForError(error);
 
       if (result.frames !== null) {
         return {
-          frames: result.frames,
+          frames: this.withCauseOrigin(result.frames, 0),
+          missReason: null,
           captureLayer: result.captureLayer,
           degradation: result.degradation
         };
@@ -787,7 +816,8 @@ export class ErrorCapturer {
 
         if (causeResult.frames !== null) {
           return {
-            frames: causeResult.frames,
+            frames: this.withCauseOrigin(causeResult.frames, depth + 1),
+            missReason: null,
             captureLayer: causeResult.captureLayer,
             degradation: causeResult.degradation
           };
@@ -813,7 +843,7 @@ export class ErrorCapturer {
         inspectorError instanceof Error ? inspectorError.message : String(inspectorError);
 
       captureFailures.push(`locals: ${sanitizeDiagnosticString(this.config, message)}`);
-      return { frames: null };
+      return { frames: null, missReason: message };
     }
   }
 
@@ -855,13 +885,15 @@ export class ErrorCapturer {
       const traceparent = request.traceparent ?? getExplicitHeader(headers, 'traceparent');
       const tracestate = request.tracestate ?? getExplicitHeader(headers, 'tracestate');
 
-      return this.als.createRequestContext({
+      const context = this.als.createRequestContext({
         method: request.method,
         url: request.url,
         headers,
         ...(traceparent === undefined ? {} : { traceparent }),
         ...(tracestate === undefined ? {} : { tracestate })
       });
+      context.framework = request.framework;
+      return context;
     } catch (contextError) {
       const message = contextError instanceof Error ? contextError.message : String(contextError);
       captureFailures.push(
@@ -961,8 +993,74 @@ export class ErrorCapturer {
       url: context.url,
       headers: { ...context.headers },
       body: context.body,
-      bodyTruncated: context.bodyTruncated
+      bodyTruncated: context.bodyTruncated,
+      framework: context.framework
     };
+  }
+
+  private withCauseOrigin(frames: CapturedFrame[], depth: number): CapturedFrame[] {
+    const causeOrigin = { kind: depth === 0 ? 'error' as const : 'cause' as const, depth };
+    return frames.map((frame) => ({
+      ...frame,
+      causeOrigin,
+      scopes: frame.scopes?.map((scope) => ({
+        ...scope,
+        bindings: scope.bindings.map((binding) => ({
+          ...binding,
+          captured: { ...binding.captured, causeOrigin }
+        }))
+      })),
+      arguments: frame.arguments?.map((argument) => ({ ...argument, causeOrigin })),
+      thisValue: frame.thisValue === undefined
+        ? undefined
+        : { ...frame.thisValue, causeOrigin }
+    }));
+  }
+
+  private annotateFrameResolution(
+    raw: CapturedFrame[] | null,
+    resolved: CapturedFrame[] | null,
+    sourceMapsEnabled: boolean,
+    layer?: 'tag' | 'identity',
+    degradation?: LocalsWithDiagnostics['degradation']
+  ): CapturedFrame[] | null {
+    if (resolved === null) return null;
+    return resolved.map((frame, index) => {
+      const rawFrame = raw?.[index] ?? frame;
+      const mapped = rawFrame.filePath !== frame.filePath ||
+        rawFrame.lineNumber !== frame.lineNumber ||
+        rawFrame.columnNumber !== frame.columnNumber;
+      const correlationQuality =
+        layer === 'tag'
+          ? 'tag_exact' as const
+          : degradation === 'exact'
+            ? 'identity_exact' as const
+            : layer === 'identity'
+              ? 'degraded' as const
+              : 'unmatched' as const;
+      return {
+        ...frame,
+        rawLocation: {
+          functionName: rawFrame.functionName,
+          filePath: rawFrame.filePath,
+          lineNumber: rawFrame.lineNumber,
+          columnNumber: rawFrame.columnNumber
+        },
+        sourceMapOutcome: sourceMapsEnabled ? (mapped ? 'mapped' : 'unmapped') : 'disabled',
+        correlationQuality,
+        scopes: frame.scopes?.map((scope) => ({
+          ...scope,
+          bindings: scope.bindings.map((binding) => ({
+            ...binding,
+            captured: { ...binding.captured, correlationQuality }
+          }))
+        })),
+        arguments: frame.arguments?.map((argument) => ({ ...argument, correlationQuality })),
+        thisValue: frame.thisValue === undefined
+          ? undefined
+          : { ...frame.thisValue, correlationQuality }
+      };
+    });
   }
 
   private captureInline(parts: ErrorPackageParts, modeState?: ModeState): ErrorPackage {

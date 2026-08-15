@@ -195,7 +195,7 @@ interface TimeAnchor {
 
 ```typescript
 interface ErrorPackage {
-  schemaVersion: '1.3.0';   // current emit; receivers accept '1.1.0' | '1.2.0' | '1.3.0'
+  schemaVersion: '1.4.0';   // current emit; receivers accept '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0'
   capturedAt: string;                      // ISO 8601, per-package (not per-event)
   errorEventSeq: number;                   // module 20 — EventClock.tick() at capture entry
   errorEventHrtimeNs: string;              // module 20 — bigint serialized

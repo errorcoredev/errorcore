@@ -238,7 +238,8 @@ function classifyPayload(payload: unknown): IngestedPayload['kind'] {
     (
       payload.schemaVersion === '1.1.0' ||
       payload.schemaVersion === '1.2.0' ||
-      payload.schemaVersion === '1.3.0'
+      payload.schemaVersion === '1.3.0' ||
+      payload.schemaVersion === '1.4.0'
     ) &&
     typeof payload.capturedAt === 'string' &&
     isRecord(payload.error)

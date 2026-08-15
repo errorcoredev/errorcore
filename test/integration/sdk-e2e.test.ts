@@ -727,7 +727,7 @@ const pkgJson = require('./package.json');
     }
   });
 
-  it('ships v1.3.0 stamping fields and eventClockRange brackets every captured event', async () => {
+  it('ships v1.4.0 stamping fields and eventClockRange brackets every captured event', async () => {
     const output = createTempOutput('errorcore-e2e-stamping');
     const sdk = createSDK({
       allowUnencrypted: true,
@@ -761,7 +761,7 @@ const pkgJson = require('./package.json');
       const pkg = readDeliveredPackage(output.file);
 
       // Top-level v1.3.0 fields are present and well-typed.
-      expect(pkg.schemaVersion).toBe('1.3.0');
+      expect(pkg.schemaVersion).toBe('1.4.0');
       expect(pkg.errorEventSeq).toBeTypeOf('number');
       expect(pkg.errorEventSeq).toBeGreaterThan(0);
       expect(pkg.errorEventHrtimeNs).toBeTypeOf('string');

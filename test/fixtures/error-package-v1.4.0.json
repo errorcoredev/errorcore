@@ -1,0 +1,191 @@
+{
+  "schemaVersion": "1.4.0",
+  "eventId": "11111111-1111-4111-8111-111111111111",
+  "service": "sdk-v1.4-fixture",
+  "capturedAt": "2026-08-15T00:00:00.000Z",
+  "errorEventSeq": 42,
+  "errorEventHrtimeNs": "42000000",
+  "eventClockRange": { "min": 41, "max": 42 },
+  "timeAnchor": { "wallClockMs": 1786752000000, "hrtimeNs": "0" },
+  "error": {
+    "type": "CheckoutFailure",
+    "name": "PaymentDeclined",
+    "message": "Payment was declined",
+    "stack": "PaymentDeclined: Payment was declined\n    at submitOrder (/srv/app/checkout.js:27:9)",
+    "properties": {}
+  },
+  "localVariables": [
+    {
+      "frameId": "frame:41:0",
+      "callFrameIndex": 0,
+      "captureSource": "v8_inspector",
+      "functionName": "submitOrder",
+      "filePath": "/srv/app/checkout.js",
+      "lineNumber": 27,
+      "columnNumber": 9,
+      "rawLocation": {
+        "functionName": "submitOrder",
+        "filePath": "/srv/app/dist/checkout.min.js",
+        "lineNumber": 1,
+        "columnNumber": 421
+      },
+      "sourceMapOutcome": "mapped",
+      "sourceContext": {
+        "status": "unavailable",
+        "reason": "source_artifact_not_configured"
+      },
+      "inspectorSeq": 41,
+      "inspectorHrtimeNs": "41000000",
+      "correlationQuality": "tag_exact",
+      "causeOrigin": { "kind": "error", "depth": 0 },
+      "arguments": [
+        {
+          "index": 0,
+          "name": "customerId",
+          "nameStatus": "matched_local_binding",
+          "status": "redacted",
+          "captureSource": "v8_inspector",
+          "inspectorSeq": 41,
+          "inspectorHrtimeNs": "41000000",
+          "origin": "argument",
+          "reason": "sensitive_binding_name"
+        },
+        {
+          "index": 1,
+          "name": null,
+          "nameStatus": "unavailable",
+          "status": "optimized_out",
+          "captureSource": "v8_inspector",
+          "inspectorSeq": 41,
+          "inspectorHrtimeNs": "41000000",
+          "origin": "argument",
+          "reason": "v8_optimized_out"
+        }
+      ],
+      "scopes": [
+        {
+          "type": "local",
+          "bindings": [
+            {
+              "name": "customerId",
+              "captured": {
+                "status": "redacted",
+                "captureSource": "v8_inspector",
+                "inspectorSeq": 41,
+                "inspectorHrtimeNs": "41000000",
+                "origin": "scope",
+                "reason": "sensitive_binding_name"
+              }
+            }
+          ],
+          "truncated": false,
+          "omittedBindings": 0
+        },
+        {
+          "type": "closure",
+          "name": "checkoutModule",
+          "bindings": [],
+          "truncated": true,
+          "omittedBindings": 3
+        }
+      ],
+      "thisValue": {
+        "status": "metadata_only",
+        "captureSource": "v8_inspector",
+        "inspectorSeq": 41,
+        "inspectorHrtimeNs": "41000000",
+        "origin": "this",
+        "reason": "capture_budget"
+      },
+      "capturePolicy": {
+        "maxFrames": 5,
+        "maxBindingsPerScope": 50,
+        "cacheCapacity": 50,
+        "cacheTtlMs": 30000
+      },
+      "locals": {
+        "customerId": {
+          "schemaVersion": 2,
+          "mode": "meta",
+          "meta": { "type": "string", "bytes": 18, "len": 16 },
+          "reason": "credential_name"
+        }
+      }
+    }
+  ],
+  "request": {
+    "id": "fixture-request",
+    "method": "POST",
+    "url": "/customers/[customerId]/checkout",
+    "headers": {},
+    "receivedAt": "2026-08-15T00:00:00.000Z",
+    "framework": {
+      "framework": "nextjs",
+      "routeTemplate": "/customers/[customerId]/checkout",
+      "controller": "CheckoutController",
+      "handler": "POST",
+      "operation": "submitOrder",
+      "instrumentation": {
+        "name": "errorcore/nextjs",
+        "version": "0.4.0",
+        "lifecyclePhase": "error"
+      }
+    }
+  },
+  "ioTimeline": [],
+  "evictionLog": [],
+  "stateReads": [],
+  "stateWrites": [],
+  "concurrentRequests": [],
+  "processMetadata": {
+    "nodeVersion": "v20.19.0",
+    "v8Version": "11.3",
+    "platform": "linux",
+    "arch": "x64",
+    "pid": 1,
+    "hostname": "fixture",
+    "uptime": 1,
+    "memoryUsage": { "rss": 1, "heapTotal": 1, "heapUsed": 1, "external": 0, "arrayBuffers": 0 },
+    "activeHandles": 0,
+    "activeRequests": 0,
+    "eventLoopLagMs": 0,
+    "processStartAnchor": { "wallClockMs": 1786752000000, "hrtimeNs": "0" }
+  },
+  "codeVersion": { "packageVersion": "0.4.0" },
+  "environment": {},
+  "fieldManifest": {
+    "schemaVersion": 1,
+    "total": 1,
+    "encrypted": 0,
+    "metadataOnly": 1,
+    "redacted": 1,
+    "truncated": 0,
+    "byReason": { "credential_name": 1 }
+  },
+  "payloadManifest": {
+    "schemaVersion": 1,
+    "expectedBlobIds": [],
+    "entries": [],
+    "setCompleteAtSdk": true
+  },
+  "completeness": {
+    "modeAtCapture": "safe",
+    "requestCaptured": true,
+    "requestBodyTruncated": false,
+    "ioTimelineCaptured": false,
+    "usedAmbientEvents": false,
+    "ioEventsDropped": 0,
+    "ioPayloadsTruncated": 0,
+    "alsContextAvailable": true,
+    "localVariablesCaptured": true,
+    "localVariablesTruncated": false,
+    "localVariablesUnavailableReason": null,
+    "localVariablesCache": { "operation": "consumed", "capacity": 50, "ttlMs": 30000 },
+    "stateTrackingEnabled": false,
+    "stateReadsCaptured": false,
+    "concurrentRequestsCaptured": false,
+    "piiScrubbed": true,
+    "encrypted": true,
+    "captureFailures": ["io-recorder: disabled_by_mode"]
+  }
+}

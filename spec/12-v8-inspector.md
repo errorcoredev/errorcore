@@ -369,7 +369,7 @@ getLocals(error: Error):
   return null  // no match
 ```
 
-Lookup does NOT consume entries — same error captured N times resolves to the same locals N times.
+Successful lookup consumes its cache entry. Entries also expire after the bounded cache TTL, and capacity pressure evicts the oldest entry while preserving new call-frame order. Duplicate error delivery is handled by the capture pipeline's event deduplication rather than retaining inspector values indefinitely.
 
 ### Telemetry (0.2.0)
 
@@ -384,7 +384,7 @@ localVariablesFrameAlignment?: 'full' | 'prefix_only'    // rendering path (Laye
 
 ### Cache maintenance
 
-- Ring buffer capacity: `maxCachedLocals` (default 50). LIFO shedding; no time-based expiry.
+- Ring buffer capacity: `maxCachedLocals` (default 50). Oldest-entry eviction plus a 30-second TTL; successful correlation consumes the entry.
 - Rate limit: 20 collections/second via `setInterval(.unref())`.
 - Lookup does NOT consume entries (unlike the pre-0.2.0 one-shot design).
 

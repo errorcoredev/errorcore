@@ -531,7 +531,7 @@ describe('InspectorManager', () => {
       const error = new Error('Stream is not writable');
       error.stack = stack;
       const result = manager.getLocalsWithDiagnostics(error);
-      expect(result.frames).toEqual([
+      expect(result.frames).toMatchObject([
         {
           functionName: 'lookupTags',
           filePath: '/app/dist/server.js',
@@ -863,7 +863,7 @@ describe('InspectorManager', () => {
       (error as unknown as Record<symbol, unknown>)[ERRORCORE_CAPTURE_ID_SYMBOL] = '1';
 
       const first = manager.getLocals(error);
-      expect(first).toEqual([
+      expect(first).toMatchObject([
         {
           functionName: 'handler',
           filePath: APP_FILE,
@@ -1192,7 +1192,7 @@ describe('InspectorManager', () => {
       // So Layer 2 identity won't exactly match, but dropped_count may
       (error as unknown as Record<symbol, unknown>)[ERRORCORE_CAPTURE_ID_SYMBOL] = '1';
 
-      expect(manager.getLocals(error)).toEqual([
+      expect(manager.getLocals(error)).toMatchObject([
         {
           functionName: 'first',
           filePath: '/app/src/first.js',
@@ -1248,7 +1248,7 @@ describe('InspectorManager', () => {
     });
   });
 
-  it('skips collection when ring buffer is at capacity', () => {
+  it('evicts the oldest cache entry and continues collecting beyond capacity', () => {
     const inspector = createInspectorMock({
       postHandlers: {
         'Runtime.getProperties': () => ({
@@ -1266,9 +1266,12 @@ describe('InspectorManager', () => {
         { getRequestId: () => 'req-1' }
       ) as unknown as {
         ringBuffer: LocalsRingBuffer;
+        ensureDebuggerActive(): void;
         _onPaused(params: unknown): void;
         shutdown(): void;
       };
+
+      manager.ensureDebuggerActive();
 
       manager.ringBuffer.push({
         id: 'existing',
@@ -1289,7 +1292,99 @@ describe('InspectorManager', () => {
 
       expect(
         inspector.session.post.mock.calls.filter((call) => call[0] === 'Runtime.getProperties')
-      ).toHaveLength(0);
+      ).toHaveLength(1);
+      expect(manager.ringBuffer.getById('existing')).toBeUndefined();
+      expect(manager.ringBuffer.size).toBe(1);
+      manager.shutdown();
+    });
+  });
+
+  it('captures ordered scopes, explicit arguments, this, and consumes the matched entry', () => {
+    const inspector = createInspectorMock({
+      postHandlers: {
+        'Debugger.evaluateOnCallFrame': () => ({
+          result: { type: 'object', objectId: 'arguments-1' }
+        }),
+        'Runtime.getProperties': (params) => {
+          if (params?.objectId === 'scope-local') {
+            return {
+              result: [
+                { name: 'customerId', value: { type: 'string', value: 'customer-safe' } },
+                { name: 'retryCount', value: { type: 'number', value: 2 } }
+              ]
+            };
+          }
+          if (params?.objectId === 'scope-closure') {
+            return {
+              result: [{ name: 'region', value: { type: 'string', value: 'ap-south-1' } }]
+            };
+          }
+          if (params?.objectId === 'arguments-1') {
+            return {
+              result: [
+                { name: '0', value: { type: 'string', value: 'customer-safe' } },
+                { name: '1', value: { type: 'number', value: 2 } },
+                { name: 'length', value: { type: 'number', value: 2 } }
+              ]
+            };
+          }
+          return { result: [] };
+        }
+      }
+    });
+
+    withInspectorMock(inspector.inspectorModule, () => {
+      const manager = new InspectorManager(
+        createInspectorConfig({ maxCachedLocals: 1 }),
+        { getRequestId: () => 'req-arguments' }
+      ) as unknown as {
+        ensureDebuggerActive(): void;
+        _onPaused(params: unknown): void;
+        getLocalsWithDiagnostics(error: Error): {
+          frames: Array<{
+            frameId?: string;
+            scopes?: Array<{ type: string }>;
+            arguments?: Array<{ index: number; name: string | null; status: string }>;
+            thisValue?: { status: string };
+          }> | null;
+          missReason: string | null;
+        };
+        shutdown(): void;
+      };
+      manager.ensureDebuggerActive();
+      const base = createCallFrame({ objectId: 'scope-local' });
+      manager._onPaused({
+        reason: 'exception',
+        data: { className: 'Error', description: 'Error: explicit args' },
+        callFrames: [{
+          ...base,
+          callFrameId: 'call-frame-1',
+          this: { type: 'object', className: 'CheckoutController' },
+          scopeChain: [
+            ...base.scopeChain,
+            {
+              type: 'closure',
+              name: 'checkoutModule',
+              object: { type: 'object', objectId: 'scope-closure' }
+            }
+          ]
+        }]
+      });
+
+      const error = buildErrorAt('explicit args');
+      (error as unknown as Record<symbol, unknown>)[ERRORCORE_CAPTURE_ID_SYMBOL] = '1';
+      const first = manager.getLocalsWithDiagnostics(error);
+      expect(first.frames?.[0]?.frameId).toMatch(/^frame:/);
+      expect(first.frames?.[0]?.scopes?.map((scope) => scope.type)).toEqual(['local', 'closure']);
+      expect(first.frames?.[0]?.arguments).toMatchObject([
+        { index: 0, name: 'customerId', status: 'captured' },
+        { index: 1, name: 'retryCount', status: 'captured' }
+      ]);
+      expect(first.frames?.[0]?.thisValue?.status).toBe('captured');
+
+      const second = manager.getLocalsWithDiagnostics(error);
+      expect(second.frames).toBeNull();
+      expect(second.missReason).toContain('cache_miss');
       manager.shutdown();
     });
   });

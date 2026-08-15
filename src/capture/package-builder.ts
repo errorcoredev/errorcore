@@ -29,6 +29,9 @@ import type {
   TimeAnchor
 } from '../types';
 import type { Source } from '../scrubber/types';
+import type { Field } from '../scrubber/types';
+
+const LOCALS_CACHE_TTL_MS = 30_000;
 
 function approximateIsoFromHrtime(
   startTime: bigint,
@@ -310,6 +313,79 @@ function getIOEventRequestSource(event: IOEventSerialized): Source {
     : 'app';
 }
 
+function isVersionedField(value: unknown): value is Extract<Field, { schemaVersion: 2 }> {
+  return typeof value === 'object' && value !== null &&
+    (value as { schemaVersion?: unknown }).schemaVersion === 2 &&
+    ((value as { mode?: unknown }).mode === 'meta' ||
+      (value as { mode?: unknown }).mode === 'encrypted');
+}
+
+function buildFieldManifest(root: unknown): NonNullable<ErrorPackage['fieldManifest']> {
+  const manifest: NonNullable<ErrorPackage['fieldManifest']> = {
+    schemaVersion: 1,
+    total: 0,
+    encrypted: 0,
+    metadataOnly: 0,
+    redacted: 0,
+    truncated: 0,
+    byReason: {}
+  };
+  const visit = (value: unknown): void => {
+    if (isVersionedField(value)) {
+      manifest.total += 1;
+      if (value.mode === 'encrypted') {
+        manifest.encrypted += 1;
+      } else {
+        manifest.metadataOnly += 1;
+        manifest.byReason[value.reason] = (manifest.byReason[value.reason] ?? 0) + 1;
+        if (
+          value.reason === 'credential_name' || value.reason === 'pii_detector' ||
+          value.reason === 'sensitivity_check_failed'
+        ) {
+          manifest.redacted += 1;
+        }
+        if (value.reason === 'max_field_bytes') {
+          manifest.truncated += 1;
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (typeof value === 'object' && value !== null) {
+      for (const child of Object.values(value as Record<string, unknown>)) visit(child);
+    }
+  };
+  visit(root);
+  return manifest;
+}
+
+function buildPayloadManifest(
+  timeline: IOEventSerialized[]
+): NonNullable<ErrorPackage['payloadManifest']> {
+  const entries = new Map<string, NonNullable<ErrorPackage['payloadManifest']>['entries'][number]>();
+  for (const event of timeline) {
+    for (const ref of [event.requestPayloadRef, event.responsePayloadRef]) {
+      if (ref === undefined || ref === null) continue;
+      entries.set(ref.blobId, {
+        blobId: ref.blobId,
+        state: ref.storage === 'spool' ? 'expected' : 'preview_only',
+        originalSize: ref.size,
+        capturedSize: ref.capturedSize
+      });
+    }
+  }
+  const ordered = [...entries.values()].sort((left, right) => left.blobId.localeCompare(right.blobId));
+  return {
+    schemaVersion: 1,
+    expectedBlobIds: ordered.filter((entry) => entry.state === 'expected').map((entry) => entry.blobId),
+    entries: ordered,
+    setCompleteAtSdk: true
+  };
+}
+
 /**
  * Count the number of rendered stack frames in an Error.stack string.
  * Lines starting with "    at " (after trimming) are counted as frames.
@@ -374,7 +450,15 @@ function scrubCapturedFrameFilePaths(
 
   return frames.map((frame) => ({
     ...frame,
-    filePath: scrubber.scrubFilePath(frame.filePath)
+    filePath: scrubber.scrubFilePath(frame.filePath),
+    ...(frame.rawLocation === undefined
+      ? {}
+      : {
+          rawLocation: {
+            ...frame.rawLocation,
+            filePath: scrubber.scrubFilePath(frame.rawLocation.filePath)
+          }
+        })
   }));
 }
 
@@ -576,7 +660,7 @@ export class PackageBuilder {
     );
 
     const packageObject: ErrorPackage = {
-      schemaVersion: '1.3.0',
+      schemaVersion: '1.4.0',
       eventId: randomUUID(),
       service: this.config.service,
       capturedAt: new Date().toISOString(),
@@ -606,7 +690,8 @@ export class PackageBuilder {
               receivedAt: approximateIsoFromHrtime(
                 parts.requestContext.startTime,
                 parts.timeAnchor
-              )
+              ),
+              framework: parts.requestContext.framework
             },
       ioTimeline: serializedTimeline,
       evictionLog: serializedEvictionLog,
@@ -661,9 +746,12 @@ export class PackageBuilder {
 
     this.normalizePackageArrays(scrubbedPackage);
     this.fieldizePackage(scrubbedPackage);
+    scrubbedPackage.fieldManifest = buildFieldManifest(scrubbedPackage);
     scrubbedPackage.completeness = this.computeCompleteness(parts, false, scrubbedPackage, frameAlignment);
     this.shedIfNeeded(scrubbedPackage, parts, frameAlignment);
     this.enforceHardCap(scrubbedPackage, parts, frameAlignment);
+    scrubbedPackage.payloadManifest = buildPayloadManifest(scrubbedPackage.ioTimeline);
+    scrubbedPackage.fieldManifest = buildFieldManifest(scrubbedPackage);
 
     return scrubbedPackage;
   }
@@ -700,13 +788,6 @@ export class PackageBuilder {
         frameAlignment
       );
     };
-
-    if (pkg.localVariables !== undefined) {
-      delete pkg.localVariables;
-      dropped.push('localVariables');
-      markTruncated();
-      if (estimateSize() <= hardCap) return;
-    }
 
     if (pkg.ioTimeline.length > 50) {
       pkg.ioTimeline = pkg.ioTimeline.slice(-50);
@@ -766,6 +847,14 @@ export class PackageBuilder {
       pkg.stateWrites = [];
       dropped.push('stateWrites');
       markTruncated();
+      if (estimateSize() <= hardCap) return;
+    }
+
+    if (pkg.localVariables !== undefined) {
+      const frameCount = pkg.localVariables.length;
+      delete pkg.localVariables;
+      dropped.push(`localVariables:count=${frameCount}`);
+      markTruncated();
     }
     // Even after all sheds, if still over cap the caller (encrypt path)
     // is responsible for emitting EC_PACKAGE_OVER_HARD_CAP. We don't
@@ -805,6 +894,32 @@ export class PackageBuilder {
     if (pkg.localVariables !== undefined) {
       for (const frame of pkg.localVariables) {
         frame.locals = this.fieldizeRecord(frame.locals, 'app');
+        for (const scope of frame.scopes ?? []) {
+          for (const binding of scope.bindings) {
+            if (Object.prototype.hasOwnProperty.call(binding.captured, 'value')) {
+              binding.captured.value = this.fieldizeCapturedValue(
+                binding.name,
+                binding.captured.value,
+                'app'
+              );
+            }
+          }
+        }
+        for (const argument of frame.arguments ?? []) {
+          if (Object.prototype.hasOwnProperty.call(argument, 'value')) {
+            argument.value = this.fieldizeCapturedValue(
+              argument.name ?? `argument_${argument.index}`,
+              argument.value,
+              'app'
+            );
+          }
+        }
+        if (
+          frame.thisValue !== undefined &&
+          Object.prototype.hasOwnProperty.call(frame.thisValue, 'value')
+        ) {
+          frame.thisValue.value = this.fieldizeCapturedValue('this', frame.thisValue.value, 'app');
+        }
       }
     }
 
@@ -979,6 +1094,12 @@ export class PackageBuilder {
       localVariablesCaptureLayer: parts.localVariablesCaptureLayer,
       localVariablesDegradation: parts.localVariablesDegradation,
       localVariablesFrameAlignment: frameAlignment ?? parts.localVariablesFrameAlignment,
+      localVariablesUnavailableReason: parts.localVariablesUnavailableReason,
+      localVariablesCache: {
+        operation: parts.localVariablesCacheOperation ?? 'unavailable',
+        capacity: this.config.maxCachedLocals,
+        ttlMs: LOCALS_CACHE_TTL_MS
+      },
       sourceMapResolution: parts.sourceMapResolution
     };
   }

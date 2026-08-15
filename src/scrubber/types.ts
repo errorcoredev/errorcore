@@ -11,13 +11,32 @@ export interface Meta {
   keys?: string[];
 }
 
-export type Blob =
+export type LegacyBlob =
   | { type: 'inline'; bytes: Uint8Array; nonce: Uint8Array }
   | { type: 'ref'; id: string; bytes: number };
 
-export type Field =
+export type FieldMetadataOnlyReason =
+  | 'credential_name'
+  | 'pii_detector'
+  | 'encryption_key_missing'
+  | 'spool_unavailable'
+  | 'max_field_bytes'
+  | 'sensitivity_check_failed'
+  | 'encode_failed'
+  | 'spool_failed';
+
+export type CanonicalBlob =
+  | { type: 'inline'; encoding: 'base64'; ciphertext: string; nonce: string }
+  | { type: 'ref'; id: string; bytes: number };
+
+export type LegacyField =
   | { mode: 'meta'; meta: Meta }
-  | { mode: 'encrypted'; meta: Meta; cipher: Blob };
+  | { mode: 'encrypted'; meta: Meta; cipher: LegacyBlob };
+
+export type Field =
+  | LegacyField
+  | { schemaVersion: 2; mode: 'meta'; meta: Meta; reason: FieldMetadataOnlyReason }
+  | { schemaVersion: 2; mode: 'encrypted'; meta: Meta; cipher: CanonicalBlob };
 
 export interface Policy {
   credentialNames: RegExp;

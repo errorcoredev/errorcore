@@ -559,7 +559,7 @@ describe('PackageBuilder', () => {
       usedAmbientEvents: false
     });
 
-    expect(pkg.schemaVersion).toBe('1.3.0');
+    expect(pkg.schemaVersion).toBe('1.4.0');
     expect(new Date(pkg.capturedAt).toISOString()).toBe(pkg.capturedAt);
     expect(pkg.error.properties.password).toBe('[REDACTED]');
     expectField(pkg.localVariables?.[0]?.locals.apiKey, 'meta');
@@ -593,7 +593,7 @@ describe('PackageBuilder', () => {
       modeAtCapture: 'forensic'
     }));
 
-    expect(pkg.schemaVersion).toBe('1.3.0');
+    expect(pkg.schemaVersion).toBe('1.4.0');
     expect(pkg.completeness.modeAtCapture).toBe('forensic');
   });
 
@@ -1102,7 +1102,7 @@ describe('PackageBuilder', () => {
     const result = await dispatcher.assemble(parts);
 
     expect(result.packageObject.request?.id).toBe('req-dispatch');
-    expect(result.packageObject.schemaVersion).toBe('1.3.0');
+    expect(result.packageObject.schemaVersion).toBe('1.4.0');
     const envelope = JSON.parse(result.payload);
     expect(envelope.v).toBe(2);
     expect(typeof envelope.eventId).toBe('string');

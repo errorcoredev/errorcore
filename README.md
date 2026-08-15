@@ -103,7 +103,9 @@ Webhook batches are signed with HMAC-SHA256 when `secret` is set. See [SETUP.md]
 
 ## What errorcore captures
 
-- Local variables and arguments at the moment an error is thrown
+- Captured local-variable previews at the moment an error is thrown. Explicit
+  `arguments[]` is emitted only by ErrorPackage `1.4.0` inspector captures that
+  can read the paused call frame; older packages do not contain exact arguments.
 - Ordered IO timeline events for inbound HTTP, outgoing HTTP/fetch, DNS/TCP, and DB queries
 - Request and response headers and bodies when enabled
 - DB query text and bind parameters when enabled

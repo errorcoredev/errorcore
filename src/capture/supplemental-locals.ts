@@ -52,16 +52,39 @@ export function mergeSupplementalLocals(
   supplemental: CapturedFrame[],
   maxFrames: number
 ): CapturedFrame[] | null {
+  const normalizedSupplemental = supplemental.map((frame, index) => ({
+    ...frame,
+    frameId: frame.frameId ??
+      `supplemental:${frame.functionName}:${frame.filePath}:${frame.lineNumber}:${frame.columnNumber}:${index}`,
+    causeOrigin: frame.causeOrigin ?? { kind: 'error' as const, depth: 0 },
+    scopes: frame.scopes ?? [{
+      type: 'local' as const,
+      bindings: Object.entries(frame.locals).map(([name, value]) => ({
+        name,
+        captured: {
+          value,
+          status: 'captured' as const,
+          captureSource: 'supplemental_instrumentation' as const,
+          origin: 'supplemental_local' as const,
+          correlationQuality: 'unmatched' as const,
+          causeOrigin: { kind: 'error' as const, depth: 0 }
+        }
+      })),
+      truncated: false,
+      omittedBindings: 0
+    }]
+  }));
+
   if (supplemental.length === 0) {
     return frames;
   }
 
   if (frames === null || frames.length === 0) {
-    return supplemental.slice(0, maxFrames);
+    return normalizedSupplemental.slice(0, maxFrames);
   }
 
   const mergedLocals: Record<string, unknown> = { ...frames[0].locals };
-  for (const frame of supplemental) {
+  for (const frame of normalizedSupplemental) {
     for (const [key, value] of Object.entries(frame.locals)) {
       if (!(key in mergedLocals)) {
         mergedLocals[key] = value;
@@ -72,7 +95,11 @@ export function mergeSupplementalLocals(
   return [
     {
       ...frames[0],
-      locals: mergedLocals
+      locals: mergedLocals,
+      scopes: [
+        ...(frames[0].scopes ?? []),
+        ...normalizedSupplemental.flatMap((frame) => frame.scopes ?? [])
+      ]
     },
     ...frames.slice(1, maxFrames)
   ];

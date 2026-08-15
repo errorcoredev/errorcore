@@ -82,7 +82,10 @@ describe('Field scrubber encoding matrix', () => {
 
     expect(field.mode).toBe('encrypted');
     if (field.mode !== 'encrypted') throw new Error('expected encrypted field');
+    expect('schemaVersion' in field && field.schemaVersion).toBe(2);
     expect(field.cipher.type).toBe('inline');
+    if (field.cipher.type !== 'inline') throw new Error('expected inline field');
+    expect('encoding' in field.cipher && field.cipher.encoding).toBe('base64');
     expect(JSON.parse(decryptFieldValue(field, { encryption }).toString('utf8'))).toEqual({
       ok: true
     });

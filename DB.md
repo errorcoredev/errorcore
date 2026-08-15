@@ -6,7 +6,7 @@ This document describes the data structures, their fields, relationships, and ho
 
 ## ErrorPackage
 
-The top-level structure sent to the collector when an error is captured. Schema version is `1.3.0` (receivers accept `1.1.0`, `1.2.0`, and `1.3.0`).
+The top-level structure sent to the collector when an error is captured. Schema version is `1.4.0` (receivers accept `1.1.0`, `1.2.0`, `1.3.0`, and `1.4.0`). Version `1.4.0` adds explicit argument/scope provenance, canonical Field v2 encoding, route provenance, and payload/field manifests; readers must select a version adapter rather than treating those fields as legacy locals.
 
 The Lambda-timeout watchdog emits a separate, smaller payload that uses a distinct `watchdogPayloadVersion` field (current value `'1.0.0'`) and is documented under "Watchdog payload" below. The two formats do not share a schema.
 

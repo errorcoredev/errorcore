@@ -297,7 +297,7 @@ describe('SDK composition', () => {
         };
       };
 
-      expect(pkg.schemaVersion).toBe('1.3.0');
+      expect(pkg.schemaVersion).toBe('1.4.0');
       expect(pkg.request).toMatchObject({
         method: 'POST',
         url: '/error/1000?token=%5BREDACTED%5D'
