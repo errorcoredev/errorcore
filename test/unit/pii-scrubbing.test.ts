@@ -375,9 +375,25 @@ describe('Scrubber', () => {
     expect(scrubbed.error.properties.hrtimeNs).toBe('[REDACTED]');
   });
 
-  it('preserves root SDK package arrays while truncating user-controlled arrays', () => {
+  it('preserves SDK package arrays while truncating user-controlled nested arrays', () => {
     const scrubber = new Scrubber(resolveConfig({}));
     const longArray = Array.from({ length: 25 }, (_value, index) => ({ index }));
+    const scopes = Array.from({ length: 25 }, (_value, index) => ({
+      bindings: index === 0 ? longArray : []
+    }));
+    const localVariables = Array.from({ length: 25 }, (_value, index) => index === 0
+      ? {
+          scopes,
+          arguments: longArray,
+          locals: {
+            items: longArray
+          }
+        }
+      : {
+          scopes: [],
+          arguments: [],
+          locals: {}
+        });
 
     const scrubbed = scrubber.scrubObject({
       ioTimeline: longArray,
@@ -385,7 +401,7 @@ describe('Scrubber', () => {
       stateReads: longArray,
       stateWrites: longArray,
       concurrentRequests: longArray,
-      localVariables: longArray,
+      localVariables,
       error: {
         properties: {
           items: longArray
@@ -397,7 +413,11 @@ describe('Scrubber', () => {
       stateReads: unknown;
       stateWrites: unknown;
       concurrentRequests: unknown;
-      localVariables: unknown;
+      localVariables: Array<{
+        scopes: Array<{ bindings: unknown }>;
+        arguments: unknown;
+        locals: { items: unknown };
+      }>;
       error: {
         properties: {
           items: unknown;
@@ -412,6 +432,18 @@ describe('Scrubber', () => {
     expect(Array.isArray(scrubbed.concurrentRequests)).toBe(true);
     expect(Array.isArray(scrubbed.localVariables)).toBe(true);
     expect(scrubbed.ioTimeline).toHaveLength(25);
+    expect(scrubbed.localVariables).toHaveLength(25);
+    expect(Array.isArray(scrubbed.localVariables[0]?.scopes)).toBe(true);
+    expect(scrubbed.localVariables[0]?.scopes).toHaveLength(25);
+    expect(Array.isArray(scrubbed.localVariables[0]?.scopes[0]?.bindings)).toBe(true);
+    expect(scrubbed.localVariables[0]?.scopes[0]?.bindings).toHaveLength(25);
+    expect(Array.isArray(scrubbed.localVariables[0]?.arguments)).toBe(true);
+    expect(scrubbed.localVariables[0]?.arguments).toHaveLength(25);
+    expect(scrubbed.localVariables[0]?.locals.items).toEqual({
+      _items: expect.any(Array),
+      _truncated: true,
+      _originalLength: 25
+    });
     expect(scrubbed.error.properties.items).toEqual({
       _items: expect.any(Array),
       _truncated: true,

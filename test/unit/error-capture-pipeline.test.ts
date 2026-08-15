@@ -646,6 +646,67 @@ describe('PackageBuilder', () => {
     expect(pkg.completeness.concurrentRequestsCaptured).toBe(true);
   });
 
+  it('preserves and fieldizes more than 20 scope bindings and arguments', () => {
+    const config = resolveConfig({});
+    const builder = new PackageBuilder({
+      scrubber: new Scrubber(config),
+      config
+    });
+    const bindings = Array.from({ length: 25 }, (_value, index) => ({
+      name: `binding_${index}`,
+      captured: {
+        value: `binding-value-${index}`,
+        status: 'captured' as const,
+        captureSource: 'v8_inspector' as const,
+        origin: 'scope' as const
+      }
+    }));
+    const capturedArguments = Array.from({ length: 25 }, (_value, index) => ({
+      index,
+      name: `argument_${index}`,
+      nameStatus: 'matched_local_binding' as const,
+      value: `argument-value-${index}`,
+      status: 'captured' as const,
+      captureSource: 'v8_inspector' as const,
+      origin: 'argument' as const
+    }));
+
+    const pkg = builder.build(createPackageParts(undefined, {
+      error: {
+        type: 'Error',
+        message: 'boom',
+        stack: 'Error: boom\n    at handler (/app/src/handler.js:1:1)',
+        properties: {}
+      },
+      localVariables: [{
+        functionName: 'handler',
+        filePath: '/app/src/handler.js',
+        lineNumber: 1,
+        columnNumber: 1,
+        scopes: [{
+          type: 'local',
+          bindings,
+          truncated: false,
+          omittedBindings: 0
+        }],
+        arguments: capturedArguments,
+        locals: {}
+      }]
+    }));
+
+    const frame = pkg.localVariables?.[0];
+    const scope = frame?.scopes?.[0];
+    expect(Array.isArray(frame?.scopes)).toBe(true);
+    expect(Array.isArray(scope?.bindings)).toBe(true);
+    expect(scope?.bindings).toHaveLength(25);
+    expect(Array.isArray(frame?.arguments)).toBe(true);
+    expect(frame?.arguments).toHaveLength(25);
+    expectField(scope?.bindings[0]?.captured.value, 'meta');
+    expectField(scope?.bindings[24]?.captured.value, 'meta');
+    expectField(frame?.arguments?.[0]?.value, 'meta');
+    expectField(frame?.arguments?.[24]?.value, 'meta');
+  });
+
   it('fieldizes captured values while leaving telemetry primitive', () => {
     const config = resolveConfig({
       encryptionKey: FIELD_KEY,

@@ -139,8 +139,23 @@ function isArrayIndexPathSegment(value: string | undefined): boolean {
   return typeof value === 'string' && /^\d+$/.test(value);
 }
 
-function isRootSdkPackageArrayPath(path: string[]): boolean {
-  return path.length === 1 && ROOT_SDK_PACKAGE_ARRAY_KEYS.has(path[0] as string);
+function isSdkPackageArrayPath(path: string[]): boolean {
+  if (path.length === 1 && ROOT_SDK_PACKAGE_ARRAY_KEYS.has(path[0] as string)) {
+    return true;
+  }
+
+  if (path[0] !== 'localVariables' || !isArrayIndexPathSegment(path[1])) {
+    return false;
+  }
+
+  if (path.length === 3) {
+    return path[2] === 'scopes' || path[2] === 'arguments';
+  }
+
+  return path.length === 5 &&
+    path[2] === 'scopes' &&
+    isArrayIndexPathSegment(path[3]) &&
+    path[4] === 'bindings';
 }
 
 function isSdkInfrastructurePath(path: string[]): boolean {
@@ -798,7 +813,7 @@ export class Scrubber {
 
       visited.add(value);
       try {
-        const preserveFullArray = isRootSdkPackageArrayPath(path);
+        const preserveFullArray = isSdkPackageArrayPath(path);
         const itemCount = preserveFullArray
           ? value.length
           : Math.min(value.length, limits.maxArrayItems);
