@@ -127,7 +127,7 @@
       "operation": "submitOrder",
       "instrumentation": {
         "name": "errorcore/nextjs",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "lifecyclePhase": "error"
       }
     }
@@ -151,7 +151,7 @@
     "eventLoopLagMs": 0,
     "processStartAnchor": { "wallClockMs": 1786752000000, "hrtimeNs": "0" }
   },
-  "codeVersion": { "packageVersion": "0.4.0" },
+  "codeVersion": { "packageVersion": "0.5.0" },
   "environment": {},
   "fieldManifest": {
     "schemaVersion": 1,

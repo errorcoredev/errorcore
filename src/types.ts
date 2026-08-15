@@ -388,6 +388,7 @@ export interface PayloadManifest {
 export interface IOEventSerialized {
   seq: number;
   hrtimeNs: string;
+  phase: IOEventPhase;
   type: IOEventSlot['type'];
   direction: IOEventSlot['direction'];
   target: string;

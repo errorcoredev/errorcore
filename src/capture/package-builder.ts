@@ -60,6 +60,7 @@ function serializeIOEvent(event: IOEventSlot, scrubber: PiiScrubber): IOEventSer
   return {
     seq: event.seq,
     hrtimeNs: event.hrtimeNs.toString(),
+    phase: event.phase,
     type: event.type,
     direction: event.direction,
     target: event.target,
@@ -746,11 +747,11 @@ export class PackageBuilder {
 
     this.normalizePackageArrays(scrubbedPackage);
     this.fieldizePackage(scrubbedPackage);
+    scrubbedPackage.payloadManifest = buildPayloadManifest(scrubbedPackage.ioTimeline);
     scrubbedPackage.fieldManifest = buildFieldManifest(scrubbedPackage);
     scrubbedPackage.completeness = this.computeCompleteness(parts, false, scrubbedPackage, frameAlignment);
     this.shedIfNeeded(scrubbedPackage, parts, frameAlignment);
     this.enforceHardCap(scrubbedPackage, parts, frameAlignment);
-    scrubbedPackage.payloadManifest = buildPayloadManifest(scrubbedPackage.ioTimeline);
     scrubbedPackage.fieldManifest = buildFieldManifest(scrubbedPackage);
 
     return scrubbedPackage;
