@@ -14,7 +14,7 @@ const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'errorcore-package-'));
 const packDir = path.join(tempRoot, 'pack');
 const projectDir = path.join(tempRoot, 'project');
 const strictLicenseSha256 = 'e2361f52ad5be22b937a6e983c824a534c5cffa454b6c34af2f8ce0c2cdf7c1a';
-const strictReleaseVersion = '0.4.0';
+const strictReleaseVersion = '0.5.0';
 
 function childEnv() {
   const env = { ...process.env };

@@ -940,13 +940,11 @@ describe('PackageBuilder', () => {
   });
 
   it('progressively sheds oversized payloads to stay under the UTF-8 byte size limit', () => {
-    // Bumped again in v1.2.0 to accommodate structured error-origin metadata.
-    // package fields (errorEventSeq, errorEventHrtimeNs, eventClockRange,
-    // hrtimeNs on each IO event, seq on each state read). The test still
+    // The cap must exceed the irreducible v1.4 metadata. The test still
     // demonstrates that the shedding pipeline brings an oversized package
-    // under any configured cap; only the absolute byte count moved.
+    // under the configured cap by removing optional payload data.
     const config = resolveConfig({
-      serialization: { maxTotalPackageSize: 1400 }
+      serialization: { maxTotalPackageSize: 2000 }
     });
     const builder = new PackageBuilder({
       scrubber: new Scrubber(config),
@@ -1534,7 +1532,7 @@ describe('ErrorCapturer', () => {
     expect(pkg?.error.properties.code).toBe('E_BANG');
     expect(transport.send).toHaveBeenCalledTimes(1);
     expect(JSON.parse(decrypted)).toMatchObject({
-      schemaVersion: '1.3.0',
+      schemaVersion: '1.4.0',
       completeness: {
         encrypted: true
       }

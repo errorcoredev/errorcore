@@ -960,6 +960,7 @@ describe('InspectorManager', () => {
       });
 
       manager.ensureDebuggerActive();
+      nowSpy.mockReturnValue(1000);
       // Same requestId, same error name/message/frameCount but DIFFERENT function names
       // → same dropped-hash key (name+message+frameCount) but different structuralHash
       // → findByIdentity misses (exact match fails due to hash diff)

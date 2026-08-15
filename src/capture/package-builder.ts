@@ -916,6 +916,7 @@ export class PackageBuilder {
           }
         }
         if (
+          frame.thisValue !== null &&
           frame.thisValue !== undefined &&
           Object.prototype.hasOwnProperty.call(frame.thisValue, 'value')
         ) {
