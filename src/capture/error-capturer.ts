@@ -835,6 +835,7 @@ export class ErrorCapturer {
 
       return {
         frames: result.frames,
+        missReason: result.missReason,
         captureLayer: result.captureLayer,
         degradation: result.degradation
       };
