@@ -167,7 +167,10 @@ describe('strict benchmark release gate', () => {
     const input = passingInput();
     input.perfResults.aggregates[0].skipped = 1;
     input.perfResults.aggregates[0].completed = 1;
-    input.perfResults.aggregates[0].quarantined = true;
+    const errorcoreAggregate = input.perfResults.aggregates.find((aggregate) =>
+      aggregate.sdk === 'errorcore' && aggregate.endpoint === 'healthz'
+    );
+    errorcoreAggregate.quarantined = true;
     input.perfResults.sanity.push({
       sdk: 'errorcore',
       endpoint: 'healthz',
@@ -183,6 +186,34 @@ describe('strict benchmark release gate', () => {
     assert.equal(codes.has('PERF_AGGREGATE_QUARANTINED'), true);
     assert.equal(codes.has('PERF_SANITY_QUARANTINED'), true);
     assert.equal(codes.has('PERF_AGGREGATE_MISSING'), true);
+  });
+
+  it('keeps comparator performance quarantines diagnostic while gating Errorcore regressions', () => {
+    const comparator = passingInput();
+    const sentryAggregate = comparator.perfResults.aggregates.find((aggregate) =>
+      aggregate.sdk === 'sentry' && aggregate.endpoint === 'healthz'
+    );
+    sentryAggregate.quarantined = true;
+    sentryAggregate.reason = 'comparator no-op throughput sanity failed';
+    comparator.perfResults.sanity.push({
+      sdk: 'sentry',
+      endpoint: 'healthz',
+      quarantined: true,
+      reason: sentryAggregate.reason
+    });
+
+    const errorcore = passingInput();
+    const errorcoreAggregate = errorcore.perfResults.aggregates.find((aggregate) =>
+      aggregate.sdk === 'errorcore' && aggregate.endpoint === 'healthz'
+    );
+    errorcoreAggregate.quarantined = true;
+    errorcoreAggregate.reason = 'Errorcore no-op throughput sanity failed';
+
+    assert.equal(evaluateStrictBenchmarkRelease(comparator).ok, true);
+    assert.equal(
+      errorCodes(evaluateStrictBenchmarkRelease(errorcore)).has('PERF_AGGREGATE_QUARANTINED'),
+      true
+    );
   });
 
   it('rejects missing, lost, and timed-out ErrorCore payload delivery', () => {
@@ -212,6 +243,22 @@ describe('strict benchmark release gate', () => {
     const result = evaluateStrictBenchmarkRelease(input);
 
     assert.equal(result.ok, true);
+  });
+
+  it('does not require the process-handler-only S3 capture in fast mode', () => {
+    const input = passingInput('fast');
+    input.expectedScenarios[0].id = 'S3';
+    input.scenarioResults[0].scenarioId = 'S3';
+    input.scores[0].scenarioId = 'S3';
+    const errorcore = input.scenarioResults[0].variants.find((variant) => variant.sdk === 'errorcore');
+    errorcore.payloads = [];
+    errorcore.delivery = { delivered: 0, lost: 1, waitTimedOut: true };
+    errorcore.payloadWait = { timedOut: true, error: 'no process handler in fast mode' };
+    for (const dimension of Object.values(input.scores[0].dimensions)) {
+      dimension.score = 0;
+    }
+
+    assert.equal(evaluateStrictBenchmarkRelease(input).ok, true);
   });
 
   it('requires full ErrorCore D1, D2, D10, and D11 correctness credit', () => {

@@ -9,6 +9,11 @@ const DEFAULT_PERF_ENDPOINTS = Object.freeze([
 // and must retain a timeline in safe mode.
 const REQUEST_DERIVED_SCENARIOS_WITHOUT_D4 = new Set(['S6']);
 
+// Fast mode deliberately has no standing process handlers. S3 exists to
+// exercise unhandled-rejection auto-capture, so it remains diagnostic in fast
+// runs but cannot be a required Errorcore payload/correctness gate there.
+const PROCESS_HANDLER_ONLY_SCENARIOS = new Set(['S3']);
+
 function asArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -170,7 +175,9 @@ export function evaluateStrictBenchmarkRelease({
         details
       );
     }
-    if (repetition?.quarantined === true) {
+    // Comparator performance remains useful diagnostic evidence, but only an
+    // Errorcore regression can veto an Errorcore release.
+    if (repetition?.quarantined === true && repetition?.sdk === 'errorcore') {
       addError(
         'PERF_REPETITION_QUARANTINED',
         `performance repetition ${key}#${String(repetition?.repetition)} was quarantined: ${repetition?.reason ?? 'no reason recorded'}`,
@@ -193,7 +200,7 @@ export function evaluateStrictBenchmarkRelease({
         details
       );
     }
-    if (aggregate?.quarantined === true) {
+    if (aggregate?.quarantined === true && aggregate?.sdk === 'errorcore') {
       addError(
         'PERF_AGGREGATE_QUARANTINED',
         `performance aggregate ${key} was quarantined: ${aggregate?.reason ?? 'no reason recorded'}`,
@@ -214,7 +221,7 @@ export function evaluateStrictBenchmarkRelease({
   }
 
   for (const sanityResult of sanity) {
-    if (sanityResult?.quarantined !== true) continue;
+    if (sanityResult?.quarantined !== true || sanityResult?.sdk !== 'errorcore') continue;
     addError(
       'PERF_SANITY_QUARANTINED',
       `performance sanity result ${perfKey(sanityResult?.sdk, sanityResult?.endpoint)} was quarantined: ${sanityResult?.reason ?? 'no reason recorded'}`,
@@ -275,6 +282,9 @@ export function evaluateStrictBenchmarkRelease({
     }
 
     const expectedCount = Number(expectedScenario?.expected?.expectedPayloadCount ?? 1);
+    const requireErrorcoreCapture = !(
+      mode === 'fast' && PROCESS_HANDLER_ONLY_SCENARIOS.has(String(scenarioId))
+    );
     const variantBySdk = new Map(asArray(scenario?.variants).map((variant) => [variant?.sdk, variant]));
     for (const sdk of scenarioSdks) {
       const variant = variantBySdk.get(sdk);
@@ -292,6 +302,7 @@ export function evaluateStrictBenchmarkRelease({
       // comparator limitation (for example S9 retry behavior) cannot veto the
       // ErrorCore release.
       if (sdk !== 'errorcore') continue;
+      if (!requireErrorcoreCapture) continue;
 
       const payloadCount = countPayloads(variant.payloads);
       const delivered = Number(variant?.delivery?.delivered ?? payloadCount);
@@ -318,6 +329,8 @@ export function evaluateStrictBenchmarkRelease({
         );
       }
     }
+
+    if (!requireErrorcoreCapture) continue;
 
     const errorcoreScore = scoreByScenarioSdk.get(`${String(scenarioId)}:errorcore`);
     if (errorcoreScore === undefined) {
