@@ -79,7 +79,13 @@ function legacyMaterialForKey(key, macKey) {
 }
 
 function aadFor(envelope, keyId) {
-  return Buffer.from(`1|${keyId}|${envelope.sdk?.version ?? 'unknown'}|${envelope.eventId}`, 'utf8');
+  const sdkVersion = envelope.sdk?.version ?? 'unknown';
+  return envelope.v === 2
+    ? Buffer.from(
+        `2|${keyId}|${sdkVersion}|${envelope.eventId}|${envelope.kind}|${envelope.blobId ?? ''}`,
+        'utf8'
+      )
+    : Buffer.from(`1|${keyId}|${sdkVersion}|${envelope.eventId}`, 'utf8');
 }
 
 function verifyHmac(material, envelope, iv, ciphertext, authTag, expectedHmac) {
@@ -102,7 +108,7 @@ function decryptWithMaterial(material, envelope, iv, ciphertext, authTag) {
 }
 
 export function decryptErrorcoreEnvelope(envelope, options) {
-  if (envelope?.v !== 1) {
+  if (envelope?.v !== 1 && envelope?.v !== 2) {
     throw new Error(`unsupported envelope version: ${String(envelope?.v)}`);
   }
   if (envelope.iv === 'unencrypted' && envelope.authTag === 'unencrypted') {

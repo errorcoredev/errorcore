@@ -1,6 +1,6 @@
 {
   "name": "errorcore",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Source Available, publicly auditable error monitoring SDK for Node.js with I/O context and request metadata",
   "type": "commonjs",
   "main": "dist/index.js",

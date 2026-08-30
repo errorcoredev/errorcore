@@ -14,7 +14,7 @@ const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'errorcore-package-'));
 const packDir = path.join(tempRoot, 'pack');
 const projectDir = path.join(tempRoot, 'project');
 const strictLicenseSha256 = 'e2361f52ad5be22b937a6e983c824a534c5cffa454b6c34af2f8ce0c2cdf7c1a';
-const strictReleaseVersion = '0.5.0';
+const strictReleaseVersion = '0.5.1';
 
 function childEnv() {
   const env = { ...process.env };
@@ -187,7 +187,9 @@ function verifyLicensingSources() {
   );
 
   const changelog = readUtf8('CHANGELOG.md');
-  requireText(changelog, '## Unreleased - 0.4.0', 'CHANGELOG.md');
+  requireText(changelog, '## 0.5.1 - 2026-08-30', 'CHANGELOG.md');
+  requireText(changelog, 'No public API, configuration, schema, or wire-format changes', 'CHANGELOG.md');
+  requireText(changelog, '## 0.5.0 - 2026-08-15', 'CHANGELOG.md');
   requireText(changelog, 'last repository version under PolyForm', 'CHANGELOG.md');
   requireText(changelog, 'last npm-published version under that', 'CHANGELOG.md');
 }

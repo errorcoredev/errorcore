@@ -146,25 +146,31 @@ function bodyStats(body) {
   };
 }
 
-function buildFastRequestContext(config, context = {}) {
+export function buildErrorcoreCaptureOptions(config, context = {}, captureMode = 'fast') {
+  if (captureMode !== 'safe' && captureMode !== 'fast') {
+    return undefined;
+  }
+
   const request = context.request ?? {};
   const headers = normalizeHeaders(request.headers ?? context.headers ?? {});
   const { bodyLength, bodyHash } = bodyStats(request.body ?? context.body);
 
   return {
-    method: request.method ?? context.method ?? 'GET',
-    url:
-      request.url ??
-      request.path ??
-      context.url ??
-      context.path ??
-      `/benchmark/${context.scenarioId ?? config.scenarioId ?? 'unknown'}`,
-    headers,
-    statusCode: request.statusCode ?? context.statusCode ?? null,
-    bodyLength,
-    bodyHash,
-    traceparent: request.traceparent ?? context.traceparent ?? getHeader(headers, 'traceparent'),
-    tracestate: request.tracestate ?? context.tracestate ?? getHeader(headers, 'tracestate')
+    request: {
+      method: request.method ?? context.method ?? 'GET',
+      url:
+        request.url ??
+        request.path ??
+        context.url ??
+        context.path ??
+        `/benchmark/${context.scenarioId ?? config.scenarioId ?? 'unknown'}`,
+      headers,
+      statusCode: request.statusCode ?? context.statusCode ?? null,
+      bodyLength,
+      bodyHash,
+      traceparent: request.traceparent ?? context.traceparent ?? getHeader(headers, 'traceparent'),
+      tracestate: request.tracestate ?? context.tracestate ?? getHeader(headers, 'tracestate')
+    }
   };
 }
 
@@ -262,10 +268,10 @@ async function createErrorcoreAdapter(config, logger) {
       error.benchmarkService = config.serviceName;
       error.benchmarkFramework = config.framework;
       const activeCaptureMode = instance.getCaptureMode?.() ?? initialCaptureMode;
-      const options = activeCaptureMode === 'fast'
-        ? { request: buildFastRequestContext(config, context) }
-        : undefined;
-      instance.captureError(error, options);
+      instance.captureError(
+        error,
+        buildErrorcoreCaptureOptions(config, context, activeCaptureMode)
+      );
     },
     getTraceHeaders() {
       return errorcore.getTraceHeaders?.() ?? null;
