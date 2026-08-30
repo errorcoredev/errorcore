@@ -11,7 +11,7 @@
     "npmIntegrity": "sha512-ChjKFVBF2CgepDXfMBkbEdcFUniJNN8py5V+tinaB8+vpJbr/fD1+VLFhkruSEn3jOafXrc1XJe9WHtsu9ht0g=="
   },
   "errorcore": {
-    "version": "0.3.0"
+    "version": "0.5.1"
   },
   "targets": [
     {

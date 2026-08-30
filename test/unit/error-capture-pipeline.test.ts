@@ -1516,21 +1516,49 @@ describe('ErrorCapturer', () => {
     const inspector = {
       getLocals: vi.fn(() => [
         {
-          functionName: 'handler',
-          filePath: '/app/src/handler.js',
+          functionName: 'RedisCommandsQueue._execute',
+          filePath: '/app/node_modules/@redis/client/dist/lib/client/commands-queue.js',
+          lineNumber: 42,
+          columnNumber: 1,
+          callFrameIndex: 0,
+          locals: {
+            token: '[REDACTED]',
+            password: '[REDACTED]',
+            slotNumber: 42,
+            slot: 'cache-slot'
+          }
+        },
+        {
+          functionName: 'cache.get',
+          filePath: '/app/src/cache.js',
           lineNumber: 10,
           columnNumber: 1,
-          locals: { password: 'secret', value: 1 }
+          callFrameIndex: 1,
+          locals: { value: 1 }
         }
       ]),
       getLocalsWithDiagnostics: vi.fn(() => ({
         frames: [
           {
-            functionName: 'handler',
-            filePath: '/app/src/handler.js',
+            functionName: 'RedisCommandsQueue._execute',
+            filePath: '/app/node_modules/@redis/client/dist/lib/client/commands-queue.js',
+            lineNumber: 42,
+            columnNumber: 1,
+            callFrameIndex: 0,
+            locals: {
+              token: '[REDACTED]',
+              password: '[REDACTED]',
+              slotNumber: 42,
+              slot: 'cache-slot'
+            }
+          },
+          {
+            functionName: 'cache.get',
+            filePath: '/app/src/cache.js',
             lineNumber: 10,
             columnNumber: 1,
-            locals: { password: 'secret', value: 1 }
+            callFrameIndex: 1,
+            locals: { value: 1 }
           }
         ],
         missReason: null
@@ -1569,6 +1597,11 @@ describe('ErrorCapturer', () => {
     );
 
     const error = new Error('boom');
+    error.stack = [
+      'Error: boom',
+      '    at RedisCommandsQueue._execute (/app/node_modules/@redis/client/dist/lib/client/commands-queue.js:42:1)',
+      '    at cache.get (/app/src/cache.js:10:1)'
+    ].join('\n');
     (error as Error & { code?: string }).code = 'E_BANG';
 
     const pkg = als.runWithContext(context, () => capturer.capture(error));
@@ -1589,11 +1622,40 @@ describe('ErrorCapturer', () => {
     expect(pkg?.request?.id).toBe('req-err');
     expect(pkg?.ioTimeline).toHaveLength(1);
     expect(pkg?.completeness.usedAmbientEvents).toBe(false);
+    expectField(pkg?.localVariables?.[0]?.locals.token, 'meta');
     expectField(pkg?.localVariables?.[0]?.locals.password, 'meta');
+    const slotNumber = expectField(pkg?.localVariables?.[0]?.locals.slotNumber, 'encrypted');
+    const slot = expectField(pkg?.localVariables?.[0]?.locals.slot, 'encrypted');
+    expect(JSON.parse(decryptFieldValue(slotNumber, { encryption }).toString('utf8'))).toBe(42);
+    expect(JSON.parse(decryptFieldValue(slot, { encryption }).toString('utf8'))).toBe('cache-slot');
+    expect(pkg?.errorOrigin).toMatchObject({
+      origin: 'external',
+      package: '@redis/client',
+      appBoundaryFrame: {
+        functionName: 'cache.get',
+        filePath: '/app/src/cache.js'
+      }
+    });
     expect(pkg?.error.properties.code).toBe('E_BANG');
     expect(transport.send).toHaveBeenCalledTimes(1);
     expect(JSON.parse(decrypted)).toMatchObject({
       schemaVersion: '1.4.0',
+      errorOrigin: {
+        origin: 'external',
+        package: '@redis/client'
+      },
+      localVariables: [
+        {
+          callFrameIndex: 0,
+          functionName: 'RedisCommandsQueue._execute',
+          filePath: '/app/node_modules/@redis/client/dist/lib/client/commands-queue.js'
+        },
+        {
+          callFrameIndex: 1,
+          functionName: 'cache.get',
+          filePath: '/app/src/cache.js'
+        }
+      ],
       completeness: {
         encrypted: true
       }

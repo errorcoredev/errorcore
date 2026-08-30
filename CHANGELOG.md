@@ -5,7 +5,28 @@ All notable changes to this project are documented here. The format is based on
 Semantic Versioning from 1.0.0 onward; before then, breaking changes may ship in
 any minor release and are called out under a **Breaking** heading.
 
-## Unreleased - 0.4.0
+## 0.5.1 - 2026-08-30
+
+### Fixed
+
+- **Bounded library-frame locals:** local-variable capture now uses one private
+  frame-selection policy for explicit V8 URLs and index-aligned reconstructed
+  description URLs. Captures still require application-frame evidence and
+  reserve space for the nearest application frame; shallow mode may retain one
+  origin-adjacent dependency frame, while deep mode may retain three. Excess
+  dependency frames, Node internals, Errorcore frames, and framework frames
+  after the application boundary are omitted within the existing
+  `maxLocalsFrames` budget. With a one-frame budget, only the nearest
+  application frame is retained.
+- Dependency-frame locals pass through the existing binding-name redaction,
+  field encryption, serialization, cache, size-limit, correlation, and
+  adaptive-guard paths. Library-only caught exceptions and noisy framework
+  exceptions without valid application evidence remain excluded.
+- **No public API, configuration, schema, or wire-format changes.** Stack
+  ownership, fingerprinting, object-expansion depth, and the ErrorPackage
+  representation are unchanged.
+
+## 0.5.0 - 2026-08-15
 
 ### Changed
 

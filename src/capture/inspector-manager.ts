@@ -412,6 +412,20 @@ interface DescriptionStackFrame {
   columnNumber: number;
 }
 
+type InspectorFrameKind = 'app' | 'library' | 'excluded';
+
+interface ResolvedInspectorFrame {
+  frame: CallFrame;
+  callFrameIndex: number;
+  renderedFrame?: DescriptionStackFrame;
+  kind: InspectorFrameKind;
+}
+
+interface InspectorFrameSelection {
+  frames: ResolvedInspectorFrame[];
+  missReason?: 'no_app_frames' | 'non_app_empty_url_exception';
+}
+
 interface InspectorManagerDeps {
   getRequestId?: () => string | undefined;
   eventClock?: EventClock;
@@ -507,6 +521,8 @@ export class InspectorManager {
 
   private captureLocalVariables: boolean;
 
+  private localVariablesMode: ResolvedConfig['localVariablesMode'];
+
   private maxLocalsObjectProperties: number;
 
   private readonly config: ResolvedConfig;
@@ -556,6 +572,7 @@ export class InspectorManager {
     this.maxLocalsFrames = config.maxLocalsFrames;
     this.maxLocalsObjectProperties = config.modeState.maxLocalsObjectProperties;
     this.captureLocalVariables = config.captureLocalVariables;
+    this.localVariablesMode = config.localVariablesMode;
     this.localsGuard = config.localsGuard;
     this.getRequestId = deps.getRequestId ?? (() => undefined);
     // EventClock is optional for test ergonomics; the SDK composition root
@@ -1024,6 +1041,7 @@ export class InspectorManager {
   ): void {
     this.captureLocalVariables =
       next.captureLocalVariables && next.localVariablesMode !== 'none';
+    this.localVariablesMode = next.localVariablesMode;
     this.maxCollectionsPerSecond = next.maxLocalsCollectionsPerSecond;
     this.maxCachedLocals = next.maxCachedLocals;
     this.ringBuffer.resize(next.maxCachedLocals);
@@ -1406,6 +1424,128 @@ export class InspectorManager {
     return normalized.startsWith('node:') || normalized.includes('node:internal');
   }
 
+  private classifyInspectorFrame(filePath: string): InspectorFrameKind {
+    const normalized = filePath.replace(/\\/g, '/');
+    if (
+      normalized === '' ||
+      normalized.startsWith('node:') ||
+      normalized.includes('node:internal') ||
+      /(?:^|\/)node_modules\/errorcore(?:\/|$)/.test(normalized) ||
+      (EXCLUDE_SDK_ROOT && normalized.startsWith(`${SDK_ROOT}/`))
+    ) {
+      return 'excluded';
+    }
+
+    if (normalized.includes('/node_modules/')) {
+      return 'library';
+    }
+
+    return this._isAppFrame(filePath) ? 'app' : 'excluded';
+  }
+
+  private selectInspectorFrames(params: PausedEventParams): InspectorFrameSelection {
+    const descriptionFrames = this.extractDescriptionStackFrames(params.data?.description);
+    const hasWebpackContext = params.callFrames.some(
+      (frame) => frame.url !== undefined && frame.url.startsWith('webpack-internal://')
+    );
+
+    const resolvedFrames = params.callFrames.map((frame, callFrameIndex): ResolvedInspectorFrame => {
+      const explicitUrl = frame.url !== undefined && frame.url.trim() !== '';
+      const hasLocalScope = frame.scopeChain.some((scope) => scope.type === 'local');
+      const renderedFrame = explicitUrl ? undefined : descriptionFrames[callFrameIndex];
+      const filePath = explicitUrl ? frame.url! : renderedFrame?.filePath ?? '';
+      let kind = explicitUrl || hasLocalScope
+        ? this.classifyInspectorFrame(filePath)
+        : 'excluded';
+
+      // Preserve the established webpack safeguard for builds where V8 leaves
+      // otherwise-capturable frame URLs empty and the description is clipped.
+      if (!explicitUrl && renderedFrame === undefined && hasLocalScope && hasWebpackContext) {
+        kind = 'app';
+      }
+
+      return {
+        frame,
+        callFrameIndex,
+        ...(renderedFrame === undefined ? {} : { renderedFrame }),
+        kind
+      };
+    });
+
+    let nearestApp = resolvedFrames.find((entry) => entry.kind === 'app');
+    if (nearestApp === undefined) {
+      const emptyUrlLocalFrames = resolvedFrames.filter(
+        ({ frame }) =>
+          (frame.url === undefined || frame.url.trim() === '') &&
+          frame.scopeChain.some((scope) => scope.type === 'local')
+      );
+      const bundledAppFrame = descriptionFrames.find((frame) =>
+        this.isBundledAppDescriptionFrame(frame)
+      );
+      const externalDriverOrigin = this.isInstrumentedExternalDescriptionFrame(
+        descriptionFrames[0]
+      );
+      const nonNodeInternalOrigin = descriptionFrames[0] !== undefined &&
+        !this.isNodeInternalDescriptionFrame(descriptionFrames[0]);
+      const appEvidenceFrame = bundledAppFrame ??
+        ((externalDriverOrigin || nonNodeInternalOrigin)
+          ? descriptionFrames.find((frame) => this.isAppDescriptionFrame(frame))
+          : undefined);
+
+      if (
+        appEvidenceFrame !== undefined &&
+        emptyUrlLocalFrames.length > 0 &&
+        (
+          emptyUrlLocalFrames.length > 1 ||
+          externalDriverOrigin ||
+          nonNodeInternalOrigin
+        )
+      ) {
+        nearestApp = emptyUrlLocalFrames[0];
+        nearestApp.kind = 'app';
+        nearestApp.renderedFrame = appEvidenceFrame;
+      } else {
+        return {
+          frames: [],
+          missReason: emptyUrlLocalFrames.length > 0
+            ? 'non_app_empty_url_exception'
+            : 'no_app_frames'
+        };
+      }
+    }
+
+    const frameBudget = Math.max(1, this.maxLocalsFrames);
+    if (frameBudget === 1) {
+      return { frames: [nearestApp] };
+    }
+
+    const libraryLimit = this.localVariablesMode === 'deep'
+      ? 3
+      : this.localVariablesMode === 'shallow'
+        ? 1
+        : 0;
+    const libraryFrames = resolvedFrames
+      .filter(
+        (entry) =>
+          entry.callFrameIndex < nearestApp.callFrameIndex &&
+          entry.kind === 'library'
+      )
+      .slice(0, Math.min(libraryLimit, frameBudget - 1));
+    const selected = [...libraryFrames, nearestApp];
+
+    for (const entry of resolvedFrames) {
+      if (selected.length >= frameBudget) {
+        break;
+      }
+      if (entry.callFrameIndex > nearestApp.callFrameIndex && entry.kind === 'app') {
+        selected.push(entry);
+      }
+    }
+
+    selected.sort((left, right) => left.callFrameIndex - right.callFrameIndex);
+    return { frames: selected };
+  }
+
   private _onPaused(params: PausedEventParams): void {
     // Stamp at entry - module 20 contract. Fires before any filtering, gating,
     // or async I/O. Pause events that don't produce a ring-buffer entry still
@@ -1434,122 +1574,10 @@ export class InspectorManager {
 
         this.ringBuffer.pruneExpired();
 
-        // Frame selection: we want the engineer to see BOTH the throw site
-        // (often a library) and at least one app frame (where their own
-        // variables live). The previous behavior took only app frames and
-        // dropped library context entirely; if no app frames existed in
-        // the deepest N frames the capture had no user-relevant context.
-        const appFrameIndices: number[] = [];
-        for (let i = 0; i < params.callFrames.length; i += 1) {
-          if (this._isAppFrame(params.callFrames[i].url)) {
-            appFrameIndices.push(i);
-          }
-        }
-
-        let appFrames: typeof params.callFrames;
-        const renderedFrameByCallFrame = new Map<CallFrame, DescriptionStackFrame>();
-        if (appFrameIndices.length > 0) {
-          const indicesToKeep = new Set<number>();
-          // Always include the throw-site frame (deepest), even if it's a
-          // library frame, so engineers see "the error originated in pg
-          // at this line" alongside their own context.
-          indicesToKeep.add(0);
-          // Always include the deepest app frame so the engineer's variables
-          // are present, even if it's beyond maxLocalsFrames.
-          indicesToKeep.add(appFrameIndices[0]);
-          // Then fill remaining budget with additional app frames.
-          for (let i = 1; i < appFrameIndices.length && indicesToKeep.size < this.maxLocalsFrames; i += 1) {
-            indicesToKeep.add(appFrameIndices[i]);
-          }
-          appFrames = Array.from(indicesToKeep)
-            .sort((a, b) => a - b)
-            .map((idx) => params.callFrames[idx]);
-        } else {
-          appFrames = [];
-        }
-
-        if (appFrames.length === 0) {
-          // Fallback 1: webpack-internal:// hints present but the top frames
-          // have empty URLs. Accept empty-URL frames that have local scope.
-          const hasWebpackContext = params.callFrames.some(
-            (frame) => frame.url !== undefined && frame.url.startsWith('webpack-internal://')
-          );
-
-          if (hasWebpackContext) {
-            appFrames = params.callFrames
-              .filter((frame) =>
-                this._isAppFrame(frame.url) ||
-                (frame.url === '' && frame.scopeChain.some((s) => s.type === 'local'))
-              )
-              .slice(0, this.maxLocalsFrames);
-          }
-
-          // Fallback 2: in heavily-bundled production builds (Next.js
-          // production, Vite SSR), V8 often reports frame.url as '' for
-          // every frame - no webpack-internal URLs anywhere, no absolute
-          // paths. Only accept empty-URL local scopes when the paused
-          // exception description originates in an app stack frame.
-          // Caught framework/runtime exceptions also pause here, but their
-          // caller stacks may still mention the route module, so a deeper
-          // app frame is not enough signal. The origin frame has to be app
-          // code. Their locals are not useful app context and would
-          // otherwise accumulate in the ring buffer during successful
-          // requests.
-          if (appFrames.length === 0) {
-            const descriptionFrames = this.extractDescriptionStackFrames(params.data?.description);
-            const emptyUrlLocalFrameEntries = params.callFrames
-              .map((frame, index) => ({ frame, renderedFrame: descriptionFrames[index] }))
-              .filter(
-                ({ frame }) =>
-                  (frame.url === undefined || frame.url === '') &&
-                  frame.scopeChain.some((s) => s.type === 'local')
-              );
-            const emptyUrlLocalFrames = emptyUrlLocalFrameEntries.filter(({ renderedFrame }) =>
-              this._isAppFrame(renderedFrame?.filePath)
-            );
-
-            if (emptyUrlLocalFrames.length > 0) {
-              appFrames = emptyUrlLocalFrames.slice(0, this.maxLocalsFrames).map((entry) => {
-                if (entry.renderedFrame !== undefined) {
-                  renderedFrameByCallFrame.set(entry.frame, entry.renderedFrame);
-                }
-                return entry.frame;
-              });
-            } else {
-              const bundledAppFrame = descriptionFrames.find((frame) =>
-                this.isBundledAppDescriptionFrame(frame)
-              );
-              const externalDriverOrigin = this.isInstrumentedExternalDescriptionFrame(
-                descriptionFrames[0]
-              );
-              const nonNodeInternalOrigin = !this.isNodeInternalDescriptionFrame(
-                descriptionFrames[0]
-              );
-              const appEvidenceFrame = bundledAppFrame ??
-                ((externalDriverOrigin || nonNodeInternalOrigin) ? descriptionFrames.find((frame) =>
-                  this.isAppDescriptionFrame(frame)
-                ) : undefined);
-              if (
-                appEvidenceFrame !== undefined &&
-                (
-                  emptyUrlLocalFrameEntries.length > 1 ||
-                  externalDriverOrigin ||
-                  nonNodeInternalOrigin
-                )
-              ) {
-                appFrames = [emptyUrlLocalFrameEntries[0].frame];
-                renderedFrameByCallFrame.set(emptyUrlLocalFrameEntries[0].frame, appEvidenceFrame);
-              } else if (emptyUrlLocalFrameEntries.length > 0) {
-                this.recordMiss('non_app_empty_url_exception');
-                return;
-              }
-            }
-          }
-
-          if (appFrames.length === 0) {
-            this.recordMiss('no_app_frames');
-            return;
-          }
+        const selection = this.selectInspectorFrames(params);
+        if (selection.frames.length === 0) {
+          this.recordMiss(selection.missReason ?? 'no_app_frames');
+          return;
         }
 
         const { errorName, errorMessage } =
@@ -1561,7 +1589,7 @@ export class InspectorManager {
         const frameCount = params.callFrames.length;
         const structuralHash = computeStructuralHash(params.callFrames);
 
-        const collected: Array<CapturedFrame | undefined> = new Array(appFrames.length);
+        const collected: Array<CapturedFrame | undefined> = new Array(selection.frames.length);
         const localProperties = new Map<number, PropertyDescriptor[]>();
         const argumentProperties = new Map<number, PropertyDescriptor[]>();
         let pendingCollections = 0;
@@ -1610,10 +1638,8 @@ export class InspectorManager {
           stored = true;
         };
 
-        for (let selectedIndex = 0; selectedIndex < appFrames.length; selectedIndex += 1) {
-          const frame = appFrames[selectedIndex];
-          const callFrameIndex = params.callFrames.indexOf(frame);
-          const renderedFrame = renderedFrameByCallFrame.get(frame);
+        for (let selectedIndex = 0; selectedIndex < selection.frames.length; selectedIndex += 1) {
+          const { frame, callFrameIndex, renderedFrame } = selection.frames[selectedIndex];
           const rawLocation = {
             functionName: renderedFrame?.functionName ?? frame.functionName,
             filePath: renderedFrame?.filePath ?? frame.url ?? '',

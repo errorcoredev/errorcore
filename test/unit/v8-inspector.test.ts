@@ -12,6 +12,7 @@ import {
   parseStackForFunctionNames,
   shouldExcludeSdkRootForRuntime
 } from '../../src/capture/inspector-manager';
+import type { CapturedFrame } from '../../src/types';
 import { normalizeThrown } from '../../src/capture/normalize-thrown';
 import { resolveTestConfig } from '../helpers/test-config';
 
@@ -198,6 +199,80 @@ function getPrivateRingEntries(manager: InspectorManager): unknown[] {
   ).ringBuffer.entries;
 }
 
+const BOUNDED_LIBRARY_STACK = [
+  {
+    functionName: 'RedisCommandsQueue._execute',
+    filePath: '/app/node_modules/@redis/client/dist/lib/client/commands-queue.js'
+  },
+  {
+    functionName: 'Commander._RedisClient_sendCommand',
+    filePath: '/app/node_modules/@redis/client/dist/lib/client/index.js'
+  },
+  {
+    functionName: 'RedisSocket.write',
+    filePath: '/app/node_modules/@redis/client/dist/lib/client/socket.js'
+  },
+  {
+    functionName: 'encodeCommand',
+    filePath: '/app/node_modules/@redis/client/dist/lib/RESP/encoder.js'
+  },
+  {
+    functionName: 'processTicksAndRejections',
+    filePath: 'node:internal/process/task_queues'
+  },
+  {
+    functionName: 'InspectorManager._onPaused',
+    filePath: '/app/node_modules/errorcore/dist/capture/inspector-manager.js'
+  },
+  {
+    functionName: 'cache.get',
+    filePath: '/app/src/cache.ts'
+  },
+  {
+    functionName: 'Layer.handleRequest',
+    filePath: '/app/node_modules/express/lib/router/layer.js'
+  }
+] as const;
+
+function createBoundedLibraryPause(
+  explicitUrls: boolean,
+  message: string,
+  includeRouteFrame = false
+) {
+  const stackFrames = includeRouteFrame
+    ? [
+        ...BOUNDED_LIBRARY_STACK,
+        { functionName: 'GET /orders', filePath: '/app/src/routes/orders.ts' }
+      ]
+    : [...BOUNDED_LIBRARY_STACK];
+  const description = [
+    `Error: ${message}`,
+    ...stackFrames.map(
+      (frame, index) =>
+        `    at ${frame.functionName} (${frame.filePath}:${index + 10}:${index + 2})`
+    )
+  ].join('\n');
+
+  return {
+    reason: 'exception',
+    data: { className: 'Error', description, objectId: `error-${message}` },
+    callFrames: stackFrames.map((frame, index) =>
+      createCallFrame({
+        functionName: frame.functionName,
+        filePath: explicitUrls ? frame.filePath : '',
+        lineNumber: index + 10,
+        columnNumber: index + 2,
+        objectId: `scope-${index}`
+      })
+    )
+  };
+}
+
+function getLatestCapturedFrames(manager: InspectorManager): CapturedFrame[] {
+  const entries = getPrivateRingEntries(manager) as Array<{ frames: CapturedFrame[] }>;
+  return entries.at(-1)?.frames ?? [];
+}
+
 describe('InspectorManager', () => {
   afterEach(() => {
     Module.prototype.require = originalRequire;
@@ -352,6 +427,127 @@ describe('InspectorManager', () => {
     });
   });
 
+  it.each([
+    ['explicit URLs', true, 'forensic', [0, 1, 2, 6]],
+    ['empty URLs', false, 'forensic', [0, 1, 2, 6]],
+    ['explicit URLs', true, 'balanced', [0, 6]],
+    ['empty URLs', false, 'balanced', [0, 6]]
+  ] as const)(
+    'selects bounded origin library locals with %s in %s mode',
+    (_label, explicitUrls, captureMode, expectedIndices) => {
+      createTimerStubs();
+      createTimeoutStubs();
+      const inspector = createInspectorMock({
+        postImplementation: ({ method, params, callback }) => {
+          if (method !== 'Runtime.getProperties') return false;
+          const scopeId = String(params?.objectId ?? '');
+          callback?.(null, {
+            result: scopeId === 'scope-0'
+              ? [
+                  { name: 'token', value: { type: 'string', value: 'redis-token' } },
+                  { name: 'password', value: { type: 'string', value: 'redis-password' } },
+                  { name: 'slotNumber', value: { type: 'number', value: 42 } }
+                ]
+              : [{ name: 'marker', value: { type: 'string', value: scopeId } }]
+          });
+          return true;
+        }
+      });
+
+      withInspectorMock(inspector.inspectorModule, () => {
+        const manager = new InspectorManager(createInspectorConfig({
+          captureMode,
+          maxLocalsFrames: 6
+        }));
+        manager.ensureDebuggerActive();
+        inspector.emitPaused(createBoundedLibraryPause(explicitUrls, `${captureMode}-${explicitUrls}`));
+
+        const frames = getLatestCapturedFrames(manager);
+        expect(frames.map((frame) => frame.callFrameIndex)).toEqual(expectedIndices);
+        expect(frames.map((frame) => frame.filePath)).toEqual(
+          expectedIndices.map((index) => BOUNDED_LIBRARY_STACK[index].filePath)
+        );
+        expect(frames.map((frame) => frame.functionName)).toEqual(
+          expectedIndices.map((index) => BOUNDED_LIBRARY_STACK[index].functionName)
+        );
+
+        const requestedScopeIds = inspector.session.post.mock.calls
+          .filter((call) => call[0] === 'Runtime.getProperties')
+          .map((call) => (call[1] as { objectId?: string } | undefined)?.objectId);
+        expect(requestedScopeIds).toEqual(expectedIndices.map((index) => `scope-${index}`));
+
+        if (captureMode === 'forensic') {
+          expect(frames[0]?.locals).toMatchObject({
+            token: '[REDACTED]',
+            password: '[REDACTED]',
+            slotNumber: 42
+          });
+        }
+        manager.shutdown();
+      });
+    }
+  );
+
+  it('uses the current local-variable mode after a shallow-to-deep runtime switch', () => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const inspector = createInspectorMock({
+      postHandlers: {
+        'Runtime.getProperties': () => ({ result: [] })
+      }
+    });
+
+    withInspectorMock(inspector.inspectorModule, () => {
+      const config = createInspectorConfig({ captureMode: 'balanced', maxLocalsFrames: 6 });
+      const manager = new InspectorManager(config);
+      manager.ensureDebuggerActive();
+
+      inspector.emitPaused(createBoundedLibraryPause(true, 'before-switch'));
+      expect(getLatestCapturedFrames(manager).map((frame) => frame.callFrameIndex)).toEqual([0, 6]);
+
+      manager.applyModeState({
+        ...config.modeState,
+        captureMode: 'forensic',
+        localVariablesMode: 'deep'
+      });
+      inspector.emitPaused(createBoundedLibraryPause(true, 'after-switch'));
+      expect(getLatestCapturedFrames(manager).map((frame) => frame.callFrameIndex)).toEqual([
+        0, 1, 2, 6
+      ]);
+      manager.shutdown();
+    });
+  });
+
+  it.each([
+    [1, [6]],
+    [2, [0, 6]],
+    [3, [0, 1, 6]],
+    [4, [0, 1, 2, 6]],
+    [5, [0, 1, 2, 6, 8]]
+  ] as const)('honors a deterministic deep frame budget of %i', (maxLocalsFrames, expectedIndices) => {
+    createTimerStubs();
+    createTimeoutStubs();
+    const inspector = createInspectorMock({
+      postHandlers: {
+        'Runtime.getProperties': () => ({ result: [] })
+      }
+    });
+
+    withInspectorMock(inspector.inspectorModule, () => {
+      const manager = new InspectorManager(createInspectorConfig({
+        captureMode: 'forensic',
+        maxLocalsFrames
+      }));
+      manager.ensureDebuggerActive();
+      inspector.emitPaused(createBoundedLibraryPause(true, `budget-${maxLocalsFrames}`, true));
+
+      expect(getLatestCapturedFrames(manager).map((frame) => frame.callFrameIndex)).toEqual(
+        expectedIndices
+      );
+      manager.shutdown();
+    });
+  });
+
   it('skips empty-url internal stream exceptions without reading locals', () => {
     createTimerStubs();
     createTimeoutStubs();
@@ -469,25 +665,26 @@ describe('InspectorManager', () => {
         }
 
         callback?.(null, {
-          result: [
-            {
-              name: 'tagNames',
-              value: {
-                type: 'object',
-                subtype: 'array',
-                description: 'Array(2)'
-              }
-            },
-            {
-              name: 'cacheName',
-              value: {
-                type: 'string',
-                value: 'tags:global'
-              }
-            }
-          ]
+          result: params?.objectId === 'scope-redis'
+            ? [{ name: 'command', value: { type: 'string', value: 'GET' } }]
+            : [
+                {
+                  name: 'tagNames',
+                  value: {
+                    type: 'object',
+                    subtype: 'array',
+                    description: 'Array(2)'
+                  }
+                },
+                {
+                  name: 'cacheName',
+                  value: {
+                    type: 'string',
+                    value: 'tags:global'
+                  }
+                }
+              ]
         });
-        expect(params?.objectId).toBe('scope-app');
         return true;
       }
     });
@@ -526,13 +723,22 @@ describe('InspectorManager', () => {
 
       expect(
         inspector.session.post.mock.calls.filter((call) => call[0] === 'Runtime.getProperties')
-      ).toHaveLength(1);
+      ).toHaveLength(2);
 
       const error = new Error('Stream is not writable');
       error.stack = stack;
       const result = manager.getLocalsWithDiagnostics(error);
       expect(result.frames).toMatchObject([
         {
+          callFrameIndex: 0,
+          functionName: 'EventEmitter.sendCommand',
+          filePath: '/app/node_modules/ioredis/built/Redis.js',
+          locals: {
+            command: 'GET'
+          }
+        },
+        {
+          callFrameIndex: 1,
           functionName: 'lookupTags',
           filePath: '/app/dist/server.js',
           lineNumber: 798,

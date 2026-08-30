@@ -17,12 +17,18 @@ function hkdf(secret, salt) {
   return Buffer.from(hkdfSync('sha256', secret, salt, Buffer.alloc(0), 32));
 }
 
-function buildEnvelope({ key, sdkVersion, eventId, plaintext, compressed = false }) {
+function buildEnvelope({ key, sdkVersion, eventId, plaintext, compressed = false, version = 2 }) {
   const secret = Buffer.from(key, /^[0-9a-f]{64}$/i.test(key) ? 'hex' : 'utf8');
   const derivedKey = hkdf(secret, STATIC_KEY_SALT);
   const macKey = hkdf(secret, MAC_DERIVATION_SALT);
   const keyId = createHash('sha256').update(derivedKey).digest().subarray(0, 8).toString('hex');
-  const aad = Buffer.from(`1|${keyId}|${sdkVersion}|${eventId}`, 'utf8');
+  const kind = 'error';
+  const aad = Buffer.from(
+    version === 2
+      ? `2|${keyId}|${sdkVersion}|${eventId}|${kind}|`
+      : `1|${keyId}|${sdkVersion}|${eventId}`,
+    'utf8'
+  );
   const iv = Buffer.from('00112233445566778899aabb', 'hex');
   const cipher = createCipheriv('aes-256-gcm', derivedKey, iv);
   cipher.setAAD(aad);
@@ -39,8 +45,9 @@ function buildEnvelope({ key, sdkVersion, eventId, plaintext, compressed = false
     .digest('base64');
 
   return {
-    v: 1,
+    v: version,
     eventId,
+    ...(version === 2 ? { kind } : {}),
     sdk: { name: 'errorcore', version: sdkVersion },
     keyId,
     iv: iv.toString('base64'),
@@ -60,6 +67,22 @@ describe('errorcore sink decryptor', () => {
       sdkVersion: '0.2.0',
       eventId: 'evt-bench',
       plaintext: JSON.stringify({ ok: true, scenarioId: 'S1' })
+    });
+
+    assert.deepEqual(JSON.parse(decryptErrorcoreEnvelope(envelope, { encryptionKey: key })), {
+      ok: true,
+      scenarioId: 'S1'
+    });
+  });
+
+  it('continues to decrypt legacy v1 envelopes', () => {
+    const key = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const envelope = buildEnvelope({
+      key,
+      sdkVersion: '0.2.0',
+      eventId: 'evt-bench-v1',
+      plaintext: JSON.stringify({ ok: true, scenarioId: 'S1' }),
+      version: 1
     });
 
     assert.deepEqual(JSON.parse(decryptErrorcoreEnvelope(envelope, { encryptionKey: key })), {
