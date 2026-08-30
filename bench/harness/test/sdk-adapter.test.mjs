@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { buildErrorcoreCaptureOptions } from '../../apps/benchmark-app/lib/sdk-adapter.mjs';
 
 describe('Errorcore benchmark capture options', () => {
-  it('preserves explicit request evidence for every capture mode', () => {
+  it('preserves explicit request evidence for low-overhead capture modes', () => {
     const context = {
       scenarioId: 'S6',
       request: {
@@ -16,11 +16,11 @@ describe('Errorcore benchmark capture options', () => {
       }
     };
 
-    for (const captureMode of ['safe', 'balanced', 'forensic', 'fast']) {
+    for (const captureMode of ['safe', 'fast']) {
       const options = buildErrorcoreCaptureOptions({
         scenarioId: 'S6',
         errorcoreCaptureMode: captureMode
-      }, context);
+      }, context, captureMode);
 
       assert.equal(options.request.method, 'POST');
       assert.equal(options.request.url, '/scenario/S6');
@@ -31,6 +31,19 @@ describe('Errorcore benchmark capture options', () => {
       );
       assert.equal(options.request.bodyLength > 0, true);
       assert.match(options.request.bodyHash, /^sha256:[0-9a-f]{64}$/);
+    }
+  });
+
+  it('keeps recorder-backed modes on their ambient timeline path', () => {
+    for (const captureMode of ['balanced', 'forensic']) {
+      assert.equal(
+        buildErrorcoreCaptureOptions(
+          { scenarioId: 'S2', errorcoreCaptureMode: captureMode },
+          { request: { method: 'POST', path: '/scenario/S2' } },
+          captureMode
+        ),
+        undefined
+      );
     }
   });
 });

@@ -146,7 +146,11 @@ function bodyStats(body) {
   };
 }
 
-export function buildErrorcoreCaptureOptions(config, context = {}) {
+export function buildErrorcoreCaptureOptions(config, context = {}, captureMode = 'fast') {
+  if (captureMode !== 'safe' && captureMode !== 'fast') {
+    return undefined;
+  }
+
   const request = context.request ?? {};
   const headers = normalizeHeaders(request.headers ?? context.headers ?? {});
   const { bodyLength, bodyHash } = bodyStats(request.body ?? context.body);
@@ -263,7 +267,11 @@ async function createErrorcoreAdapter(config, logger) {
       error.scenarioId = context.scenarioId ?? config.scenarioId;
       error.benchmarkService = config.serviceName;
       error.benchmarkFramework = config.framework;
-      instance.captureError(error, buildErrorcoreCaptureOptions(config, context));
+      const activeCaptureMode = instance.getCaptureMode?.() ?? initialCaptureMode;
+      instance.captureError(
+        error,
+        buildErrorcoreCaptureOptions(config, context, activeCaptureMode)
+      );
     },
     getTraceHeaders() {
       return errorcore.getTraceHeaders?.() ?? null;
