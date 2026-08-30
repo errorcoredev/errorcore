@@ -29,6 +29,13 @@ compare_against_current.md
 # Secrets, local configuration, logs, and package artifacts
 *.env
 .env*
+.npmrc
+.yarnrc
+.yarnrc.yml
+*.key
+*.pem
+*.p12
+*.pfx
 *.log
 *.tgz
 /errorcore.config.js
@@ -37,6 +44,10 @@ compare_against_current.md
 /errorcore-h2-smoke.pfx
 /worker-file-smoke.ndjson
 /cli-replay-smoke.*
+
+# Local release staging, downloaded CI artifacts, and private validation evidence
+/.release-candidate*/
+/release-artifact*/
 
 # Temporary files and directories
 /tmp/
