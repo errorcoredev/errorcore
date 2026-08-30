@@ -37,6 +37,17 @@ banner.png
 # Environment and secrets
 *.env
 .env*
+.npmrc
+.yarnrc
+.yarnrc.yml
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Local release staging and validation evidence
+.release-candidate*/
+release-artifact*/
 
 # Logs
 *.log
